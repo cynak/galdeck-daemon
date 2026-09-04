@@ -353,6 +353,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "galdeck-device"
+version = "0.1.0"
+dependencies = [
+ "galdeck",
+ "log",
+]
+
+[[package]]
 name = "galdeck-ipc"
 version = "0.1.0"
 dependencies = [

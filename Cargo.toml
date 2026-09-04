@@ -1,6 +1,11 @@
 [workspace]
 resolver = "2"
-members = ["crates/galdeck-daemon", "crates/galdeck-cli", "crates/galdeck-ipc"]
+members = [
+  "crates/galdeck-daemon",
+  "crates/galdeck-cli",
+  "crates/galdeck-ipc",
+  "crates/galdeck-device",
+]
 
 [workspace.package]
 version = "0.1.0"
@@ -15,6 +20,7 @@ authors = ["galdeck contributors"]
 # The hardware framework. Switch to a version once galdeck is published.
 galdeck = { path = "../galdeck" }
 galdeck-ipc = { path = "crates/galdeck-ipc" }
+galdeck-device = { path = "crates/galdeck-device" }
 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
