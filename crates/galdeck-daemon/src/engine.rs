@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
-use galdeck::{Buttons, Encoders, Event};
+use galdeck::{Buttons, Encoders, Event, Rgb};
 use galdeck_core::{Clock, DeadlineCell, Scheduler, Tick, WakeReceiver, Waker};
 use galdeck_device::{KeyTarget, Paint};
 use galdeck_ipc::{
@@ -22,8 +22,8 @@ use crate::render;
 use crate::ring::RingFeedback;
 use galdeck_model::v2::{EncoderConfig, KeyConfig, Page, Profile};
 use galdeck_model::{
-    config_file_names, ConfigDocument, Diagnostics, ResolvedPalette, ResolvedStyle, StyleLayer,
-    Workspace,
+    config_file_names, Animation, AnimationKind, ConfigDocument, Diagnostics, ResolvedPalette,
+    ResolvedStyle, StyleLayer, Workspace,
 };
 
 /// Longest the core loop sleeps with nothing scheduled.
@@ -37,6 +37,9 @@ const CORE_IDLE: Duration = Duration::from_millis(250);
 /// A deck is navigated by hand, so this is far past any real trail; the point
 /// is only that the stack cannot grow for as long as the daemon runs.
 const MAX_PAGE_STACK: usize = 32;
+/// How many animation frames a page may pre-render before it is worth saying
+/// something. Each is a JPEG encode on the page-switch path.
+const MAX_PRERENDERED_FRAMES: usize = 64;
 /// Cap on commands spawned for one coalesced rotation report.
 const MAX_DETENTS_PER_EVENT: u32 = 8;
 /// Depth of one encoder's rotation queue. Deep enough to absorb a fast
@@ -112,6 +115,10 @@ pub struct Engine {
     rotation: Vec<RotationRunner>,
     /// Ring turn-feedback state, one per encoder.
     rings: Vec<RingFeedback>,
+    /// Pre-rendered key animations, one slot per key.
+    key_animations: Vec<Option<KeyAnimation>>,
+    /// Ring animations, one slot per encoder.
+    ring_animations: Vec<Option<RingAnimation>>,
 }
 
 /// What the io thread has told us about the device.
@@ -127,6 +134,66 @@ struct DeviceStatus {
 enum TimerKind {
     /// A ring's turn or click feedback has run its course.
     RingRest { encoder: u8 },
+    /// The next frame of a key's animation is due.
+    KeyFrame { key: u8 },
+    /// The next frame of a ring's animation is due.
+    RingFrame { encoder: u8 },
+}
+
+/// A key animation, with every frame already rendered and encoded.
+///
+/// Playing one is a channel send: the CPU was spent once, when the page was
+/// applied. Re-encoding per frame would be about a millisecond each, which
+/// twelve animated keys would turn into a third of a core.
+struct KeyAnimation {
+    frames: Vec<Arc<[u8]>>,
+    interval: Duration,
+    next: u8,
+}
+
+/// A ring animation. Not pre-rendered, because a ring frame is four colours
+/// and no encoding at all.
+struct RingAnimation {
+    animation: Animation,
+    base: Rgb,
+    to: Rgb,
+    interval: Duration,
+    next: u8,
+}
+
+impl RingAnimation {
+    /// The colours for the current frame.
+    fn frame(&self) -> [Rgb; galdeck::Ring::SEGMENTS as usize] {
+        let count = u32::from(self.animation.frames());
+        let phase = f32::from(self.next) / count as f32;
+        match self.animation.kind {
+            // One lit segment travelling round.
+            AnimationKind::Spin => {
+                let lit = (phase * galdeck::Ring::SEGMENTS as f32) as usize
+                    % galdeck::Ring::SEGMENTS as usize;
+                let mut colors = [self.base; galdeck::Ring::SEGMENTS as usize];
+                colors[lit] = self.to;
+                colors
+            }
+            // A lit segment with a tail fading out behind it.
+            AnimationKind::Comet => {
+                let head = (phase * galdeck::Ring::SEGMENTS as f32) as usize
+                    % galdeck::Ring::SEGMENTS as usize;
+                let mut colors = [self.base; galdeck::Ring::SEGMENTS as usize];
+                for behind in 0..galdeck::Ring::SEGMENTS as usize {
+                    let at = (head + galdeck::Ring::SEGMENTS as usize - behind)
+                        % galdeck::Ring::SEGMENTS as usize;
+                    let strength = 1.0 - (behind as f32 / galdeck::Ring::SEGMENTS as f32);
+                    colors[at] = self.base.lerp(self.to, strength);
+                }
+                colors
+            }
+            kind => {
+                let mix = kind.mix_at(phase);
+                [self.base.lerp(self.to, mix); galdeck::Ring::SEGMENTS as usize]
+            }
+        }
+    }
 }
 
 /// Which deck the daemon drives.
@@ -184,6 +251,8 @@ impl Engine {
             preview,
             rotation: Encoders::indices().map(|_| RotationRunner::new()).collect(),
             rings: Encoders::indices().map(|_| RingFeedback::new()).collect(),
+            key_animations: (0..Buttons::COUNT).map(|_| None).collect(),
+            ring_animations: Encoders::indices().map(|_| None).collect(),
         };
         engine.enter_profile();
         engine.load_documents();
@@ -384,6 +453,158 @@ impl Engine {
     fn fire(&mut self, kind: TimerKind) {
         match kind {
             TimerKind::RingRest { encoder } => self.paint_ring(encoder),
+            TimerKind::KeyFrame { key } => self.advance_key_animation(key),
+            TimerKind::RingFrame { encoder } => self.advance_ring_animation(encoder),
+        }
+    }
+
+    /// Show the next frame of a key's animation and schedule the one after.
+    fn advance_key_animation(&mut self, key: u8) {
+        let Some(animation) = self.key_animations[key as usize].as_mut() else {
+            return;
+        };
+        let frame = Arc::clone(&animation.frames[animation.next as usize]);
+        animation.next = (animation.next + 1) % animation.frames.len() as u8;
+        let interval = animation.interval;
+
+        self.preview.set_key(key, Some(Arc::clone(&frame)));
+        self.send(Paint::Key {
+            index: key,
+            target: KeyTarget::Jpeg(frame),
+        });
+        let now = self.clock.now();
+        self.scheduler
+            .after(now, interval, TimerKind::KeyFrame { key });
+    }
+
+    fn advance_ring_animation(&mut self, encoder: u8) {
+        let Some(animation) = self.ring_animations[encoder as usize].as_mut() else {
+            return;
+        };
+        let colors = animation.frame();
+        let count = animation.animation.frames();
+        animation.next = (animation.next + 1) % count;
+        let interval = animation.interval;
+
+        // Turn and click feedback wins: an animation must not hide what the
+        // knob is doing. The rest colour it returns to is the animation's, so
+        // the next frame picks straight back up.
+        if !self.rings[encoder as usize].is_active() {
+            self.rings[encoder as usize].rest(colors[0]);
+            self.preview.set_ring(encoder, colors);
+            self.send(Paint::Ring { encoder, colors });
+        }
+        let now = self.clock.now();
+        self.scheduler
+            .after(now, interval, TimerKind::RingFrame { encoder });
+    }
+
+    /// Render and encode every frame of the animations on this page.
+    ///
+    /// Done once, here, rather than per frame. The cost is real -- eight
+    /// frames is eight JPEG encodes -- but it is paid on a page switch instead
+    /// of thirty times a second forever.
+    fn build_animations(&mut self, page: &galdeck_model::v2::Page) {
+        for encoder in Encoders::indices() {
+            self.scheduler.cancel_kind(TimerKind::RingFrame { encoder });
+            self.ring_animations[encoder as usize] = None;
+        }
+        for key in Buttons::indices() {
+            self.scheduler.cancel_kind(TimerKind::KeyFrame { key });
+            self.key_animations[key as usize] = None;
+        }
+
+        let now = self.clock.now();
+        let mut encoded_frames = 0usize;
+
+        for cfg in &page.keys {
+            let Some(animation) = &cfg.animation else {
+                continue;
+            };
+            if animation.kind.is_ring_only() || cfg.key >= Buttons::COUNT {
+                continue;
+            }
+            let style = self.style_for(Some(&cfg.style), "key");
+            let to = animation
+                .to
+                .as_ref()
+                .and_then(|color| {
+                    self.palette
+                        .resolve(color, "animation.to", &mut Diagnostics::new())
+                })
+                .unwrap_or(Rgb::WHITE);
+
+            let count = animation.frames();
+            let mut frames = Vec::with_capacity(count as usize);
+            for index in 0..count {
+                let mix = animation.mix_for_frame(index);
+                let mut frame_style = style;
+                frame_style.key_bg = style.key_bg.lerp(to, mix);
+                let canvas = render::key(
+                    &frame_style,
+                    cfg.icon.as_deref(),
+                    cfg.label.as_deref(),
+                    self.font.as_ref(),
+                );
+                match canvas.to_jpeg(galdeck::ids::DEFAULT_JPEG_QUALITY) {
+                    Ok(jpeg) => frames.push(Arc::from(jpeg)),
+                    Err(e) => {
+                        log::warn!("encoding a frame for key {} failed: {e}", cfg.key);
+                        break;
+                    }
+                }
+            }
+            if frames.len() < 2 {
+                continue;
+            }
+            encoded_frames += frames.len();
+            let interval = Duration::from_millis(u64::from(animation.frame_interval_ms()));
+            self.key_animations[cfg.key as usize] = Some(KeyAnimation {
+                frames,
+                interval,
+                next: 0,
+            });
+            self.scheduler
+                .after(now, interval, TimerKind::KeyFrame { key: cfg.key });
+        }
+
+        for cfg in &page.encoders {
+            let Some(animation) = &cfg.animation else {
+                continue;
+            };
+            if cfg.encoder >= Encoders::COUNT {
+                continue;
+            }
+            let style = self.style_for(Some(&cfg.style), "encoder");
+            let to = animation
+                .to
+                .as_ref()
+                .and_then(|color| {
+                    self.palette
+                        .resolve(color, "animation.to", &mut Diagnostics::new())
+                })
+                .unwrap_or(Rgb::WHITE);
+            let interval = Duration::from_millis(u64::from(animation.frame_interval_ms()));
+            self.ring_animations[cfg.encoder as usize] = Some(RingAnimation {
+                animation: animation.clone(),
+                base: style.ring,
+                to,
+                interval,
+                next: 0,
+            });
+            self.scheduler.after(
+                now,
+                interval,
+                TimerKind::RingFrame {
+                    encoder: cfg.encoder,
+                },
+            );
+        }
+
+        if encoded_frames > MAX_PRERENDERED_FRAMES {
+            log::warn!(
+                "this page pre-renders {encoded_frames} animation frames; page switches will be slow"
+            );
         }
     }
 
@@ -531,6 +752,8 @@ impl Engine {
             self.rings[index as usize].rest(style.ring);
             self.paint_ring(index);
         }
+
+        self.build_animations(&page);
 
         let style = self.style_for(None, "lcd.style");
         let text = page.lcd_text.clone().unwrap_or_else(|| page.id.clone());

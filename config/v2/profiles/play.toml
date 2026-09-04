@@ -20,3 +20,10 @@ profile = "work"
 encoder = 0
 cw = "wpctl set-volume -l 1.0 @DEFAULT_AUDIO_SINK@ 2%+"
 ccw = "wpctl set-volume @DEFAULT_AUDIO_SINK@ 2%-"
+
+# Rings can animate too, and cost nothing to do so: a ring frame is four
+# colours with no image encoding at all. Turning or clicking the knob still
+# takes precedence -- an animation must not hide what the knob is doing.
+[pages.encoders.animation]
+kind = "comet"
+period_ms = 2400

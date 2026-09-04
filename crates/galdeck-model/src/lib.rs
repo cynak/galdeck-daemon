@@ -5,6 +5,7 @@
 //! CI job enforces that, which is what lets a user interface validate an edit
 //! the user has not saved yet without any of the daemon's machinery.
 
+pub mod animation;
 pub mod color;
 pub mod diag;
 pub mod doc;
@@ -13,6 +14,7 @@ pub mod v1;
 pub mod v2;
 pub mod workspace;
 
+pub use animation::{Animation, AnimationKind};
 pub use color::{ColorRef, Palette, ResolvedPalette};
 pub use diag::{Diagnostic, Diagnostics, LineIndex, Loc, Severity};
 pub use doc::{ConfigDocument, Patch, Staged, Value};

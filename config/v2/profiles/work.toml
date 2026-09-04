@@ -35,6 +35,14 @@ key = 11
 label = "Play"
 profile = "play"
 
+# Animations pre-render their frames when the page is applied, so playing one
+# costs nothing at runtime. `kind` is pulse, breathe or blink; `to` is the
+# colour it moves towards, defaulting to white.
+[pages.keys.animation]
+kind = "breathe"
+period_ms = 3000
+to = "@aurora-green"
+
 [[pages.encoders]]
 encoder = 0
 press = "wpctl set-mute @DEFAULT_AUDIO_SINK@ toggle"

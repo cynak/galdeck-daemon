@@ -10,6 +10,7 @@ use std::path::PathBuf;
 
 use serde::Deserialize;
 
+use crate::animation::Animation;
 use crate::theme::StyleLayer;
 
 /// The version this build writes and understands.
@@ -120,6 +121,9 @@ pub struct KeyConfig {
     pub back: bool,
     #[serde(default)]
     pub style: StyleLayer,
+    /// Makes this key move. Frames are pre-rendered when the page is applied.
+    #[serde(default)]
+    pub animation: Option<Animation>,
 }
 
 impl KeyConfig {
@@ -142,6 +146,10 @@ pub struct EncoderConfig {
     pub ccw: Option<String>,
     #[serde(default)]
     pub style: StyleLayer,
+    /// Makes this ring move when it is at rest. Turn and click feedback still
+    /// takes precedence -- an animation must not hide what the knob is doing.
+    #[serde(default)]
+    pub animation: Option<Animation>,
 }
 
 /// Everything loaded from a config directory.

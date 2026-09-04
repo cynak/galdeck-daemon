@@ -145,6 +145,7 @@ impl Workspace {
                         page: key.page.clone(),
                         profile: None,
                         back: false,
+                        animation: None,
                         style: StyleLayer {
                             // v1's `color` was the key background.
                             key_bg: key.color.as_deref().and_then(literal),
@@ -164,6 +165,7 @@ impl Workspace {
                             ring: encoder.ring.as_deref().and_then(literal),
                             ..StyleLayer::default()
                         },
+                        animation: None,
                     })
                     .collect(),
             })
@@ -400,6 +402,19 @@ impl Workspace {
                             );
                         }
                     }
+                    if let Some(animation) = &key.animation {
+                        if animation.kind.is_ring_only() {
+                            out.push(
+                                Diagnostic::error(
+                                    "E0140",
+                                    at("animation.kind"),
+                                    format!("{:?} only works on an encoder ring", animation.kind),
+                                )
+                                .with_help("try \"pulse\", \"breathe\" or \"blink\""),
+                            );
+                        }
+                        check_period(animation, &at("animation.period_ms"), &mut out);
+                    }
                     if !key.is_bound() {
                         out.push(
                             Diagnostic::hint("H0113", at(""), "this key does nothing when pressed")
@@ -434,6 +449,10 @@ impl Workspace {
                         ));
                     } else {
                         seen_encoders.push(encoder.encoder);
+                    }
+
+                    if let Some(animation) = &encoder.animation {
+                        check_period(animation, &at("animation.period_ms"), &mut out);
                     }
                 }
             }
@@ -493,6 +512,27 @@ impl Workspace {
         }
 
         out
+    }
+}
+
+/// A period outside what the panel can show is clamped rather than refused,
+/// but silently clamping a value the user typed is how a config stops meaning
+/// what it says.
+fn check_period(animation: &crate::animation::Animation, path: &str, out: &mut Diagnostics) {
+    use crate::animation::{MAX_PERIOD_MS, MIN_PERIOD_MS};
+    if animation.period_ms < MIN_PERIOD_MS || animation.period_ms > MAX_PERIOD_MS {
+        out.push(
+            Diagnostic::warning(
+                "W0141",
+                path,
+                format!(
+                    "period {} ms is outside {MIN_PERIOD_MS}-{MAX_PERIOD_MS} and will be clamped to {}",
+                    animation.period_ms,
+                    animation.period_ms()
+                ),
+            )
+            .with_help("below the minimum it reads as a flicker rather than motion"),
+        );
     }
 }
 

@@ -265,3 +265,113 @@ fn a_config_from_the_future_is_refused_rather_than_guessed_at() {
     let refusal = diagnostics.iter().find(|d| d.code == "E0003").unwrap();
     assert!(refusal.help.as_deref().unwrap().contains("newer galdeck"));
 }
+
+#[test]
+fn a_pulse_rises_and_falls_over_its_cycle() {
+    use galdeck_model::{Animation, AnimationKind};
+
+    let pulse = Animation {
+        kind: AnimationKind::Pulse,
+        period_ms: 1000,
+        to: None,
+        frames: 4,
+    };
+    // Quarter, half, three-quarters: up to the top and back down.
+    assert_eq!(pulse.mix_for_frame(0), 0.0);
+    assert_eq!(pulse.mix_for_frame(1), 0.5);
+    assert_eq!(pulse.mix_for_frame(2), 1.0);
+    assert_eq!(pulse.mix_for_frame(3), 0.5);
+    assert_eq!(pulse.frame_interval_ms(), 250);
+}
+
+#[test]
+fn breathing_lingers_at_both_ends() {
+    use galdeck_model::{Animation, AnimationKind};
+
+    // The difference from a pulse: a raised cosine has no corner at the top
+    // or the bottom, which is what makes it read as breathing rather than as
+    // a triangle wave.
+    let breathe = Animation {
+        kind: AnimationKind::Breathe,
+        period_ms: 1000,
+        to: None,
+        frames: 8,
+    };
+    let first_step = breathe.mix_for_frame(1) - breathe.mix_for_frame(0);
+    let middle_step = breathe.mix_for_frame(3) - breathe.mix_for_frame(2);
+    assert!(
+        middle_step > first_step * 1.5,
+        "it should move fastest through the middle: {first_step} then {middle_step}"
+    );
+}
+
+#[test]
+fn a_blink_has_exactly_two_frames_however_many_are_asked_for() {
+    use galdeck_model::{Animation, AnimationKind};
+
+    let blink = Animation {
+        kind: AnimationKind::Blink,
+        period_ms: 1000,
+        to: None,
+        frames: 30,
+    };
+    // Any more would be identical copies, each costing a JPEG encode.
+    assert_eq!(blink.frames(), 2);
+    assert_eq!(blink.mix_for_frame(0), 1.0);
+    assert_eq!(blink.mix_for_frame(1), 0.0);
+}
+
+#[test]
+fn an_impossible_period_is_clamped_and_said_out_loud() {
+    let dir = tempdir::Dir::new();
+    dir.write("galdeck.toml", GLOBAL);
+    dir.write(
+        "profiles/work.toml",
+        r##"
+[[pages]]
+id = "main"
+
+[[pages.keys]]
+key = 0
+label = "Fast"
+exec = "true"
+
+[pages.keys.animation]
+kind = "pulse"
+period_ms = 5
+"##,
+    );
+
+    let (workspace, diagnostics) = Workspace::load(dir.path());
+    assert!(workspace.is_some(), "clamping is not a refusal");
+    let warned = diagnostics
+        .iter()
+        .find(|d| d.code == "W0141")
+        .expect("clamping silently would make the config stop meaning what it says");
+    assert!(warned.message.contains("clamped"));
+}
+
+#[test]
+fn a_ring_only_animation_on_a_key_is_an_error() {
+    let dir = tempdir::Dir::new();
+    dir.write("galdeck.toml", GLOBAL);
+    dir.write(
+        "profiles/work.toml",
+        r##"
+[[pages]]
+id = "main"
+
+[[pages.keys]]
+key = 0
+label = "Spin"
+exec = "true"
+
+[pages.keys.animation]
+kind = "comet"
+"##,
+    );
+
+    let (_, diagnostics) = Workspace::load(dir.path());
+    let error = diagnostics.iter().find(|d| d.code == "E0140").unwrap();
+    assert!(error.help.as_deref().unwrap().contains("pulse"));
+}
