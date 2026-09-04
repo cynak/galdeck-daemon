@@ -337,6 +337,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "galdeck-core"
+version = "0.1.0"
+dependencies = [
+ "log",
+]
+
+[[package]]
 name = "galdeck-daemon"
 version = "0.1.0"
 dependencies = [

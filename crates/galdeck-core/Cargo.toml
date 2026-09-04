@@ -1,0 +1,13 @@
+[package]
+name = "galdeck-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+description = "Pure runtime machinery for galdeck-daemon: a virtual clock, a deadline scheduler, and a wake signal."
+
+[dependencies]
+log.workspace = true
