@@ -353,6 +353,7 @@ dependencies = [
  "env_logger",
  "galdeck",
  "galdeck-ipc",
+ "galdeck-model",
  "log",
  "serde",
  "serde_json",
@@ -373,6 +374,16 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "galdeck-model"
+version = "0.1.0"
+dependencies = [
+ "galdeck",
+ "log",
+ "serde",
+ "toml",
 ]
 
 [[package]]

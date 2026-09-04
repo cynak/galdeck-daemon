@@ -6,6 +6,7 @@ members = [
   "crates/galdeck-ipc",
   "crates/galdeck-device",
   "crates/galdeck-core",
+  "crates/galdeck-model",
 ]
 
 [workspace.package]
@@ -23,6 +24,7 @@ galdeck = { path = "../galdeck" }
 galdeck-ipc = { path = "crates/galdeck-ipc" }
 galdeck-device = { path = "crates/galdeck-device" }
 galdeck-core = { path = "crates/galdeck-core" }
+galdeck-model = { path = "crates/galdeck-model" }
 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

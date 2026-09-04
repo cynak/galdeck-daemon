@@ -1,4 +1,3 @@
-mod config;
 mod engine;
 mod ipc_server;
 mod render;
@@ -25,15 +24,17 @@ fn main() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     let args = Args::parse();
 
-    let config_path = args.config.unwrap_or_else(config::default_config_path);
+    let config_path = args
+        .config
+        .unwrap_or_else(galdeck_model::default_config_path);
     let config = if config_path.exists() {
-        config::Config::load(&config_path)?
+        galdeck_model::Config::load(&config_path)?
     } else {
         log::warn!(
             "no config at {} — running with a blank profile; copy config/galdeck.example.toml there to get started",
             config_path.display()
         );
-        config::Config::fallback()
+        galdeck_model::Config::fallback()
     };
 
     let shutdown = Arc::new(AtomicBool::new(false));

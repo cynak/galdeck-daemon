@@ -14,6 +14,7 @@ categories = ["hardware-support", "command-line-utilities"]
 [dependencies]
 galdeck = { workspace = true }
 galdeck-ipc = { workspace = true }
+galdeck-model = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 toml = { workspace = true }

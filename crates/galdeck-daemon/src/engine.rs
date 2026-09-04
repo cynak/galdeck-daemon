@@ -11,9 +11,9 @@ use anyhow::Result;
 use galdeck::{Buttons, Encoders, Event, Galleon, Rgb};
 use galdeck_ipc::{Request, Response, Status};
 
-use crate::config::{Config, EncoderConfig, KeyConfig, Page};
 use crate::render;
 use crate::ring::RingFeedback;
+use galdeck_model::{Config, EncoderConfig, KeyConfig, Page};
 
 const RECONNECT_INTERVAL: Duration = Duration::from_secs(2);
 /// How long one poll waits for input when the device is idle.
