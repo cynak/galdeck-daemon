@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: fmt, clippy, test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: galdeck-daemon
+      # The framework is a path dependency until it is published.
+      - uses: actions/checkout@v4
+        with:
+          repository: cynak/galdeck
+          path: galdeck
+      - name: Install libudev headers
+        run: sudo apt-get update && sudo apt-get install -y libudev-dev
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: galdeck-daemon
+      - name: Format
+        working-directory: galdeck-daemon
+        run: cargo fmt --all --check
+      - name: Clippy
+        working-directory: galdeck-daemon
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Test
+        working-directory: galdeck-daemon
+        run: cargo test --workspace

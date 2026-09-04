@@ -1,0 +1,80 @@
+# galdeck example profile — copy to ~/.config/galdeck/config.toml
+#
+# Key positions are 0-11, row-major from the top-left of the 3x4 key grid:
+#   0  1  2
+#   3  4  5
+#   6  7  8
+#   9 10 11
+# Encoders: 0 = left, 1 = right. Colors are #rrggbb.
+#
+# `ring` is the colour an encoder's LED ring rests at. Turning the knob
+# steps one lit segment around the ring in the direction of the turn and
+# a click flashes the whole ring, so a knob answers even when its command
+# has no visible effect of its own. Rings with no colour set rest dark and
+# still light up on use.
+
+brightness = 60
+# font = "/usr/share/fonts/TTF/DejaVuSans.ttf"   # optional, auto-detected
+lcd_text = "galdeck"
+
+[[pages]]
+name = "main"
+
+[[pages.keys]]
+key = 0
+label = "Terminal"
+color = "#20303a"
+exec = "x-terminal-emulator || kitty || alacritty || gnome-terminal"
+
+[[pages.keys]]
+key = 1
+label = "Browser"
+color = "#3a2030"
+exec = "xdg-open https://example.com"
+
+[[pages.keys]]
+key = 2
+label = "Media"
+color = "#203a24"
+page = "media"
+
+# [[pages.keys]]
+# key = 3
+# label = "Shot"
+# image = "/usr/share/icons/hicolor/64x64/apps/org.gnome.Screenshot.png"
+# exec = "gnome-screenshot -i"
+
+[[pages.encoders]]
+encoder = 0
+ring = "#00c896"
+press = "wpctl set-mute @DEFAULT_AUDIO_SINK@ toggle"
+cw = "wpctl set-volume -l 1.0 @DEFAULT_AUDIO_SINK@ 2%+"
+ccw = "wpctl set-volume @DEFAULT_AUDIO_SINK@ 2%-"
+
+[[pages]]
+name = "media"
+lcd_text = "media controls"
+
+[[pages.keys]]
+key = 0
+label = "Play"
+color = "#204020"
+exec = "playerctl play-pause"
+
+[[pages.keys]]
+key = 1
+label = "Next"
+color = "#204028"
+exec = "playerctl next"
+
+[[pages.keys]]
+key = 2
+label = "Back"
+color = "#402020"
+page = "main"
+
+[[pages.encoders]]
+encoder = 1
+ring = "#3070ff"
+cw = "playerctl position 5+"
+ccw = "playerctl position 5-"

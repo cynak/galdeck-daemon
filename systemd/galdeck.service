@@ -1,0 +1,21 @@
+# galdeck user service.
+# Install:  mkdir -p ~/.config/systemd/user && cp systemd/galdeck.service ~/.config/systemd/user/
+#           systemctl --user daemon-reload && systemctl --user enable --now galdeck
+# The binary must be on the user path (e.g. cargo install --path crates/galdeck-daemon,
+# which puts it in ~/.cargo/bin), or adjust ExecStart to an absolute path.
+
+[Unit]
+Description=galdeck — Corsair Galleon 100 SD Stream Deck daemon
+
+[Service]
+Type=simple
+ExecStart=%h/.cargo/bin/galdeck-daemon
+Restart=on-failure
+RestartSec=2
+# Apps launched from a key are children of the daemon. With the default
+# KillMode=control-group, stopping or restarting the service would kill
+# them too — closing the user's windows. Kill only the daemon itself.
+KillMode=process
+
+[Install]
+WantedBy=default.target

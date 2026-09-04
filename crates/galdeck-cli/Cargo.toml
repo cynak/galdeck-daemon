@@ -1,0 +1,23 @@
+[package]
+name = "galdeck-cli"
+description = "CLI controlling the galdeck daemon for the Corsair Galleon 100 SD's built-in Stream Deck"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+homepage.workspace = true
+keywords = ["streamdeck", "corsair", "galleon", "cli", "linux"]
+categories = ["hardware-support", "command-line-utilities"]
+
+[[bin]]
+name = "galdeck"
+path = "src/main.rs"
+
+[dependencies]
+galdeck = { workspace = true }
+galdeck-ipc = { workspace = true }
+serde_json = { workspace = true }
+clap = { workspace = true }
+anyhow = { workspace = true }

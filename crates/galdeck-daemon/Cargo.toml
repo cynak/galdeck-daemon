@@ -1,0 +1,24 @@
+[package]
+name = "galdeck-daemon"
+description = "Config-driven daemon programming the Corsair Galleon 100 SD's built-in Stream Deck on Linux"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+homepage.workspace = true
+keywords = ["streamdeck", "corsair", "galleon", "daemon", "linux"]
+categories = ["hardware-support", "command-line-utilities"]
+
+[dependencies]
+galdeck = { workspace = true }
+galdeck-ipc = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+clap = { workspace = true }
+anyhow = { workspace = true }
+log = { workspace = true }
+env_logger = { workspace = true }
+ctrlc = { workspace = true }
