@@ -196,6 +196,12 @@ impl Diagnostics {
     }
 }
 
+impl From<Diagnostic> for Diagnostics {
+    fn from(d: Diagnostic) -> Self {
+        Self { items: vec![d] }
+    }
+}
+
 impl FromIterator<Diagnostic> for Diagnostics {
     fn from_iter<T: IntoIterator<Item = Diagnostic>>(iter: T) -> Self {
         Self {

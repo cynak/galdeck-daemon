@@ -43,9 +43,37 @@ Keys are numbered row-major from the top-left of the 3×4 grid:
  9 10 11
 ```
 
-A key can carry a label, a color, an icon, and either a shell command or a
-page to switch to. An encoder can bind commands to press, clockwise, and
-anticlockwise, and rests at a ring color of your choosing.
+A key can carry a label, an icon, a style, and one of: a shell command, a
+page to switch to, a profile to switch to, or `back = true` to return to
+wherever the current page was reached from. An encoder can bind commands to
+press, clockwise and anticlockwise, and rests at a ring colour.
+
+### Profiles and themes
+
+A configuration directory looks like this:
+
+```
+~/.config/galdeck/
+  galdeck.toml          version, brightness, which profile to start in
+  profiles/<id>.toml    one per profile; the id is the filename
+  themes/<id>.toml      one per theme
+```
+
+A **profile** is a set of pages with a theme; switch between them with
+`galdeck profile <name>` or from a key. A **theme** is a palette plus style
+defaults. Anywhere a colour is expected you can write `#rrggbb` or `@name`
+naming a palette entry, and a theme can `extends` another and override only
+what differs — so redefining one palette entry moves everything that
+referenced it.
+
+Style resolves from the most general layer to the most specific: built-in
+defaults, then the theme, the profile, the page, and finally the individual
+key or encoder. A config with no theme at all looks exactly as it did before
+themes existed.
+
+See [config/v2](config/v2) for a commented worked example. A single-file
+`config.toml` from before still works — it is translated on load, and nothing
+on disk is rewritten.
 
 Turning a knob steps a lit segment around its ring and a click flashes it,
 so a knob answers even when its command has no visible effect. Fast spins
@@ -58,9 +86,10 @@ racing; `GALDECK_DELTA` carries the signed step count to your command.
 |---|---|
 | `galdeck detect` | Find the module and read its firmware (works without the daemon, changes nothing) |
 | `galdeck status` | Daemon and device state |
-| `galdeck page <name>` | Switch page |
+| `galdeck page <name>` | Switch page within the current profile |
+| `galdeck profile <name>` | Switch profile |
 | `galdeck brightness <0-100>` | Set panel brightness |
-| `galdeck reload` | Re-read the config |
+| `galdeck reload` | Re-read the config; a broken edit leaves the running one alone |
 | `galdeck ping` | Check the daemon is alive |
 
 ## Running as a service
@@ -76,6 +105,15 @@ racing; `GALDECK_DELTA` carries the signed step count to your command.
   for per-event tracing.
 
 ## Development
+
+`--device virtual` runs the whole daemon against a deck that exists only in
+memory, so the configuration, themes and profiles can be developed and tested
+on a machine with no keyboard attached:
+
+```sh
+cargo run --bin galdeck-daemon -- --device virtual --config config/v2
+```
+
 
 ```sh
 cargo fmt --all

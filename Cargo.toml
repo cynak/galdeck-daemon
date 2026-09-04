@@ -29,6 +29,7 @@ galdeck-model = { path = "crates/galdeck-model" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
+toml_edit = "0.22"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 clap = { version = "4", features = ["derive"] }
 anyhow = "1"

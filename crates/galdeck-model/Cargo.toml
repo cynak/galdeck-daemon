@@ -13,4 +13,5 @@ description = "The galdeck configuration model: schema, validation diagnostics, 
 galdeck.workspace = true
 serde.workspace = true
 toml.workspace = true
+toml_edit.workspace = true
 log.workspace = true

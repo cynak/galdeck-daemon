@@ -41,9 +41,12 @@ printf '\nlayering\n'
 printf '%-58s' "no wall clock in the pure crates"
 no_match '(Instant|SystemTime)::now\(\)' "${PURE[@]}" && printf 'ok\n' || fail=1
 
-# Ambient IO in the pure crates would make them untestable in the same way.
-printf '%-58s' "no process or socket IO in the pure crates"
-no_match 'std::(process|net)::' "${PURE[@]}" && printf 'ok\n' || fail=1
+# Ambient authority in the pure crates would make them untestable in the same
+# way. This targets spawning and sockets specifically rather than the whole
+# `std::process` module: reading our own pid is neither, and a staging filename
+# legitimately wants it.
+printf '%-58s' "no subprocesses or sockets in the pure crates"
+no_match 'std::process::(Command|exit|abort)|std::net::' "${PURE[@]}" && printf 'ok\n' || fail=1
 
 # One file may name the concrete device type. Everything else goes through
 # the Deck trait, which is what keeps the workspace testable with no keyboard.

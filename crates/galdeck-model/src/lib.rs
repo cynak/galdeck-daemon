@@ -7,6 +7,7 @@
 
 pub mod color;
 pub mod diag;
+pub mod doc;
 pub mod theme;
 pub mod v1;
 pub mod v2;
@@ -14,6 +15,7 @@ pub mod workspace;
 
 pub use color::{ColorRef, Palette, ResolvedPalette};
 pub use diag::{Diagnostic, Diagnostics, LineIndex, Loc, Severity};
+pub use doc::{ConfigDocument, Patch, Staged, Value};
 pub use theme::{ResolvedStyle, StyleLayer, StyleSource, Theme};
 pub use v1::{default_config_path, Config, EncoderConfig, KeyConfig, LoadError, Page, ParseError};
 pub use v2::{Global, Workspace, CURRENT_VERSION};
