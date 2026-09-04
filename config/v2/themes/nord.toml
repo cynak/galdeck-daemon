@@ -1,0 +1,28 @@
+# A theme is a palette plus a set of style defaults.
+#
+# Anywhere a colour is expected you may write `#rrggbb` or `@name`, where the
+# name is one of the palette entries below. Tokens may point at other tokens;
+# they are resolved once when the theme loads.
+
+name = "Nord"
+
+[palette]
+polar = "#2e3440"
+storm = "#3b4252"
+frost = "#88c0d0"
+snow = "#eceff4"
+aurora-red = "#bf616a"
+aurora-green = "#a3be8c"
+# A token pointing at another token: change `frost` and this follows.
+accent = "@frost"
+
+[style]
+key_bg = "@storm"
+key_label_color = "@snow"
+key_label_size = 26.0
+# Height of the strip at the bottom of a key reserved for its label.
+key_label_strip = 36
+lcd_bg = "@polar"
+lcd_text_color = "@snow"
+lcd_text_size = 56.0
+ring = "@accent"

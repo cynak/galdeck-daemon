@@ -15,7 +15,7 @@ use galdeck_daemon::engine::{ControlMsg, ControlSender, Engine};
 use galdeck_daemon::io::IoThread;
 use galdeck_device::{DeckOp, FakeDeck, FakeDeckHandle};
 use galdeck_ipc::{Request, Response};
-use galdeck_model::Config;
+use galdeck_model::{v1, Workspace};
 
 const CONFIG: &str = r##"
 brightness = 60
@@ -70,7 +70,8 @@ struct Harness {
 
 impl Harness {
     fn start() -> Self {
-        let config = Config::parse(CONFIG).expect("test config should parse");
+        let config = v1::Config::parse(CONFIG).expect("test config should parse");
+        let workspace = Workspace::from_v1(&config);
         let shutdown = Arc::new(AtomicBool::new(false));
         let clock: Arc<dyn Clock> = Arc::new(SystemClock::new());
         let deadline = Arc::new(DeadlineCell::new());
@@ -93,8 +94,8 @@ impl Harness {
         let io_thread = std::thread::spawn(move || io.run());
 
         let mut engine = Engine::new(
-            "test.toml".into(),
-            config,
+            "test-config".into(),
+            workspace,
             control_rx,
             device_rx,
             paint_tx,

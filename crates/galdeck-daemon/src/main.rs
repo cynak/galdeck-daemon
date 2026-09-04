@@ -22,7 +22,7 @@ struct Args {
     #[arg(long, value_enum, default_value_t = DeviceArg::Auto)]
     device: DeviceArg,
 
-    /// Config file (default: ~/.config/galdeck/config.toml)
+    /// Config directory (default: ~/.config/galdeck)
     #[arg(long)]
     config: Option<PathBuf>,
 }
@@ -31,17 +31,33 @@ fn main() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     let args = Args::parse();
 
-    let config_path = args
+    let config_dir = args
         .config
-        .unwrap_or_else(galdeck_model::default_config_path);
-    let config = if config_path.exists() {
-        galdeck_model::Config::load(&config_path)?
-    } else {
-        log::warn!(
-            "no config at {} — running with a blank profile; copy config/galdeck.example.toml there to get started",
-            config_path.display()
-        );
-        galdeck_model::Config::fallback()
+        .unwrap_or_else(galdeck_model::default_config_dir);
+    let (workspace, diagnostics) = galdeck_model::Workspace::load(&config_dir);
+    for diagnostic in &diagnostics {
+        match diagnostic.severity {
+            galdeck_model::Severity::Error => {
+                log::error!("{}: {}", diagnostic.path, diagnostic.message)
+            }
+            galdeck_model::Severity::Warning => {
+                log::warn!("{}: {}", diagnostic.path, diagnostic.message)
+            }
+            galdeck_model::Severity::Hint => {
+                log::info!("{}: {}", diagnostic.path, diagnostic.message)
+            }
+        }
+    }
+    let workspace = match workspace {
+        Some(workspace) => workspace,
+        None => {
+            log::warn!(
+                "no usable config in {} — running with a blank profile; copy config/galdeck.example.toml to {}/config.toml to get started",
+                config_dir.display(),
+                config_dir.display()
+            );
+            galdeck_model::Workspace::default()
+        }
     };
 
     let shutdown = Arc::new(AtomicBool::new(false));
@@ -85,15 +101,7 @@ fn main() -> Result<()> {
         .spawn(move || io.run())?;
 
     let mut engine = engine::Engine::new(
-        config_path,
-        config,
-        control_rx,
-        device_rx,
-        paint_tx,
-        deadline,
-        clock,
-        wake_rx,
-        shutdown,
+        config_dir, workspace, control_rx, device_rx, paint_tx, deadline, clock, wake_rx, shutdown,
     )?;
     engine.run();
 

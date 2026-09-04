@@ -21,8 +21,10 @@ enum Command {
     Status,
     /// Set panel brightness (0-100).
     Brightness { percent: u8 },
-    /// Switch to a named page from the config.
+    /// Switch to a named page in the current profile.
     Page { name: String },
+    /// Switch to a named profile.
+    Profile { name: String },
     /// Reload the config file and re-apply the current page.
     Reload,
     /// Enumerate the module over HID directly (works without the daemon).
@@ -114,6 +116,9 @@ fn main() -> Result<()> {
         }
         Command::Page { name } => {
             expect_ok(request(&Request::SwitchPage { name })?)?;
+        }
+        Command::Profile { name } => {
+            expect_ok(request(&Request::SwitchProfile { name })?)?;
         }
         Command::Reload => {
             expect_ok(request(&Request::Reload)?)?;

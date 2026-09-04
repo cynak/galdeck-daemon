@@ -12,8 +12,16 @@ use serde::{Deserialize, Serialize};
 pub enum Request {
     Ping,
     Status,
-    SetBrightness { percent: u8 },
-    SwitchPage { name: String },
+    SetBrightness {
+        percent: u8,
+    },
+    SwitchPage {
+        name: String,
+    },
+    /// Switch to another profile.
+    SwitchProfile {
+        name: String,
+    },
     Reload,
 }
 

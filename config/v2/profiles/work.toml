@@ -1,0 +1,70 @@
+name = "Work"
+theme = "nord"
+home = "main"
+
+# Style set here applies to every page in this profile, and is overridden by
+# anything a page or an individual key sets.
+[style]
+key_label_size = 24.0
+
+[[pages]]
+id = "main"
+lcd_text = "work"
+
+[[pages.keys]]
+key = 0
+label = "Terminal"
+exec = "x-terminal-emulator || kitty || alacritty || gnome-terminal"
+
+[[pages.keys]]
+key = 1
+label = "Browser"
+exec = "xdg-open https://example.com"
+
+[[pages.keys]]
+key = 2
+label = "Media"
+page = "media"
+
+# A per-key override sits at the top of the cascade.
+[pages.keys.style]
+key_bg = "@aurora-green"
+
+[[pages.keys]]
+key = 11
+label = "Play"
+profile = "play"
+
+[[pages.encoders]]
+encoder = 0
+press = "wpctl set-mute @DEFAULT_AUDIO_SINK@ toggle"
+cw = "wpctl set-volume -l 1.0 @DEFAULT_AUDIO_SINK@ 2%+"
+ccw = "wpctl set-volume @DEFAULT_AUDIO_SINK@ 2%-"
+
+[[pages]]
+id = "media"
+lcd_text = "media"
+
+[[pages.keys]]
+key = 0
+label = "Play"
+exec = "playerctl play-pause"
+
+[[pages.keys]]
+key = 1
+label = "Next"
+exec = "playerctl next"
+
+[[pages.keys]]
+key = 2
+label = "Back"
+# Returns to whichever page this one was reached from.
+back = true
+
+[pages.keys.style]
+key_bg = "@aurora-red"
+
+[[pages.encoders]]
+encoder = 1
+cw = "playerctl position 5+"
+ccw = "playerctl position 5-"

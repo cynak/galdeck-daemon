@@ -1,0 +1,12 @@
+# A theme may extend another and override only what it cares about.
+# Redefining a palette entry also moves everything that referenced it.
+
+name = "Nord Bright"
+extends = "nord"
+
+[palette]
+storm = "#4c566a"
+accent = "#a3be8c"
+
+[style]
+key_label_size = 30.0

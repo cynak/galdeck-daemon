@@ -1,0 +1,20 @@
+# galdeck — the small file at the root.
+#
+# Everything else lives beside it:
+#   profiles/<id>.toml   one per profile; the id is the filename
+#   themes/<id>.toml     one per theme
+#
+# Copy this whole directory to ~/.config/galdeck to use it.
+
+version = 2
+
+# Panel brightness, 0-100. One value for the whole module: the hardware has
+# no per-key brightness and no way to read the current value back.
+brightness = 60
+
+# Optional. Without it a system font is found automatically; if none is
+# found, labels are skipped rather than the daemon failing.
+# font = "/usr/share/fonts/TTF/DejaVuSans.ttf"
+
+# Which profile to start in. `galdeck profile <name>` switches at runtime.
+profile = "work"

@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
-use galdeck::{Buttons, Encoders, Event, Rgb};
+use galdeck::{Buttons, Encoders, Event};
 use galdeck_core::{Clock, DeadlineCell, Scheduler, Tick, WakeReceiver, Waker};
 use galdeck_device::{KeyTarget, Paint};
 use galdeck_ipc::{Request, Response, Status};
@@ -17,7 +17,8 @@ use crate::io::DeviceMsg;
 
 use crate::render;
 use crate::ring::RingFeedback;
-use galdeck_model::{Config, EncoderConfig, KeyConfig, Page};
+use galdeck_model::v2::{EncoderConfig, KeyConfig, Page, Profile};
+use galdeck_model::{Diagnostics, ResolvedPalette, ResolvedStyle, StyleLayer, Workspace};
 
 /// Longest the core loop sleeps with nothing scheduled.
 ///
@@ -25,7 +26,11 @@ use galdeck_model::{Config, EncoderConfig, KeyConfig, Page};
 /// with the scheduler and every message rings the waker. It only bounds how
 /// long shutdown takes to notice.
 const CORE_IDLE: Duration = Duration::from_millis(250);
-const DEFAULT_KEY_COLOR: Rgb = Rgb::new(24, 26, 32);
+/// How many pages back a `back` key can walk.
+///
+/// A deck is navigated by hand, so this is far past any real trail; the point
+/// is only that the stack cannot grow for as long as the daemon runs.
+const MAX_PAGE_STACK: usize = 32;
 /// Cap on commands spawned for one coalesced rotation report.
 const MAX_DETENTS_PER_EVENT: u32 = 8;
 /// Depth of one encoder's rotation queue. Deep enough to absorb a fast
@@ -64,10 +69,21 @@ pub struct ControlMsg {
 }
 
 pub struct Engine {
-    config_path: PathBuf,
-    config: Config,
+    config_dir: PathBuf,
+    workspace: Workspace,
     font: Option<galdeck::Font>,
+    /// Which profile is showing, and where in it.
+    profile_id: String,
     page_index: usize,
+    /// Pages visited, so a key bound to `back` can return.
+    ///
+    /// Bounded: a deck is navigated by hand, and an unbounded stack would
+    /// grow for as long as the daemon runs.
+    page_stack: Vec<usize>,
+    /// The current profile's theme, folded and with its palette resolved.
+    /// Recomputed only when the profile or the config changes.
+    theme: StyleLayer,
+    palette: ResolvedPalette,
     brightness: u8,
     /// What the io thread last told us about the device. The engine never
     /// touches it directly.
@@ -116,8 +132,8 @@ pub enum DeviceMode {
 impl Engine {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        config_path: PathBuf,
-        config: Config,
+        config_dir: PathBuf,
+        workspace: Workspace,
         control_rx: Receiver<ControlMsg>,
         device_rx: Receiver<DeviceMsg>,
         paint_tx: SyncSender<Paint>,
@@ -126,13 +142,21 @@ impl Engine {
         wake: WakeReceiver,
         shutdown: Arc<AtomicBool>,
     ) -> Result<Self> {
-        let font = render::load_font(config.font.as_deref());
-        let brightness = config.brightness;
-        Ok(Engine {
-            config_path,
-            config,
+        let font = render::load_font(workspace.global.font.as_deref());
+        let brightness = workspace.global.brightness;
+        let profile_id = workspace
+            .start_profile()
+            .map(str::to_string)
+            .unwrap_or_default();
+        let mut engine = Engine {
+            config_dir,
+            workspace,
             font,
+            profile_id,
             page_index: 0,
+            page_stack: Vec::new(),
+            theme: StyleLayer::default(),
+            palette: ResolvedPalette::default(),
             brightness,
             device: DeviceStatus::default(),
             control_rx,
@@ -145,11 +169,34 @@ impl Engine {
             scheduler: Scheduler::new(),
             rotation: Encoders::indices().map(|_| RotationRunner::new()).collect(),
             rings: Encoders::indices().map(|_| RingFeedback::new()).collect(),
-        })
+        };
+        engine.enter_profile();
+        Ok(engine)
+    }
+
+    /// Recompute everything that depends on which profile is showing.
+    fn enter_profile(&mut self) {
+        let mut out = Diagnostics::new();
+        let theme_id = self
+            .workspace
+            .profile(&self.profile_id)
+            .and_then(|p| p.theme.clone());
+        let (theme, palette) = self.workspace.theme_for(theme_id.as_deref(), &mut out);
+        for diagnostic in out.iter() {
+            log::warn!("{}: {}", diagnostic.path, diagnostic.message);
+        }
+        self.theme = theme;
+        self.palette = palette;
+        self.page_index = self
+            .workspace
+            .profile(&self.profile_id)
+            .map(Profile::home_index)
+            .unwrap_or(0);
+        self.page_stack.clear();
     }
 
     pub fn run(&mut self) {
-        log::info!("engine started, config: {}", self.config_path.display());
+        log::info!("engine started, config: {}", self.config_dir.display());
         while !self.shutdown.load(Ordering::Relaxed) {
             let now = self.clock.now();
             for (_, kind) in self.scheduler.due(now) {
@@ -222,19 +269,46 @@ impl Engine {
         }
     }
 
-    fn current_page(&self) -> &Page {
-        &self.config.pages[self.page_index.min(self.config.pages.len() - 1)]
+    fn current_profile(&self) -> Option<&Profile> {
+        self.workspace.profile(&self.profile_id)
+    }
+
+    fn current_page(&self) -> Option<&Page> {
+        let profile = self.current_profile()?;
+        profile
+            .pages
+            .get(self.page_index.min(profile.pages.len().saturating_sub(1)))
     }
 
     fn key_config(&self, key: u8) -> Option<&KeyConfig> {
-        self.current_page().keys.iter().find(|k| k.key == key)
+        self.current_page()?.keys.iter().find(|k| k.key == key)
     }
 
     fn encoder_config(&self, encoder: u8) -> Option<&EncoderConfig> {
-        self.current_page()
+        self.current_page()?
             .encoders
             .iter()
             .find(|e| e.encoder == encoder)
+    }
+
+    /// The resolved style for one cell of the current page.
+    fn style_for(&self, cell: Option<&StyleLayer>, path: &str) -> ResolvedStyle {
+        let (Some(profile), Some(page)) = (self.current_profile(), self.current_page()) else {
+            return ResolvedStyle::BUILTIN;
+        };
+        let mut out = Diagnostics::new();
+        let (style, _) = self.workspace.style_for(
+            &self.theme,
+            &self.palette,
+            profile,
+            page,
+            cell,
+            path,
+            &mut out,
+        );
+        // Anything wrong here was already reported when the config loaded;
+        // repeating it once per repaint would drown the log.
+        style
     }
 
     /// Push the current page's full state to the device.
@@ -250,18 +324,20 @@ impl Engine {
         }
         self.send(Paint::Brightness(self.brightness));
 
-        let page = self.current_page();
+        // Cloned up front so the borrow of the workspace ends before the
+        // paints go out; a page is a dozen small structs.
+        let Some(page) = self.current_page().cloned() else {
+            return;
+        };
+
         for index in Buttons::indices() {
-            let target = match page.keys.iter().find(|k| k.key == index) {
+            let cell = page.keys.iter().find(|k| k.key == index);
+            let target = match cell {
                 Some(cfg) => {
-                    let background = cfg
-                        .color
-                        .as_deref()
-                        .and_then(Rgb::from_hex)
-                        .unwrap_or(DEFAULT_KEY_COLOR);
+                    let style = self.style_for(Some(&cfg.style), &format!("keys[{index}].style"));
                     let canvas = render::key(
-                        background,
-                        cfg.image.as_deref(),
+                        &style,
+                        cfg.icon.as_deref(),
                         cfg.label.as_deref(),
                         self.font.as_ref(),
                     );
@@ -269,7 +345,7 @@ impl Engine {
                         Ok(jpeg) => KeyTarget::Jpeg(jpeg.into()),
                         Err(e) => {
                             log::warn!("encoding key {index} failed: {e}");
-                            KeyTarget::Color(background)
+                            KeyTarget::Color(style.key_bg)
                         }
                     }
                 }
@@ -278,33 +354,19 @@ impl Engine {
             self.send(Paint::Key { index, target });
         }
 
-        let ring_colors: Vec<Rgb> = Encoders::indices()
-            .map(|index| {
-                self.current_page()
-                    .encoders
-                    .iter()
-                    .find(|e| e.encoder == index)
-                    .and_then(|cfg| cfg.ring.as_deref())
-                    .and_then(Rgb::from_hex)
-                    .unwrap_or(Rgb::BLACK)
-            })
-            .collect();
-        for (index, color) in Encoders::indices().zip(ring_colors) {
+        for index in Encoders::indices() {
+            let cell = page.encoders.iter().find(|e| e.encoder == index);
+            let style = self.style_for(cell.map(|c| &c.style), &format!("encoders[{index}].style"));
             // The page paints the ring, so the feedback state rests there --
             // but it does not get to claim the hardware shows it. Only the
             // mirror, on the far side of a real write, says that.
-            self.rings[index as usize].rest(color);
+            self.rings[index as usize].rest(style.ring);
             self.paint_ring(index);
         }
 
-        let page = self.current_page();
-        let text = page
-            .lcd_text
-            .as_deref()
-            .or(self.config.lcd_text.as_deref())
-            .unwrap_or(&page.name)
-            .to_string();
-        let screen = render::lcd(&text, self.font.as_ref());
+        let style = self.style_for(None, "lcd.style");
+        let text = page.lcd_text.clone().unwrap_or_else(|| page.id.clone());
+        let screen = render::lcd(&style, &text, self.font.as_ref());
         match screen.to_jpeg(galdeck::ids::DEFAULT_JPEG_QUALITY) {
             Ok(jpeg) => self.send(Paint::Lcd { jpeg: jpeg.into() }),
             Err(e) => log::warn!("encoding the lcd failed: {e}"),
@@ -335,15 +397,26 @@ impl Engine {
         log::debug!("event: {event:?}");
         match event {
             Event::KeyDown(key) => {
-                let (exec, page_target) = match self.key_config(key) {
-                    Some(cfg) => (cfg.exec.clone(), cfg.page.clone()),
-                    None => (None, None),
+                let Some(cfg) = self.key_config(key) else {
+                    return;
                 };
+                let (exec, page, profile, back) = (
+                    cfg.exec.clone(),
+                    cfg.page.clone(),
+                    cfg.profile.clone(),
+                    cfg.back,
+                );
                 if let Some(cmd) = exec {
                     spawn_action(&cmd);
                 }
-                if let Some(name) = page_target {
+                // At most one navigation, in the order a key would sensibly
+                // declare them.
+                if let Some(name) = profile {
+                    self.switch_profile(&name);
+                } else if let Some(name) = page {
                     self.switch_page(&name);
+                } else if back {
+                    self.go_back();
                 }
             }
             Event::EncoderDown(encoder) => {
@@ -387,18 +460,108 @@ impl Engine {
         }
     }
 
-    fn switch_page(&mut self, name: &str) -> bool {
-        match self.config.pages.iter().position(|p| p.name == name) {
+    fn switch_page(&mut self, id: &str) -> bool {
+        let Some(profile) = self.current_profile() else {
+            return false;
+        };
+        match profile.pages.iter().position(|p| p.id == id) {
+            Some(index) => {
+                if index != self.page_index {
+                    // Bounded, because a deck is navigated by hand and an
+                    // unbounded stack would grow for as long as the daemon
+                    // runs. Dropping the oldest entry loses the far end of a
+                    // very long trail, which nobody is walking back anyway.
+                    if self.page_stack.len() >= MAX_PAGE_STACK {
+                        self.page_stack.remove(0);
+                    }
+                    self.page_stack.push(self.page_index);
+                }
+                self.page_index = index;
+                self.paint_page();
+                true
+            }
+            None => {
+                log::warn!("unknown page {id:?}");
+                false
+            }
+        }
+    }
+
+    /// Return to the page this one was reached from.
+    fn go_back(&mut self) -> bool {
+        match self.page_stack.pop() {
             Some(index) => {
                 self.page_index = index;
                 self.paint_page();
                 true
             }
             None => {
-                log::warn!("unknown page {name:?}");
+                log::debug!("nothing to go back to");
                 false
             }
         }
+    }
+
+    fn switch_profile(&mut self, id: &str) -> bool {
+        if !self.workspace.profiles.contains_key(id) {
+            log::warn!("unknown profile {id:?}");
+            return false;
+        }
+        if id == self.profile_id {
+            return true;
+        }
+        log::info!("switching to profile {id:?}");
+        self.profile_id = id.to_string();
+        self.enter_profile();
+        self.paint_page();
+        true
+    }
+
+    /// Re-read the config from disk.
+    ///
+    /// Parse and validate before swapping, so a broken edit leaves the running
+    /// config alone rather than blanking the deck. Where the user was is
+    /// preserved by name where that still exists.
+    fn reload(&mut self) -> Response {
+        let (workspace, diagnostics) = Workspace::load(&self.config_dir);
+        let Some(workspace) = workspace else {
+            let message = diagnostics
+                .iter()
+                .map(|d| format!("{}: {}", d.path, d.message))
+                .collect::<Vec<_>>()
+                .join("\n");
+            return Response::Error { message };
+        };
+        for diagnostic in &diagnostics {
+            log::warn!("{}: {}", diagnostic.path, diagnostic.message);
+        }
+
+        let was_profile = self.profile_id.clone();
+        let was_page = self.current_page().map(|p| p.id.clone());
+
+        self.font = render::load_font(workspace.global.font.as_deref());
+        self.brightness = workspace.global.brightness;
+        self.profile_id = if workspace.profiles.contains_key(&was_profile) {
+            was_profile
+        } else {
+            workspace
+                .start_profile()
+                .map(str::to_string)
+                .unwrap_or_default()
+        };
+        self.workspace = workspace;
+        self.enter_profile();
+
+        if let Some(id) = was_page {
+            if let Some(index) = self
+                .current_profile()
+                .and_then(|p| p.pages.iter().position(|page| page.id == id))
+            {
+                self.page_index = index;
+            }
+        }
+        self.paint_page();
+        Response::Ok
     }
 
     fn service_control(&mut self) {
@@ -415,8 +578,14 @@ impl Engine {
                 connected: self.device.connected,
                 firmware: self.device.firmware.clone(),
                 serial: self.device.serial.clone(),
-                page: self.current_page().name.clone(),
-                pages: self.config.pages.iter().map(|p| p.name.clone()).collect(),
+                page: self
+                    .current_page()
+                    .map(|p| p.id.clone())
+                    .unwrap_or_default(),
+                pages: self
+                    .current_profile()
+                    .map(|p| p.pages.iter().map(|page| page.id.clone()).collect())
+                    .unwrap_or_default(),
                 brightness: self.brightness,
             }),
             Request::SetBrightness { percent } => {
@@ -441,24 +610,16 @@ impl Engine {
                     }
                 }
             }
-            Request::Reload => match Config::load(&self.config_path) {
-                Ok(config) => {
-                    self.font = render::load_font(config.font.as_deref());
-                    self.brightness = config.brightness;
-                    let current = self.current_page().name.clone();
-                    self.page_index = config
-                        .pages
-                        .iter()
-                        .position(|p| p.name == current)
-                        .unwrap_or(0);
-                    self.config = config;
-                    self.paint_page();
+            Request::SwitchProfile { name } => {
+                if self.switch_profile(&name) {
                     Response::Ok
+                } else {
+                    Response::Error {
+                        message: format!("unknown profile {name:?}"),
+                    }
                 }
-                Err(e) => Response::Error {
-                    message: format!("{e:#}"),
-                },
-            },
+            }
+            Request::Reload => self.reload(),
         }
     }
 }

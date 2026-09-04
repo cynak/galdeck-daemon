@@ -1,0 +1,22 @@
+name = "Play"
+theme = "nord-bright"
+home = "main"
+
+[[pages]]
+id = "main"
+lcd_text = "play"
+
+[[pages.keys]]
+key = 0
+label = "Steam"
+exec = "steam"
+
+[[pages.keys]]
+key = 11
+label = "Work"
+profile = "work"
+
+[[pages.encoders]]
+encoder = 0
+cw = "wpctl set-volume -l 1.0 @DEFAULT_AUDIO_SINK@ 2%+"
+ccw = "wpctl set-volume @DEFAULT_AUDIO_SINK@ 2%-"

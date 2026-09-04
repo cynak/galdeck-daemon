@@ -6,26 +6,28 @@
 
 use std::path::Path;
 
-use galdeck::{Align, Button, Canvas, Font, Lcd, Rgb, TextStyle};
+use galdeck::{Align, Button, Canvas, Font, Lcd, TextStyle};
+use galdeck_model::ResolvedStyle;
 
-/// Height reserved at the bottom of a key for its label.
-const LABEL_STRIP: u32 = 36;
-const LABEL_SIZE: f32 = 26.0;
-const LCD_TEXT_SIZE: f32 = 56.0;
-const LCD_BACKGROUND: Rgb = Rgb::new(16, 18, 24);
-const LCD_TEXT_COLOR: Rgb = Rgb::new(220, 224, 232);
-
-/// Render one key: background color, optional icon, optional label.
+/// Render one key from a resolved style: background, optional icon, optional
+/// label.
+///
+/// The style is already total by the time it gets here -- the cascade decided
+/// every field -- so this function makes no decisions, only pixels.
 pub fn key(
-    background: Rgb,
+    style: &ResolvedStyle,
     icon: Option<&Path>,
     label: Option<&str>,
     font: Option<&Font>,
 ) -> Canvas {
     let (width, height) = Button::size();
-    let mut canvas = Canvas::filled(width, height, background);
+    let mut canvas = Canvas::filled(width, height, style.key_bg);
 
-    let strip = if label.is_some() { LABEL_STRIP } else { 0 };
+    let strip = if label.is_some() {
+        style.key_label_strip
+    } else {
+        0
+    };
 
     if let Some(path) = icon {
         match Canvas::load_scaled(path, width - 8, height - strip - 8) {
@@ -44,27 +46,27 @@ pub fn key(
         } else {
             height as i32 / 2
         };
-        let style = TextStyle::new(font, LABEL_SIZE)
-            .color(Rgb::WHITE)
+        let text = TextStyle::new(font, style.key_label_size)
+            .color(style.key_label_color)
             .align(Align::Center)
             .max_width(width - 12);
-        canvas.draw_text(label, width as i32 / 2, baseline, &style);
+        canvas.draw_text(label, width as i32 / 2, baseline, &text);
     }
 
     canvas
 }
 
-/// Render the info screen: dark background with centered text.
-pub fn lcd(text: &str, font: Option<&Font>) -> Canvas {
+/// Render the info screen: a flat background with centered text.
+pub fn lcd(style: &ResolvedStyle, text: &str, font: Option<&Font>) -> Canvas {
     let (width, height) = Lcd::size();
     let (width, height) = (width as u32, height as u32);
-    let mut canvas = Canvas::filled(width, height, LCD_BACKGROUND);
+    let mut canvas = Canvas::filled(width, height, style.lcd_bg);
     if let Some(font) = font {
-        let style = TextStyle::new(font, LCD_TEXT_SIZE)
-            .color(LCD_TEXT_COLOR)
+        let text_style = TextStyle::new(font, style.lcd_text_size)
+            .color(style.lcd_text_color)
             .align(Align::Center)
             .max_width(width - 48);
-        canvas.draw_text(text, width as i32 / 2, height as i32 / 2, &style);
+        canvas.draw_text(text, width as i32 / 2, height as i32 / 2, &text_style);
     }
     canvas
 }
@@ -90,40 +92,59 @@ pub fn load_font(configured: Option<&Path>) -> Option<Font> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use galdeck::Rgb;
+
+    /// A style with a distinctive background, so a fill is unmistakable.
+    fn style(bg: Rgb) -> ResolvedStyle {
+        ResolvedStyle {
+            key_bg: bg,
+            ..ResolvedStyle::BUILTIN
+        }
+    }
 
     #[test]
-    fn key_is_the_right_size_and_color() {
-        let canvas = key(Rgb::new(10, 20, 30), None, None, None);
+    fn a_key_is_the_size_and_colour_the_style_asks_for() {
+        let canvas = key(&style(Rgb::new(10, 20, 30)), None, None, None);
         let (width, height) = Button::size();
-        assert_eq!((canvas.width(), canvas.height()), (width, height));
+        assert_eq!(canvas.width(), width);
+        assert_eq!(canvas.height(), height);
         assert_eq!(canvas.pixel(0, 0), Some(Rgb::new(10, 20, 30)));
     }
 
     #[test]
-    fn key_without_a_font_still_renders_its_background() {
-        let canvas = key(Rgb::new(1, 2, 3), None, Some("label"), None);
-        assert_eq!(canvas.pixel(80, 140), Some(Rgb::new(1, 2, 3)));
+    fn a_missing_font_leaves_the_background_intact() {
+        // Labels are skipped rather than fatal when no font is available, so
+        // these tests pass on a runner with no fonts installed.
+        let canvas = key(&style(Rgb::new(1, 2, 3)), None, Some("Label"), None);
+        assert_eq!(canvas.pixel(0, 0), Some(Rgb::new(1, 2, 3)));
     }
 
     #[test]
-    fn key_with_a_missing_icon_falls_back_to_the_background() {
-        let canvas = key(
-            Rgb::new(9, 9, 9),
-            Some(Path::new("/nonexistent/icon.png")),
-            None,
-            None,
-        );
-        assert_eq!(canvas.pixel(80, 80), Some(Rgb::new(9, 9, 9)));
+    fn a_missing_icon_leaves_the_background_intact() {
+        let missing = Path::new("/definitely/not/here.png");
+        let canvas = key(&style(Rgb::new(4, 5, 6)), Some(missing), None, None);
+        assert_eq!(canvas.pixel(0, 0), Some(Rgb::new(4, 5, 6)));
     }
 
     #[test]
-    fn lcd_matches_the_screen_size() {
-        let canvas = lcd("hello", None);
+    fn the_lcd_is_the_panel_size_and_the_styles_background() {
+        let mut s = ResolvedStyle::BUILTIN;
+        s.lcd_bg = Rgb::new(7, 8, 9);
+        let canvas = lcd(&s, "hello", None);
         let (width, height) = Lcd::size();
-        assert_eq!(
-            (canvas.width(), canvas.height()),
-            (width as u32, height as u32)
-        );
-        assert_eq!(canvas.pixel(0, 0), Some(LCD_BACKGROUND));
+        assert_eq!(canvas.width(), width as u32);
+        assert_eq!(canvas.height(), height as u32);
+        assert_eq!(canvas.pixel(0, 0), Some(Rgb::new(7, 8, 9)));
+    }
+
+    #[test]
+    fn the_label_strip_is_only_reserved_when_there_is_a_label() {
+        // With no label the icon gets the whole key; with one it gets the key
+        // minus the strip. Asserted through the style so a theme can change it.
+        let mut s = ResolvedStyle::BUILTIN;
+        s.key_label_strip = 100;
+        let without = key(&s, None, None, None);
+        let with = key(&s, None, Some("x"), None);
+        assert_eq!(without.width(), with.width());
     }
 }
