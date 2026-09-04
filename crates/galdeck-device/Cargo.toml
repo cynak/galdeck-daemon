@@ -11,4 +11,8 @@ description = "The device seam for galdeck-daemon: a Deck trait, the hardware ad
 
 [dependencies]
 galdeck.workspace = true
+galdeck-core.workspace = true
 log.workspace = true
+# Only the fake needs this: it decodes what it is handed so it can enforce the
+# JPEG-dimensions invariant the framework's report builders never check.
+image.workspace = true

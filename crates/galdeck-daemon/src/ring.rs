@@ -30,8 +30,10 @@ const HIGHLIGHT: f32 = 0.7;
 pub struct RingFeedback {
     /// Colour the page painted the ring; what it rests at.
     base: Rgb,
-    /// What the hardware is currently showing, per segment.
-    shown: [Rgb; SEGMENTS],
+    /// What the hardware is currently showing, per segment. `None` means
+    /// unknown -- nothing has been written since the last time the firmware
+    /// wiped the ring -- which forces the next diff to repaint that segment.
+    shown: [Option<Rgb>; SEGMENTS],
     /// What it should be showing.
     want: [Rgb; SEGMENTS],
     /// Lit segment, stepped one place per detent.
@@ -44,20 +46,45 @@ impl RingFeedback {
     pub fn new() -> Self {
         RingFeedback {
             base: Rgb::BLACK,
-            shown: [Rgb::BLACK; SEGMENTS],
+            shown: [None; SEGMENTS],
             want: [Rgb::BLACK; SEGMENTS],
             cursor: 0,
             until: None,
         }
     }
 
-    /// Record the colour the page just painted across the whole ring. The
-    /// hardware already shows it, so this yields no updates.
+    /// Record the colour the ring should rest at.
+    ///
+    /// This deliberately does *not* touch `shown`. `shown` means "what the
+    /// hardware is displaying", and only an actual write may claim that.
+    /// Setting it here used to be harmless because the page apply always
+    /// wrote every segment immediately beforehand; once diffing is the only
+    /// write path, that assumption silently loses every repaint after the
+    /// firmware wipes the ring.
     pub fn rest(&mut self, base: Rgb) {
         self.base = base;
-        self.shown = [base; SEGMENTS];
         self.want = [base; SEGMENTS];
         self.until = None;
+    }
+
+    /// Record that all four segments were just written to `base`.
+    ///
+    /// The page apply writes the whole ring itself, so it may legitimately
+    /// claim `shown` -- that is what keeps a page switch from immediately
+    /// rewriting the same four segments and spending 8 ms doing it.
+    pub fn painted(&mut self, base: Rgb) {
+        self.rest(base);
+        self.shown = [Some(base); SEGMENTS];
+    }
+
+    /// Forget what the hardware is showing, so the next diff repaints
+    /// everything.
+    ///
+    /// The firmware turns all the ring LEDs white when it re-enters software
+    /// mode, and says so only through `take_mode_reentry`. Without this, the
+    /// rings stay wrong until the next page switch.
+    pub fn forget(&mut self) {
+        self.shown = [None; SEGMENTS];
     }
 
     /// One detent: step the lit segment one place in the turn's direction.
@@ -86,8 +113,8 @@ impl RingFeedback {
         }
         let mut updates = Vec::new();
         for segment in 0..SEGMENTS {
-            if self.shown[segment] != self.want[segment] {
-                self.shown[segment] = self.want[segment];
+            if self.shown[segment] != Some(self.want[segment]) {
+                self.shown[segment] = Some(self.want[segment]);
                 updates.push((segment as u8, self.want[segment]));
             }
         }
@@ -120,7 +147,7 @@ mod tests {
 
     fn rested() -> (RingFeedback, Instant) {
         let mut ring = RingFeedback::new();
-        ring.rest(BASE);
+        ring.painted(BASE);
         (ring, Instant::now())
     }
 
@@ -204,7 +231,7 @@ mod tests {
     #[test]
     fn an_unconfigured_black_ring_still_lights_up() {
         let mut ring = RingFeedback::new();
-        ring.rest(Rgb::BLACK);
+        ring.painted(Rgb::BLACK);
         let now = Instant::now();
         ring.turn(1, now);
         let updates = ring.updates(now);
@@ -218,8 +245,32 @@ mod tests {
         ring.turn(1, now);
         ring.updates(now);
 
-        ring.rest(Rgb::BLUE);
+        ring.painted(Rgb::BLUE);
         assert!(!ring.is_active());
         assert!(ring.updates(now).is_empty());
+    }
+
+    #[test]
+    fn forgetting_repaints_all_four_segments() {
+        // The firmware turns every ring LED white when it re-enters software
+        // mode. Diffing against a stale `shown` would then produce no writes
+        // at all and leave the rings wrong until the next page switch.
+        let (mut ring, now) = rested();
+        assert!(ring.updates(now).is_empty());
+
+        ring.forget();
+        let updates = ring.updates(now);
+        assert_eq!(updates.len(), SEGMENTS, "every segment must be rewritten");
+        assert!(updates.iter().all(|(_, color)| *color == BASE));
+    }
+
+    #[test]
+    fn resting_alone_does_not_claim_the_hardware_shows_it() {
+        // `rest` records intent; only a real write may claim `shown`. A ring
+        // that has never been painted must still emit its first four writes.
+        let mut ring = RingFeedback::new();
+        ring.rest(BASE);
+        let updates = ring.updates(Instant::now());
+        assert_eq!(updates.len(), SEGMENTS);
     }
 }

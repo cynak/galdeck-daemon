@@ -9,9 +9,43 @@ use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use galdeck::{Buttons, Encoders, Error, Event, Lcd, Rgb, Ring};
+use galdeck::{Buttons, Encoders, Event, Lcd, Rgb, Ring};
+use galdeck_core::{Clock, ManualClock, Tick};
 
-use crate::{check_key, check_lcd_rect, check_ring, Deck, DeckOp};
+use crate::{check_key, check_lcd_rect, check_ring, invalid, Deck, DeckOp, DeckResult};
+
+/// How long the module may go untouched before the firmware drops out of
+/// software mode. Mirrors `galdeck::ids::SOFTWARE_MODE_REENTRY_GAP`.
+const REENTRY_GAP: Duration = Duration::from_secs(2);
+/// What the next call costs once that has happened: the framework sleeps a
+/// full second waiting for the firmware to finish asserting its own state.
+const REENTRY_SETTLE: Duration = Duration::from_millis(1000);
+
+/// Something the real firmware would not forgive.
+///
+/// These are recorded rather than returned, because the hardware does not
+/// return them either -- it misbehaves quietly. Surfacing them here is the
+/// main reason the fake is worth more than a stub.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Violation {
+    /// A JPEG that does not decode to the rectangle it was sent for.
+    ///
+    /// `protocol::lcd_region_reports` documents that the JPEG "must decode to
+    /// exactly width x height" and then never checks it, and
+    /// `key_image_reports` never checks for 160x160 either. The firmware's
+    /// behaviour when they disagree is undefined.
+    JpegDimensionMismatch {
+        what: String,
+        expected: (u32, u32),
+        actual: (u32, u32),
+    },
+    /// A payload that is not a decodable JPEG at all.
+    UndecodableJpeg { what: String },
+    /// The module went untouched for long enough to drop out of software
+    /// mode. On real hardware the next call then blocks for a second and the
+    /// ring LEDs come back white.
+    KeepaliveGap { gap: Duration },
+}
 
 /// What one key is currently showing.
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
@@ -60,6 +94,8 @@ pub struct DeckSurface {
     pub image_writes: u64,
     /// Bumped on every change, so a watcher can tell whether anything moved.
     pub generation: u64,
+    /// Things the real firmware would not forgive, in the order they happened.
+    pub violations: Vec<Violation>,
 }
 
 impl Default for DeckSurface {
@@ -73,6 +109,7 @@ impl Default for DeckSurface {
             feature_writes: 0,
             image_writes: 0,
             generation: 0,
+            violations: Vec::new(),
         }
     }
 }
@@ -103,6 +140,11 @@ pub struct FakeDeck {
     reentry: Arc<Mutex<bool>>,
     firmware: String,
     serial: String,
+    /// When set, time is simulated: polls and writes advance this clock
+    /// instead of blocking, so a sixty-second soak runs in microseconds.
+    clock: Option<Arc<ManualClock>>,
+    /// Simulated time of the last device interaction, for gap detection.
+    last_touch: Tick,
 }
 
 /// The test/preview side of a [`FakeDeck`]: injects input, reads the surface.
@@ -114,25 +156,42 @@ pub struct FakeDeckHandle {
 }
 
 impl FakeDeck {
-    /// Build a fake deck and the handle that drives it.
-    ///
-    /// The default identity reports the firmware this project validated
-    /// against, so code paths that check `VALIDATED_FIRMWARES` take the same
-    /// branch they would on the real device.
+    /// A fake deck that runs in real time, for `--device virtual`.
     pub fn new() -> (Self, FakeDeckHandle) {
-        Self::with_identity("3.05.003", "FAKE0000000000")
+        Self::build("3.05.003", "FAKE0000000000", None)
+    }
+
+    /// A fake deck whose time is simulated.
+    ///
+    /// Polls advance the clock by their timeout instead of blocking, and each
+    /// write charges its modelled cost, so an hour-long soak runs instantly
+    /// and a keepalive bug shows up as a gap rather than as a flaky timing
+    /// assertion.
+    pub fn simulated(clock: Arc<ManualClock>) -> (Self, FakeDeckHandle) {
+        Self::build("3.05.003", "FAKE0000000000", Some(clock))
     }
 
     pub fn with_identity(firmware: &str, serial: &str) -> (Self, FakeDeckHandle) {
+        Self::build(firmware, serial, None)
+    }
+
+    fn build(
+        firmware: &str,
+        serial: &str,
+        clock: Option<Arc<ManualClock>>,
+    ) -> (Self, FakeDeckHandle) {
         let (tx, rx) = std::sync::mpsc::channel();
         let surface = Arc::new(Mutex::new(DeckSurface::default()));
         let reentry = Arc::new(Mutex::new(false));
+        let last_touch = clock.as_ref().map(|c| c.now()).unwrap_or(Tick::ZERO);
         let deck = Self {
             surface: Arc::clone(&surface),
             input: rx,
             reentry: Arc::clone(&reentry),
             firmware: firmware.to_string(),
             serial: serial.to_string(),
+            clock,
+            last_touch,
         };
         let handle = FakeDeckHandle {
             surface,
@@ -142,12 +201,61 @@ impl FakeDeck {
         (deck, handle)
     }
 
-    fn record<F: FnOnce(&mut DeckSurface)>(&self, op: DeckOp, f: F) {
+    /// Note that the device was touched, and replicate what the firmware does
+    /// when it has not been touched for too long.
+    fn touch(&mut self) {
+        let Some(clock) = self.clock.as_ref() else {
+            return;
+        };
+        let now = clock.now();
+        let gap = now.duration_since(self.last_touch);
+        if gap >= REENTRY_GAP {
+            self.note(Violation::KeepaliveGap { gap });
+            // The framework sleeps a full second here, and the firmware wipes
+            // the ring LEDs on the way back in.
+            clock.advance(REENTRY_SETTLE);
+            *self.reentry.lock().expect("reentry flag poisoned") = true;
+        }
+        self.last_touch = clock.now();
+    }
+
+    fn note(&self, violation: Violation) {
+        let mut surface = self.surface.lock().expect("deck surface poisoned");
+        surface.violations.push(violation);
+    }
+
+    /// Check a payload really is a JPEG of the size it was sent for.
+    fn check_jpeg(&self, what: &str, jpeg: &[u8], expected: (u32, u32)) {
+        match jpeg_dimensions(jpeg) {
+            Some(actual) if actual == expected => {}
+            Some(actual) => self.note(Violation::JpegDimensionMismatch {
+                what: what.to_string(),
+                expected,
+                actual,
+            }),
+            None => self.note(Violation::UndecodableJpeg {
+                what: what.to_string(),
+            }),
+        }
+    }
+
+    fn record<F: FnOnce(&mut DeckSurface)>(&mut self, op: DeckOp, f: F) {
+        self.touch();
+        if let Some(clock) = self.clock.as_ref() {
+            clock.advance(op.cost());
+        }
         let mut surface = self.surface.lock().expect("deck surface poisoned");
         f(&mut surface);
         surface.ops.push(op);
         surface.generation += 1;
     }
+}
+
+/// Dimensions of a JPEG without decoding its pixels.
+fn jpeg_dimensions(jpeg: &[u8]) -> Option<(u32, u32)> {
+    image::ImageReader::with_format(std::io::Cursor::new(jpeg), image::ImageFormat::Jpeg)
+        .into_dimensions()
+        .ok()
 }
 
 impl FakeDeckHandle {
@@ -169,6 +277,15 @@ impl FakeDeckHandle {
             .lock()
             .expect("deck surface poisoned")
             .ops
+            .clone()
+    }
+
+    /// Everything the real firmware would not have forgiven.
+    pub fn violations(&self) -> Vec<Violation> {
+        self.surface
+            .lock()
+            .expect("deck surface poisoned")
+            .violations
             .clone()
     }
 
@@ -198,8 +315,23 @@ impl Deck for FakeDeck {
         &self.serial
     }
 
-    fn poll(&mut self, timeout: Duration) -> Result<Vec<Event>, Error> {
+    fn poll(&mut self, timeout: Duration) -> DeckResult<Vec<Event>> {
+        self.touch();
         let mut events = Vec::new();
+
+        if let Some(clock) = self.clock.as_ref() {
+            // Simulated: never block. Take whatever is queued, and if there is
+            // nothing, let the timeout elapse in simulated time.
+            while let Ok(event) = self.input.try_recv() {
+                events.push(event);
+            }
+            if events.is_empty() {
+                clock.advance(timeout);
+            }
+            self.last_touch = clock.now();
+            return Ok(events);
+        }
+
         match self.input.recv_timeout(timeout) {
             Ok(event) => events.push(event),
             Err(RecvTimeoutError::Timeout) => return Ok(events),
@@ -220,11 +352,9 @@ impl Deck for FakeDeck {
         std::mem::take(&mut *flag)
     }
 
-    fn set_brightness(&mut self, percent: u8) -> Result<(), Error> {
+    fn set_brightness(&mut self, percent: u8) -> DeckResult<()> {
         if percent > 100 {
-            return Err(Error::InvalidArgument(format!(
-                "brightness {percent} out of range"
-            )));
+            return Err(invalid(format!("brightness {percent} out of range")));
         }
         self.record(DeckOp::Brightness(percent), |s| {
             s.brightness = percent;
@@ -233,8 +363,13 @@ impl Deck for FakeDeck {
         Ok(())
     }
 
-    fn set_key_jpeg(&mut self, key: u8, jpeg: &[u8]) -> Result<(), Error> {
+    fn set_key_jpeg(&mut self, key: u8, jpeg: &[u8]) -> DeckResult<()> {
         check_key(key)?;
+        self.check_jpeg(
+            &format!("key {key}"),
+            jpeg,
+            (Buttons::PIXEL_SIZE, Buttons::PIXEL_SIZE),
+        );
         let jpeg: Arc<[u8]> = Arc::from(jpeg);
         self.record(
             DeckOp::KeyJpeg {
@@ -249,7 +384,7 @@ impl Deck for FakeDeck {
         Ok(())
     }
 
-    fn set_key_color(&mut self, key: u8, color: Rgb) -> Result<(), Error> {
+    fn set_key_color(&mut self, key: u8, color: Rgb) -> DeckResult<()> {
         check_key(key)?;
         self.record(DeckOp::KeyColor { key, color }, |s| {
             s.keys[key as usize] = KeySurface::Color(color);
@@ -258,7 +393,7 @@ impl Deck for FakeDeck {
         Ok(())
     }
 
-    fn clear_key(&mut self, key: u8) -> Result<(), Error> {
+    fn clear_key(&mut self, key: u8) -> DeckResult<()> {
         check_key(key)?;
         self.record(DeckOp::KeyClear { key }, |s| {
             s.keys[key as usize] = KeySurface::Blank;
@@ -267,7 +402,7 @@ impl Deck for FakeDeck {
         Ok(())
     }
 
-    fn set_ring_segment(&mut self, encoder: u8, segment: u8, color: Rgb) -> Result<(), Error> {
+    fn set_ring_segment(&mut self, encoder: u8, segment: u8, color: Rgb) -> DeckResult<()> {
         check_ring(encoder, segment)?;
         self.record(
             DeckOp::RingSegment {
@@ -290,8 +425,13 @@ impl Deck for FakeDeck {
         width: u16,
         height: u16,
         jpeg: &[u8],
-    ) -> Result<(), Error> {
+    ) -> DeckResult<()> {
         check_lcd_rect(x, y, width, height)?;
+        self.check_jpeg(
+            &format!("lcd {width}x{height}+{x}+{y}"),
+            jpeg,
+            (u32::from(width), u32::from(height)),
+        );
         let jpeg: Arc<[u8]> = Arc::from(jpeg);
         let patch = LcdPatch {
             x,
@@ -321,7 +461,7 @@ impl Deck for FakeDeck {
         Ok(())
     }
 
-    fn clear_all(&mut self) -> Result<(), Error> {
+    fn clear_all(&mut self) -> DeckResult<()> {
         self.record(DeckOp::ClearAll, |s| {
             s.keys.fill(KeySurface::Blank);
             s.rings.fill([Rgb::BLACK; Ring::SEGMENTS as usize]);
@@ -334,7 +474,7 @@ impl Deck for FakeDeck {
         Ok(())
     }
 
-    fn reset_to_logo(&mut self) -> Result<(), Error> {
+    fn reset_to_logo(&mut self) -> DeckResult<()> {
         self.record(DeckOp::ResetToLogo, |s| s.feature_writes += 1);
         Ok(())
     }

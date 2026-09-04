@@ -8,7 +8,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use galdeck::{Buttons, Encoders, Event, Galleon, Rgb};
+use galdeck::{Buttons, Encoders, Event, Rgb};
+use galdeck_device::{Deck, DeckError, FakeDeck, FakeDeckHandle, HardwareDeck};
 use galdeck_ipc::{Request, Response, Status};
 
 use crate::render;
@@ -42,6 +43,10 @@ pub struct Engine {
     page_index: usize,
     brightness: u8,
     device: Option<DeviceState>,
+    device_mode: DeviceMode,
+    /// Kept alive for the virtual deck so its surface can be inspected and
+    /// input can be injected into it.
+    virtual_handle: Option<FakeDeckHandle>,
     last_connect_attempt: Option<Instant>,
     control_rx: Receiver<ControlMsg>,
     shutdown: Arc<AtomicBool>,
@@ -52,9 +57,19 @@ pub struct Engine {
 }
 
 struct DeviceState {
-    deck: Galleon,
-    firmware: String,
-    serial: String,
+    deck: Box<dyn Deck>,
+}
+
+/// Which deck the daemon drives.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum DeviceMode {
+    /// Use the keyboard if it is present, and keep retrying if it is not.
+    #[default]
+    Auto,
+    /// A deck that exists only in memory. Everything above the seam behaves
+    /// identically, which is what lets the configuration UI be developed and
+    /// tested on a machine with no keyboard attached.
+    Virtual,
 }
 
 impl Engine {
@@ -63,6 +78,7 @@ impl Engine {
         config: Config,
         control_rx: Receiver<ControlMsg>,
         shutdown: Arc<AtomicBool>,
+        device_mode: DeviceMode,
     ) -> Result<Self> {
         let font = render::load_font(config.font.as_deref());
         let brightness = config.brightness;
@@ -73,6 +89,8 @@ impl Engine {
             page_index: 0,
             brightness,
             device: None,
+            device_mode,
+            virtual_handle: None,
             last_connect_attempt: None,
             control_rx,
             shutdown,
@@ -107,6 +125,11 @@ impl Engine {
                     // state — redraw the page.
                     if state.deck.take_mode_reentry() {
                         log::info!("module re-entered software mode, re-applying page");
+                        // The firmware wiped the ring LEDs white, so what we
+                        // believe they show is no longer true.
+                        for ring in &mut self.rings {
+                            ring.forget();
+                        }
                         self.apply_page();
                     }
                     for event in events {
@@ -114,10 +137,13 @@ impl Engine {
                     }
                     self.tick_rings();
                 }
-                Err(e) => {
+                // A garbled report is worth ignoring; a vanished device is
+                // not. Telling them apart is why the seam classifies errors.
+                Err(e) if e.is_disconnected() => {
                     log::warn!("device error, will reconnect: {e}");
                     self.device = None;
                 }
+                Err(e) => log::debug!("device hiccup, continuing: {e}"),
             }
         }
 
@@ -138,6 +164,21 @@ impl Engine {
         }
         self.last_connect_attempt = Some(Instant::now());
 
+        if self.device_mode == DeviceMode::Virtual {
+            let (deck, handle) = FakeDeck::new();
+            log::info!(
+                "connected: virtual deck, firmware {}, serial {}",
+                deck.firmware(),
+                deck.serial()
+            );
+            self.virtual_handle = Some(handle);
+            self.device = Some(DeviceState {
+                deck: Box::new(deck),
+            });
+            self.apply_page();
+            return;
+        }
+
         let api = match galdeck::hidapi::HidApi::new() {
             Ok(api) => api,
             Err(e) => {
@@ -145,21 +186,22 @@ impl Engine {
                 return;
             }
         };
-        match Galleon::open(&api) {
-            Ok(mut deck) => {
-                let firmware = deck.firmware_version().unwrap_or_else(|_| "unknown".into());
-                let serial = deck.serial_number().unwrap_or_else(|_| "unknown".into());
-                log::info!("connected: firmware {firmware}, serial {serial}");
-                if !galdeck::ids::VALIDATED_FIRMWARES.contains(&firmware.as_str()) {
+        match HardwareDeck::open(&api) {
+            Ok(deck) => {
+                log::info!(
+                    "connected: firmware {}, serial {}",
+                    deck.firmware(),
+                    deck.serial()
+                );
+                if !deck.firmware_is_validated() {
                     log::warn!(
-                        "firmware {firmware} differs from the validated versions {:?} — if the module drops out of software mode, the keepalive may have changed on this firmware; please report it",
+                        "firmware {} differs from the validated versions {:?} — if the module drops out of software mode, the keepalive may have changed on this firmware; please report it",
+                        deck.firmware(),
                         galdeck::ids::VALIDATED_FIRMWARES
                     );
                 }
                 self.device = Some(DeviceState {
-                    deck,
-                    firmware,
-                    serial,
+                    deck: Box::new(deck),
                 });
                 self.apply_page();
             }
@@ -206,7 +248,7 @@ impl Engine {
             })
             .collect();
 
-        let result: std::result::Result<(), galdeck::Error> = (|| {
+        let result: std::result::Result<(), DeckError> = (|| {
             state.deck.set_brightness(self.brightness)?;
 
             for index in Buttons::indices() {
@@ -223,14 +265,22 @@ impl Engine {
                             cfg.label.as_deref(),
                             self.font.as_ref(),
                         );
-                        state.deck.button(index)?.draw(&canvas)?;
+                        // Encode here rather than in the framework's
+                        // Button::draw: the seam takes bytes, which is what
+                        // will let the compositor encode off this thread.
+                        let jpeg = canvas
+                            .to_jpeg(galdeck::ids::DEFAULT_JPEG_QUALITY)
+                            .map_err(DeckError::classify)?;
+                        state.deck.set_key_jpeg(index, &jpeg)?;
                     }
-                    None => state.deck.button(index)?.clear()?,
+                    None => state.deck.clear_key(index)?,
                 }
             }
 
             for (index, color) in Encoders::indices().zip(ring_colors.iter().copied()) {
-                state.deck.encoder(index)?.ring().set_all(color)?;
+                for segment in 0..galdeck::Ring::SEGMENTS {
+                    state.deck.set_ring_segment(index, segment, color)?;
+                }
             }
 
             let text = page
@@ -239,7 +289,12 @@ impl Engine {
                 .or(self.config.lcd_text.as_deref())
                 .unwrap_or(&page.name);
             let screen = render::lcd(text, self.font.as_ref());
-            state.deck.lcd().draw(&screen)?;
+            let jpeg = screen
+                .to_jpeg(galdeck::ids::DEFAULT_JPEG_QUALITY)
+                .map_err(DeckError::classify)?;
+            state
+                .deck
+                .draw_lcd_jpeg(0, 0, galdeck::Lcd::WIDTH, galdeck::Lcd::HEIGHT, &jpeg)?;
             Ok(())
         })();
 
@@ -248,13 +303,17 @@ impl Engine {
             // after every turn.
             Ok(()) => {
                 for (ring, color) in self.rings.iter_mut().zip(ring_colors) {
-                    ring.rest(color);
+                    ring.painted(color);
                 }
             }
-            Err(e) => {
+            // Only a disconnect is worth tearing the handle down for. A bad
+            // argument would otherwise spin the reconnect loop forever, and
+            // every attempt blocks 1.2 seconds re-opening the device.
+            Err(e) if e.is_disconnected() => {
                 log::warn!("applying page failed, will reconnect: {e}");
                 self.device = None;
             }
+            Err(e) => log::warn!("applying page failed: {e}"),
         }
     }
 
@@ -267,10 +326,7 @@ impl Engine {
         let mut failure = None;
         'rings: for (index, ring) in self.rings.iter_mut().enumerate() {
             for (segment, color) in ring.updates(now) {
-                let write = state
-                    .deck
-                    .encoder(index as u8)
-                    .and_then(|mut encoder| encoder.ring().set_segment(segment, color));
+                let write = state.deck.set_ring_segment(index as u8, segment, color);
                 if let Err(e) = write {
                     failure = Some(e);
                     break 'rings;
@@ -278,8 +334,12 @@ impl Engine {
             }
         }
         if let Some(e) = failure {
-            log::warn!("ring feedback failed, will reconnect: {e}");
-            self.device = None;
+            if e.is_disconnected() {
+                log::warn!("ring feedback failed, will reconnect: {e}");
+                self.device = None;
+            } else {
+                log::warn!("ring feedback failed: {e}");
+            }
         }
     }
 
@@ -363,8 +423,8 @@ impl Engine {
             Request::Ping => Response::Ok,
             Request::Status => Response::Status(Status {
                 connected: self.device.is_some(),
-                firmware: self.device.as_ref().map(|d| d.firmware.clone()),
-                serial: self.device.as_ref().map(|d| d.serial.clone()),
+                firmware: self.device.as_ref().map(|d| d.deck.firmware().to_string()),
+                serial: self.device.as_ref().map(|d| d.deck.serial().to_string()),
                 page: self.current_page().name.clone(),
                 pages: self.config.pages.iter().map(|p| p.name.clone()).collect(),
                 brightness: self.brightness,

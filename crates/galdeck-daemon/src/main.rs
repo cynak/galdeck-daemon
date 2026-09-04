@@ -1,20 +1,24 @@
-mod engine;
-mod ipc_server;
-mod render;
-mod ring;
-
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::channel;
 use std::sync::Arc;
 
 use anyhow::Result;
+use clap::ValueEnum;
+use galdeck_daemon::{engine, ipc_server};
+
 use clap::Parser;
+use engine::DeviceMode;
 
 /// Daemon programming the Corsair Galleon 100 SD's built-in Stream Deck.
 #[derive(Parser)]
 #[command(version, about)]
 struct Args {
+    /// Which deck to drive: the keyboard, or one that exists only in memory
+    /// so the daemon can run on a machine with no hardware attached.
+    #[arg(long, value_enum, default_value_t = DeviceArg::Auto)]
+    device: DeviceArg,
+
     /// Config file (default: ~/.config/galdeck/config.toml)
     #[arg(long)]
     config: Option<PathBuf>,
@@ -52,9 +56,32 @@ fn main() -> Result<()> {
     let (control_tx, control_rx) = channel();
     std::thread::spawn(move || ipc_server::serve(listener, control_tx));
 
-    let mut engine = engine::Engine::new(config_path, config, control_rx, shutdown)?;
+    let mut engine = engine::Engine::new(
+        config_path,
+        config,
+        control_rx,
+        shutdown,
+        args.device.into(),
+    )?;
     engine.run();
 
     let _ = std::fs::remove_file(&socket_path);
     Ok(())
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug, ValueEnum)]
+enum DeviceArg {
+    /// Use the keyboard if it is present, and keep retrying if it is not.
+    Auto,
+    /// A deck that exists only in memory.
+    Virtual,
+}
+
+impl From<DeviceArg> for DeviceMode {
+    fn from(arg: DeviceArg) -> Self {
+        match arg {
+            DeviceArg::Auto => DeviceMode::Auto,
+            DeviceArg::Virtual => DeviceMode::Virtual,
+        }
+    }
 }

@@ -11,10 +11,20 @@ homepage.workspace = true
 keywords = ["streamdeck", "corsair", "galleon", "daemon", "linux"]
 categories = ["hardware-support", "command-line-utilities"]
 
+[lib]
+name = "galdeck_daemon"
+path = "src/lib.rs"
+
+[[bin]]
+name = "galdeck-daemon"
+path = "src/main.rs"
+
 [dependencies]
 galdeck = { workspace = true }
 galdeck-ipc = { workspace = true }
 galdeck-model = { workspace = true }
+galdeck-device = { workspace = true }
+galdeck-core = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 toml = { workspace = true }

@@ -352,6 +352,8 @@ dependencies = [
  "ctrlc",
  "env_logger",
  "galdeck",
+ "galdeck-core",
+ "galdeck-device",
  "galdeck-ipc",
  "galdeck-model",
  "log",
@@ -365,6 +367,8 @@ name = "galdeck-device"
 version = "0.1.0"
 dependencies = [
  "galdeck",
+ "galdeck-core",
+ "image",
  "log",
 ]
 

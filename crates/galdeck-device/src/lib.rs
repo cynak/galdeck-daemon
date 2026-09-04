@@ -22,10 +22,12 @@ use std::time::Duration;
 
 use galdeck::{Buttons, Encoders, Error, Event, Lcd, Rgb, Ring};
 
+mod error;
 mod fake;
 mod hardware;
 
-pub use fake::{DeckSurface, FakeDeck, FakeDeckHandle, KeySurface, LcdPatch};
+pub use error::{DeckError, DeckResult};
+pub use fake::{DeckSurface, FakeDeck, FakeDeckHandle, KeySurface, LcdPatch, Violation};
 pub use hardware::HardwareDeck;
 
 /// The forced pause after every feature report.
@@ -42,6 +44,14 @@ pub const FEATURE_REPORT_COST: Duration = Duration::from_millis(2);
 /// bottleneck, so this is really the cost of one `write()` syscall. Measured
 /// well under this; the round number keeps the budget conservative.
 pub const IMAGE_REPORT_COST: Duration = Duration::from_micros(25);
+
+/// Modelled cost of encoding one full 720x384 LCD frame.
+///
+/// `image`'s JPEG encoder is single-threaded and hardwired to 4:4:4 chroma,
+/// so a full frame is around ten milliseconds of CPU on the calling thread.
+/// Partial regions scale with area, which is the entire reason dirty-rect
+/// rendering is worth building.
+pub const LCD_FULL_FRAME_ENCODE: Duration = Duration::from_millis(10);
 
 /// Payload bytes per key-image report (1024 minus an 8-byte header).
 const KEY_IMAGE_PAYLOAD: usize = 1016;
@@ -62,7 +72,7 @@ pub trait Deck: Send {
     /// Implementations must keep the keepalive alive for the whole wait:
     /// going quiet for more than two seconds makes the *next* device call
     /// block a full second while the module re-enters software mode.
-    fn poll(&mut self, timeout: Duration) -> Result<Vec<Event>, Error>;
+    fn poll(&mut self, timeout: Duration) -> DeckResult<Vec<Event>>;
 
     /// True once after the module re-entered software mode, which wipes
     /// firmware-asserted state (the ring LEDs go white). The caller must
@@ -72,24 +82,24 @@ pub trait Deck: Send {
     /// must be unconditional.
     fn take_mode_reentry(&mut self) -> bool;
 
-    fn set_brightness(&mut self, percent: u8) -> Result<(), Error>;
+    fn set_brightness(&mut self, percent: u8) -> DeckResult<()>;
 
     /// Push a pre-encoded 160x160 JPEG to a key. Keys have no partial update:
     /// this is the only way to change what one shows, short of a solid fill.
-    fn set_key_jpeg(&mut self, key: u8, jpeg: &[u8]) -> Result<(), Error>;
+    fn set_key_jpeg(&mut self, key: u8, jpeg: &[u8]) -> DeckResult<()>;
 
     /// Fill a key with a solid colour. Cheap in bytes but *not* in wall clock:
     /// it is a feature report, so it costs 2 ms, which makes it roughly an
     /// order of magnitude slower than pushing a small JPEG of the same fill.
     /// Prefer the JPEG path for anything on a hot repaint route.
-    fn set_key_color(&mut self, key: u8, color: Rgb) -> Result<(), Error>;
+    fn set_key_color(&mut self, key: u8, color: Rgb) -> DeckResult<()>;
 
-    fn clear_key(&mut self, key: u8) -> Result<(), Error>;
+    fn clear_key(&mut self, key: u8) -> DeckResult<()>;
 
     /// Set one ring segment; segment 0 is the top LED, then clockwise.
     /// One feature report, so 2 ms — a full ring is 8 ms, both rings 16 ms,
     /// which is what caps ring animation at about 30 Hz once diffed.
-    fn set_ring_segment(&mut self, encoder: u8, segment: u8, color: Rgb) -> Result<(), Error>;
+    fn set_ring_segment(&mut self, encoder: u8, segment: u8, color: Rgb) -> DeckResult<()>;
 
     /// Push a pre-encoded JPEG to a rectangle of the LCD. The JPEG must decode
     /// to exactly `width` x `height` and the rectangle must fit in 720x384.
@@ -102,10 +112,10 @@ pub trait Deck: Send {
         width: u16,
         height: u16,
         jpeg: &[u8],
-    ) -> Result<(), Error>;
+    ) -> DeckResult<()>;
 
-    fn clear_all(&mut self) -> Result<(), Error>;
-    fn reset_to_logo(&mut self) -> Result<(), Error>;
+    fn clear_all(&mut self) -> DeckResult<()>;
+    fn reset_to_logo(&mut self) -> DeckResult<()>;
 }
 
 /// One device write, resolved to bytes and ready to push.
@@ -159,16 +169,25 @@ impl DeckOp {
             DeckOp::KeyJpeg { jpeg, .. } => image_cost(jpeg.len(), KEY_IMAGE_PAYLOAD),
             DeckOp::LcdRegion { jpeg, .. } => image_cost(jpeg.len(), LCD_REGION_PAYLOAD),
             // 12 key fills plus 8 ring LEDs, then a full black LCD frame.
+            // 12 key fills plus 8 ring LEDs, and then -- easy to miss -- a
+            // full black LCD frame, which the framework encodes on the spot
+            // under its `encode` feature. That last part is most of the cost,
+            // and charging only the feature reports would let the io budget
+            // schedule a clear it cannot afford.
             DeckOp::ClearAll => {
                 let feature_reports = u32::from(Buttons::COUNT)
                     + u32::from(Encoders::COUNT) * u32::from(Ring::SEGMENTS);
+                // A flat black 720x384 frame encodes to roughly five kilobytes.
+                const FLAT_LCD_FRAME_BYTES: usize = 5 * 1024;
                 FEATURE_REPORT_COST * feature_reports
+                    + LCD_FULL_FRAME_ENCODE
+                    + image_cost(FLAT_LCD_FRAME_BYTES, LCD_REGION_PAYLOAD)
             }
         }
     }
 
     /// Push this op to a deck.
-    pub fn apply(&self, deck: &mut dyn Deck) -> Result<(), Error> {
+    pub fn apply(&self, deck: &mut dyn Deck) -> DeckResult<()> {
         match self {
             DeckOp::Brightness(percent) => deck.set_brightness(*percent),
             DeckOp::KeyJpeg { key, jpeg } => deck.set_key_jpeg(*key, jpeg),
@@ -197,31 +216,25 @@ fn image_cost(bytes: usize, payload_per_report: usize) -> Duration {
     IMAGE_REPORT_COST * reports as u32
 }
 
-pub(crate) fn check_key(key: u8) -> Result<(), Error> {
+pub(crate) fn check_key(key: u8) -> DeckResult<()> {
     if key < Buttons::COUNT {
         Ok(())
     } else {
-        Err(Error::InvalidArgument(format!(
-            "key index {key} out of range"
-        )))
+        Err(invalid(format!("key index {key} out of range")))
     }
 }
 
-pub(crate) fn check_ring(encoder: u8, segment: u8) -> Result<(), Error> {
+pub(crate) fn check_ring(encoder: u8, segment: u8) -> DeckResult<()> {
     if encoder >= Encoders::COUNT {
-        return Err(Error::InvalidArgument(format!(
-            "encoder index {encoder} out of range"
-        )));
+        return Err(invalid(format!("encoder index {encoder} out of range")));
     }
     if segment >= Ring::SEGMENTS {
-        return Err(Error::InvalidArgument(format!(
-            "ring segment {segment} out of range"
-        )));
+        return Err(invalid(format!("ring segment {segment} out of range")));
     }
     Ok(())
 }
 
-pub(crate) fn check_lcd_rect(x: u16, y: u16, width: u16, height: u16) -> Result<(), Error> {
+pub(crate) fn check_lcd_rect(x: u16, y: u16, width: u16, height: u16) -> DeckResult<()> {
     let fits = width > 0
         && height > 0
         && x.saturating_add(width) <= Lcd::WIDTH
@@ -229,10 +242,14 @@ pub(crate) fn check_lcd_rect(x: u16, y: u16, width: u16, height: u16) -> Result<
     if fits {
         Ok(())
     } else {
-        Err(Error::InvalidArgument(format!(
+        Err(invalid(format!(
             "lcd rect {width}x{height}+{x}+{y} does not fit in {}x{}",
             Lcd::WIDTH,
             Lcd::HEIGHT
         )))
     }
+}
+
+pub(crate) fn invalid(message: String) -> DeckError {
+    DeckError::Invalid(Error::InvalidArgument(message))
 }

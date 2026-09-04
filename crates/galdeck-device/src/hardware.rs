@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use galdeck::{Error, Event, Galleon, Rgb};
 
+use crate::error::{DeckError, DeckResult};
 use crate::Deck;
 
 pub struct HardwareDeck {
@@ -41,6 +42,10 @@ impl HardwareDeck {
         })
     }
 
+    fn key(&mut self, index: u8) -> DeckResult<galdeck::Button<'_>> {
+        self.deck.button(index).map_err(DeckError::classify)
+    }
+
     /// Whether this firmware is one the protocol has been validated against.
     ///
     /// Firmware 3.06.006 and later reportedly change the keepalive report, and
@@ -60,37 +65,41 @@ impl Deck for HardwareDeck {
         &self.serial
     }
 
-    fn poll(&mut self, timeout: Duration) -> Result<Vec<Event>, Error> {
+    fn poll(&mut self, timeout: Duration) -> DeckResult<Vec<Event>> {
         // Galleon::poll slices internally at 100 ms and ticks the keepalive at
         // the top of each slice, so a long timeout here is still safe.
-        self.deck.poll(timeout)
+        self.deck.poll(timeout).map_err(DeckError::classify)
     }
 
     fn take_mode_reentry(&mut self) -> bool {
         self.deck.take_mode_reentry()
     }
 
-    fn set_brightness(&mut self, percent: u8) -> Result<(), Error> {
-        self.deck.set_brightness(percent)
-    }
-
-    fn set_key_jpeg(&mut self, key: u8, jpeg: &[u8]) -> Result<(), Error> {
-        self.deck.button(key)?.set_jpeg(jpeg)
-    }
-
-    fn set_key_color(&mut self, key: u8, color: Rgb) -> Result<(), Error> {
-        self.deck.button(key)?.set_color(color)
-    }
-
-    fn clear_key(&mut self, key: u8) -> Result<(), Error> {
-        self.deck.button(key)?.clear()
-    }
-
-    fn set_ring_segment(&mut self, encoder: u8, segment: u8, color: Rgb) -> Result<(), Error> {
+    fn set_brightness(&mut self, percent: u8) -> DeckResult<()> {
         self.deck
-            .encoder(encoder)?
+            .set_brightness(percent)
+            .map_err(DeckError::classify)
+    }
+
+    fn set_key_jpeg(&mut self, key: u8, jpeg: &[u8]) -> DeckResult<()> {
+        self.key(key)?.set_jpeg(jpeg).map_err(DeckError::classify)
+    }
+
+    fn set_key_color(&mut self, key: u8, color: Rgb) -> DeckResult<()> {
+        self.key(key)?.set_color(color).map_err(DeckError::classify)
+    }
+
+    fn clear_key(&mut self, key: u8) -> DeckResult<()> {
+        self.key(key)?.clear().map_err(DeckError::classify)
+    }
+
+    fn set_ring_segment(&mut self, encoder: u8, segment: u8, color: Rgb) -> DeckResult<()> {
+        self.deck
+            .encoder(encoder)
+            .map_err(DeckError::classify)?
             .ring()
             .set_segment(segment, color)
+            .map_err(DeckError::classify)
     }
 
     fn draw_lcd_jpeg(
@@ -100,15 +109,18 @@ impl Deck for HardwareDeck {
         width: u16,
         height: u16,
         jpeg: &[u8],
-    ) -> Result<(), Error> {
-        self.deck.lcd().draw_jpeg_at(x, y, width, height, jpeg)
+    ) -> DeckResult<()> {
+        self.deck
+            .lcd()
+            .draw_jpeg_at(x, y, width, height, jpeg)
+            .map_err(DeckError::classify)
     }
 
-    fn clear_all(&mut self) -> Result<(), Error> {
-        self.deck.clear_all()
+    fn clear_all(&mut self) -> DeckResult<()> {
+        self.deck.clear_all().map_err(DeckError::classify)
     }
 
-    fn reset_to_logo(&mut self) -> Result<(), Error> {
-        self.deck.reset_to_logo()
+    fn reset_to_logo(&mut self) -> DeckResult<()> {
+        self.deck.reset_to_logo().map_err(DeckError::classify)
     }
 }
