@@ -56,8 +56,33 @@ fn expect_ok(response: Response) -> Result<()> {
     match response {
         Response::Ok => Ok(()),
         Response::Error { message } => bail!("{message}"),
-        Response::Status(_) => bail!("unexpected response"),
+        Response::Diagnostics { diagnostics } => {
+            if diagnostics.is_empty() {
+                return Ok(());
+            }
+            bail!("{}", render_diagnostics(&diagnostics));
+        }
+        other => bail!("unexpected response: {other:?}"),
     }
+}
+
+fn render_diagnostics(diagnostics: &[galdeck_ipc::Diagnostic]) -> String {
+    diagnostics
+        .iter()
+        .map(|d| {
+            let where_ = match d.start {
+                Some(loc) => format!("{}:{}", loc.line, loc.col),
+                None => d.path.clone(),
+            };
+            let help = d
+                .help
+                .as_ref()
+                .map(|h| format!(" ({h})"))
+                .unwrap_or_default();
+            format!("{where_} [{}] {}{help}", d.code, d.message)
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn detect() -> Result<()> {
@@ -104,12 +129,14 @@ fn main() -> Result<()> {
                 if let Some(serial) = status.serial {
                     println!("serial:     {serial}");
                 }
+                println!("profile:    {}", status.profile);
+                println!("profiles:   {}", status.profiles.join(", "));
                 println!("page:       {}", status.page);
                 println!("pages:      {}", status.pages.join(", "));
                 println!("brightness: {}", status.brightness);
             }
             Response::Error { message } => bail!("{message}"),
-            Response::Ok => bail!("unexpected response"),
+            other => bail!("unexpected response: {other:?}"),
         },
         Command::Brightness { percent } => {
             expect_ok(request(&Request::SetBrightness { percent })?)?;

@@ -92,7 +92,7 @@ ring = "nope"
     let ParseError::Invalid(diagnostics) = Config::parse(text).unwrap_err() else {
         panic!("expected a validation failure");
     };
-    let codes: Vec<_> = diagnostics.iter().map(|d| d.code).collect();
+    let codes: Vec<&str> = diagnostics.iter().map(|d| d.code.as_str()).collect();
     assert!(codes.contains(&"E0101"), "brightness: {codes:?}");
     assert!(codes.contains(&"E0110"), "key range: {codes:?}");
     assert!(codes.contains(&"E0130"), "colors: {codes:?}");

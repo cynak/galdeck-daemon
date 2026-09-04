@@ -9,7 +9,9 @@
 
 use std::ops::Range;
 
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug, serde::Serialize)]
+#[derive(
+    Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug, serde::Serialize, serde::Deserialize,
+)]
 #[serde(rename_all = "lowercase")]
 pub enum Severity {
     Hint,
@@ -23,7 +25,7 @@ pub enum Severity {
 /// `textarea.selectionStart` counts those rather than bytes, so resolving it
 /// here is what makes "click the error, land on the character" work in a
 /// config whose labels contain emoji or accents.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Loc {
     pub line: u32,
     pub col: u32,
@@ -69,12 +71,15 @@ impl LineIndex {
     }
 }
 
-#[derive(Clone, Debug, serde::Serialize)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct Diagnostic {
     pub severity: Severity,
     /// A stable code, so a message can be reworded without breaking anyone
     /// who matched on it. `E` blocks loading, `W` and `H` do not.
-    pub code: &'static str,
+    ///
+    /// Owned rather than `&'static str` so a diagnostic can survive the trip
+    /// through the control socket and back.
+    pub code: String,
     pub span: Option<Range<usize>>,
     pub start: Option<Loc>,
     pub end: Option<Loc>,
@@ -85,7 +90,7 @@ pub struct Diagnostic {
 }
 
 impl Diagnostic {
-    pub fn error(code: &'static str, path: impl Into<String>, message: impl Into<String>) -> Self {
+    pub fn error(code: &str, path: impl Into<String>, message: impl Into<String>) -> Self {
         Self::new(Severity::Error, code, path, message)
     }
 
@@ -97,19 +102,19 @@ impl Diagnostic {
         Self::new(Severity::Warning, code, path, message)
     }
 
-    pub fn hint(code: &'static str, path: impl Into<String>, message: impl Into<String>) -> Self {
+    pub fn hint(code: &str, path: impl Into<String>, message: impl Into<String>) -> Self {
         Self::new(Severity::Hint, code, path, message)
     }
 
     fn new(
         severity: Severity,
-        code: &'static str,
+        code: &str,
         path: impl Into<String>,
         message: impl Into<String>,
     ) -> Self {
         Self {
             severity,
-            code,
+            code: code.to_string(),
             span: None,
             start: None,
             end: None,
@@ -170,7 +175,7 @@ impl Diagnostics {
         self.items.sort_by(|a, b| {
             let a_start = a.span.as_ref().map(|s| s.start);
             let b_start = b.span.as_ref().map(|s| s.start);
-            a_start.cmp(&b_start).then_with(|| a.code.cmp(b.code))
+            a_start.cmp(&b_start).then_with(|| a.code.cmp(&b.code))
         });
         self.items
     }

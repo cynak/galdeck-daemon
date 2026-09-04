@@ -19,7 +19,7 @@ pub use doc::{ConfigDocument, Patch, Staged, Value};
 pub use theme::{ResolvedStyle, StyleLayer, StyleSource, Theme};
 pub use v1::{default_config_path, Config, EncoderConfig, KeyConfig, LoadError, Page, ParseError};
 pub use v2::{Global, Workspace, CURRENT_VERSION};
-pub use workspace::default_config_dir;
+pub use workspace::{config_file_names, default_config_dir};
 
 /// Levenshtein distance, iterative with one row of state.
 pub(crate) fn edit_distance(a: &str, b: &str) -> usize {

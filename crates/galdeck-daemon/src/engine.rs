@@ -11,14 +11,17 @@ use anyhow::Result;
 use galdeck::{Buttons, Encoders, Event};
 use galdeck_core::{Clock, DeadlineCell, Scheduler, Tick, WakeReceiver, Waker};
 use galdeck_device::{KeyTarget, Paint};
-use galdeck_ipc::{Request, Response, Status};
+use galdeck_ipc::{ConfigFile, ConfigSnapshot, Patch, Request, Response, Status};
 
 use crate::io::DeviceMsg;
 
 use crate::render;
 use crate::ring::RingFeedback;
 use galdeck_model::v2::{EncoderConfig, KeyConfig, Page, Profile};
-use galdeck_model::{Diagnostics, ResolvedPalette, ResolvedStyle, StyleLayer, Workspace};
+use galdeck_model::{
+    config_file_names, ConfigDocument, Diagnostics, ResolvedPalette, ResolvedStyle, StyleLayer,
+    Workspace,
+};
 
 /// Longest the core loop sleeps with nothing scheduled.
 ///
@@ -80,6 +83,9 @@ pub struct Engine {
     /// Bounded: a deck is navigated by hand, and an unbounded stack would
     /// grow for as long as the daemon runs.
     page_stack: Vec<usize>,
+    /// Every config file, kept as the document it was written as so edits
+    /// preserve comments and ordering.
+    documents: std::collections::BTreeMap<String, ConfigDocument>,
     /// The current profile's theme, folded and with its palette resolved.
     /// Recomputed only when the profile or the config changes.
     theme: StyleLayer,
@@ -155,6 +161,7 @@ impl Engine {
             profile_id,
             page_index: 0,
             page_stack: Vec::new(),
+            documents: Default::default(),
             theme: StyleLayer::default(),
             palette: ResolvedPalette::default(),
             brightness,
@@ -171,7 +178,76 @@ impl Engine {
             rings: Encoders::indices().map(|_| RingFeedback::new()).collect(),
         };
         engine.enter_profile();
+        engine.load_documents();
         Ok(engine)
+    }
+
+    /// Read every config file as an editable document.
+    ///
+    /// Kept alongside the parsed model rather than derived from it: the model
+    /// is what the daemon runs on, the documents are what the user wrote, and
+    /// only the latter can be edited without losing comments.
+    fn load_documents(&mut self) {
+        self.documents.clear();
+        for name in config_file_names(&self.config_dir) {
+            match ConfigDocument::load(&self.config_dir.join(&name)) {
+                Ok(document) => {
+                    self.documents.insert(name, document);
+                }
+                Err(diagnostics) => {
+                    log::warn!("{name}: {}", diagnostics.render());
+                }
+            }
+        }
+    }
+
+    fn config_snapshot(&self) -> ConfigSnapshot {
+        let (_, diagnostics) = Workspace::load(&self.config_dir);
+        ConfigSnapshot {
+            dir: self.config_dir.clone(),
+            files: self
+                .documents
+                .iter()
+                .map(|(name, document)| ConfigFile {
+                    name: name.clone(),
+                    text: document.text(),
+                    generation: document.generation(),
+                })
+                .collect(),
+            diagnostics,
+        }
+    }
+
+    /// Work out what an edit would do, without doing it.
+    fn stage(
+        &self,
+        file: &str,
+        patches: &[Patch],
+        generation: Option<u64>,
+    ) -> Result<(galdeck_model::Staged, Vec<galdeck_ipc::Diagnostic>), String> {
+        let Some(document) = self.documents.get(file) else {
+            return Err(format!("no such config file {file:?}"));
+        };
+        let staged = match document.preview(patches, generation) {
+            Ok(staged) => staged,
+            Err(diagnostics) => {
+                return Ok((
+                    galdeck_model::Staged {
+                        text: document.text(),
+                        generation: document.generation(),
+                    },
+                    diagnostics.sorted(),
+                ))
+            }
+        };
+
+        // Validate the whole workspace the edit would produce, not just the
+        // file it touched: a theme that stops defining a colour breaks every
+        // key that referenced it, and that is exactly what a user needs told
+        // before saving.
+        let overrides = std::collections::BTreeMap::from([(file.to_string(), staged.text.clone())]);
+        let (_, diagnostics) = Workspace::load_with_overrides(&self.config_dir, &overrides);
+        Ok((staged, diagnostics))
     }
 
     /// Recompute everything that depends on which profile is showing.
@@ -551,6 +627,7 @@ impl Engine {
         };
         self.workspace = workspace;
         self.enter_profile();
+        self.load_documents();
 
         if let Some(id) = was_page {
             if let Some(index) = self
@@ -578,6 +655,8 @@ impl Engine {
                 connected: self.device.connected,
                 firmware: self.device.firmware.clone(),
                 serial: self.device.serial.clone(),
+                profile: self.profile_id.clone(),
+                profiles: self.workspace.profiles.keys().cloned().collect(),
                 page: self
                     .current_page()
                     .map(|p| p.id.clone())
@@ -618,6 +697,48 @@ impl Engine {
                         message: format!("unknown profile {name:?}"),
                     }
                 }
+            }
+            Request::GetConfig => Response::Config(self.config_snapshot()),
+            Request::ValidateConfig {
+                file,
+                patches,
+                generation,
+            } => match self.stage(&file, &patches, generation) {
+                Ok((_, diagnostics)) => Response::Diagnostics { diagnostics },
+                Err(message) => Response::Error { message },
+            },
+            Request::ApplyConfig {
+                file,
+                patches,
+                generation,
+            } => {
+                let (staged, diagnostics) = match self.stage(&file, &patches, generation) {
+                    Ok(result) => result,
+                    Err(message) => return Response::Error { message },
+                };
+                if diagnostics
+                    .iter()
+                    .any(|d| d.severity == galdeck_ipc::Severity::Error)
+                {
+                    // Refused rather than written and then complained about.
+                    return Response::Diagnostics { diagnostics };
+                }
+                let Some(document) = self.documents.get_mut(&file) else {
+                    return Response::Error {
+                        message: format!("no such config file {file:?}"),
+                    };
+                };
+                if let Err(e) = document.commit(staged) {
+                    return Response::Error {
+                        message: e.render(),
+                    };
+                }
+                if let Err(e) = document.save() {
+                    return Response::Error {
+                        message: format!("saving {file}: {e}"),
+                    };
+                }
+                self.reload()
             }
             Request::Reload => self.reload(),
         }

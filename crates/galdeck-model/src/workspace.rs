@@ -35,6 +35,19 @@ impl Workspace {
     /// a user interface can show all the problems at once rather than one per
     /// save.
     pub fn load(dir: &Path) -> (Option<Workspace>, Vec<Diagnostic>) {
+        Self::load_with_overrides(dir, &BTreeMap::new())
+    }
+
+    /// Load a config directory, substituting the text of named files.
+    ///
+    /// This is what makes live validation honest: an edit is checked against
+    /// the whole workspace it would create, so "this theme no longer defines
+    /// @accent, and three keys reference it" is caught before saving rather
+    /// than after.
+    pub fn load_with_overrides(
+        dir: &Path,
+        overrides: &BTreeMap<String, String>,
+    ) -> (Option<Workspace>, Vec<Diagnostic>) {
         let mut out = Diagnostics::new();
 
         // An existing single-file config keeps working untouched.
@@ -68,8 +81,12 @@ impl Workspace {
             };
         }
 
-        let global = match read_toml::<Global>(&dir.join("galdeck.toml"), "galdeck.toml", &mut out)
-        {
+        let global = match read_toml::<Global>(
+            &dir.join("galdeck.toml"),
+            "galdeck.toml",
+            overrides.get("galdeck.toml").map(String::as_str),
+            &mut out,
+        ) {
             Some(global) => global,
             None => return (None, out.sorted()),
         };
@@ -89,8 +106,8 @@ impl Workspace {
             return (None, out.sorted());
         }
 
-        let profiles = read_dir_of("profiles", &dir.join("profiles"), &mut out);
-        let themes = read_dir_of("themes", &dir.join("themes"), &mut out);
+        let profiles = read_dir_of("profiles", dir, overrides, &mut out);
+        let themes = read_dir_of("themes", dir, overrides, &mut out);
 
         let workspace = Workspace {
             global,
@@ -531,18 +548,22 @@ fn literal(value: &str) -> Option<ColorRef> {
 fn read_toml<T: serde::de::DeserializeOwned>(
     path: &Path,
     label: &str,
+    override_text: Option<&str>,
     out: &mut Diagnostics,
 ) -> Option<T> {
-    let text = match std::fs::read_to_string(path) {
-        Ok(text) => text,
-        Err(e) => {
-            out.push(Diagnostic::error(
-                "E0002",
-                label,
-                format!("reading {}: {e}", path.display()),
-            ));
-            return None;
-        }
+    let text = match override_text {
+        Some(text) => text.to_string(),
+        None => match std::fs::read_to_string(path) {
+            Ok(text) => text,
+            Err(e) => {
+                out.push(Diagnostic::error(
+                    "E0002",
+                    label,
+                    format!("reading {}: {e}", path.display()),
+                ));
+                return None;
+            }
+        },
     };
     match toml::from_str::<T>(&text) {
         Ok(value) => Some(value),
@@ -561,30 +582,73 @@ fn read_toml<T: serde::de::DeserializeOwned>(
 /// Read every `.toml` in a directory, keyed by filename stem.
 fn read_dir_of<T: serde::de::DeserializeOwned>(
     label: &str,
-    dir: &Path,
+    root: &Path,
+    overrides: &BTreeMap<String, String>,
     out: &mut Diagnostics,
 ) -> BTreeMap<String, T> {
-    let mut found = BTreeMap::new();
-    let Ok(entries) = std::fs::read_dir(dir) else {
+    let dir = root.join(label);
+    let mut paths: Vec<PathBuf> = match std::fs::read_dir(&dir) {
+        Ok(entries) => entries
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "toml"))
+            .collect(),
         // A missing directory is not an error: a config may have no themes.
-        return found;
+        Err(_) => Vec::new(),
     };
-    let mut paths: Vec<PathBuf> = entries
-        .flatten()
-        .map(|entry| entry.path())
-        .filter(|path| path.extension().is_some_and(|ext| ext == "toml"))
-        .collect();
+    // An override may name a file that does not exist on disk yet.
+    for name in overrides.keys() {
+        if let Some(stem) = name.strip_prefix(&format!("{label}/")) {
+            let path = dir.join(stem);
+            if !paths.contains(&path) {
+                paths.push(path);
+            }
+        }
+    }
     // Sorted so loading is deterministic, which keeps diagnostics stable.
     paths.sort();
 
+    let mut found = BTreeMap::new();
     for path in paths {
         let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
             continue;
         };
+        let relative = format!("{label}/{stem}.toml");
         let at = format!("{label}.{stem}");
-        if let Some(value) = read_toml::<T>(&path, &at, out) {
+        if let Some(value) = read_toml::<T>(
+            &path,
+            &at,
+            overrides.get(&relative).map(String::as_str),
+            out,
+        ) {
             found.insert(stem.to_string(), value);
         }
     }
     found
+}
+
+/// Every configuration file in a directory, by its path relative to it.
+pub fn config_file_names(dir: &Path) -> Vec<String> {
+    let mut names = Vec::new();
+    if dir.join("galdeck.toml").is_file() {
+        names.push("galdeck.toml".to_string());
+    }
+    for sub in ["profiles", "themes"] {
+        let Ok(entries) = std::fs::read_dir(dir.join(sub)) else {
+            continue;
+        };
+        let mut found: Vec<String> = entries
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "toml"))
+            .filter_map(|path| {
+                path.file_name()
+                    .and_then(|n| n.to_str())
+                    .map(|n| format!("{sub}/{n}"))
+            })
+            .collect();
+        found.sort();
+        names.extend(found);
+    }
+    names
 }

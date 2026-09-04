@@ -16,7 +16,8 @@ use toml_edit::{DocumentMut, Item, Value as TomlValue};
 use crate::diag::{Diagnostic, Diagnostics};
 
 /// A scalar an edit can set.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "type", content = "value", rename_all = "snake_case")]
 pub enum Value {
     String(String),
     Integer(i64),
@@ -36,7 +37,8 @@ impl From<Value> for TomlValue {
 }
 
 /// One edit.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case")]
 pub enum Patch {
     /// Set a scalar, creating intermediate tables if they are missing.
     Set { path: String, value: Value },

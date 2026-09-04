@@ -1,12 +1,16 @@
-//! Control-socket protocol between `galdeck-daemon` and `galdeck`.
+//! The control protocol shared by the daemon, the CLI and the web UI.
 //!
-//! Transport: a unix stream socket, one JSON-encoded [`Request`] per line
-//! from the client, answered by one JSON-encoded [`Response`] per line.
+//! Line-delimited JSON over a Unix stream socket: one request per line, one
+//! response per line, in order. Simple enough that `socat` is a usable client,
+//! which matters for a protocol people will script against.
 
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+pub use galdeck_model::{Diagnostic, Patch, Severity, Value};
+
+/// A request to the daemon.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "cmd", rename_all = "snake_case")]
 pub enum Request {
@@ -23,14 +27,42 @@ pub enum Request {
         name: String,
     },
     Reload,
+    /// Every configuration file, as text, for an editor to work on.
+    GetConfig,
+    /// Try edits without saving anything, and report what they would do.
+    ///
+    /// This is what makes live validation possible: the editor can show
+    /// problems in an edit nobody has committed.
+    ValidateConfig {
+        file: String,
+        patches: Vec<Patch>,
+        /// The generation the editor read. Omitted skips the check.
+        #[serde(default)]
+        generation: Option<u64>,
+    },
+    /// Apply edits, save them, and reload.
+    ApplyConfig {
+        file: String,
+        patches: Vec<Patch>,
+        #[serde(default)]
+        generation: Option<u64>,
+    },
 }
 
+/// A reply.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "result", rename_all = "snake_case")]
 pub enum Response {
     Ok,
-    Error { message: String },
+    Error {
+        message: String,
+    },
     Status(Status),
+    Config(ConfigSnapshot),
+    /// Everything an edit would produce. An empty list means it is clean.
+    Diagnostics {
+        diagnostics: Vec<Diagnostic>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -38,9 +70,45 @@ pub struct Status {
     pub connected: bool,
     pub firmware: Option<String>,
     pub serial: Option<String>,
+    /// Which profile is showing.
+    pub profile: String,
+    pub profiles: Vec<String>,
     pub page: String,
     pub pages: Vec<String>,
     pub brightness: u8,
+}
+
+/// The whole configuration, as the files it is written in.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConfigSnapshot {
+    pub dir: PathBuf,
+    pub files: Vec<ConfigFile>,
+    /// Everything currently wrong with it.
+    pub diagnostics: Vec<Diagnostic>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConfigFile {
+    /// Path relative to the config directory, e.g. `profiles/work.toml`.
+    pub name: String,
+    pub text: String,
+    /// Bumped on every save. An edit carrying a stale one is refused.
+    pub generation: u64,
+}
+
+/// Something that happened, for clients that asked to be told.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "event", rename_all = "snake_case")]
+pub enum Event {
+    DeviceConnected { firmware: String, serial: String },
+    DeviceDisconnected,
+    PageChanged { profile: String, page: String },
+    ProfileChanged { profile: String },
+    BrightnessChanged { percent: u8 },
+    KeyPressed { key: u8 },
+    EncoderTurned { encoder: u8, delta: i8 },
+    EncoderPressed { encoder: u8 },
+    ConfigChanged,
 }
 
 /// Path of the daemon's control socket: `$XDG_RUNTIME_DIR/galdeck.sock`,
@@ -50,8 +118,8 @@ pub struct Status {
 /// attacker-controlled in the general case and simply absent in some service
 /// managers, where it previously collapsed to a single shared
 /// `/tmp/galdeck-unknown.sock` in a world-writable directory. Two accounts
-/// would then race for one path, and this socket is about to be able to
-/// define what commands the daemon runs.
+/// would then race for one path, and this socket can define what commands the
+/// daemon runs.
 pub fn socket_path() -> PathBuf {
     if let Ok(dir) = std::env::var("XDG_RUNTIME_DIR") {
         if !dir.is_empty() {

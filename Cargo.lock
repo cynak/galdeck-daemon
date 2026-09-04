@@ -377,6 +377,7 @@ dependencies = [
 name = "galdeck-ipc"
 version = "0.1.0"
 dependencies = [
+ "galdeck-model",
  "libc",
  "serde",
  "serde_json",
