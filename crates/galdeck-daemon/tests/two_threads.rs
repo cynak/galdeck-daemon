@@ -103,6 +103,7 @@ impl Harness {
             clock,
             wake_rx,
             Arc::clone(&shutdown),
+            galdeck_daemon::preview::Preview::new(),
         )
         .expect("engine should build");
         let core_thread = std::thread::spawn(move || engine.run());

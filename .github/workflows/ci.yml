@@ -7,11 +7,6 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  # The framework is a path dependency until it is published, and Cargo.lock
-  # cannot pin a path dependency. Without a fixed revision here, an unrelated
-  # commit to the framework reddens an unrelated pull request in this repo.
-  # Bump this deliberately, in a commit that says why.
-  GALDECK_FRAMEWORK_REV: 4cb2a16a46d098e7e9f10a4bcca09d3ef72ba0e0
 
 jobs:
   check:
@@ -19,29 +14,21 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-        with:
-          path: galdeck-daemon
-      - uses: actions/checkout@v4
-        with:
-          repository: cynak/galdeck
-          ref: ${{ env.GALDECK_FRAMEWORK_REV }}
-          path: galdeck
+      # hidapi builds a C shim against these.
       - name: Install libudev headers
         run: sudo apt-get update && sudo apt-get install -y libudev-dev
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: galdeck-daemon
       - name: Format
-        working-directory: galdeck-daemon
         run: cargo fmt --all --check
+      # --locked throughout: the framework and `image` are both pinned by
+      # Cargo.lock, and `image` declares exactly our MSRV floor, so an
+      # unnoticed update is how the MSRV job would start failing mysteriously.
       - name: Clippy
-        working-directory: galdeck-daemon
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Test
-        working-directory: galdeck-daemon
         run: cargo test --workspace --locked
 
   msrv:
@@ -49,13 +36,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-        with:
-          path: galdeck-daemon
-      - uses: actions/checkout@v4
-        with:
-          repository: cynak/galdeck
-          ref: ${{ env.GALDECK_FRAMEWORK_REV }}
-          path: galdeck
       - name: Install libudev headers
         run: sudo apt-get update && sudo apt-get install -y libudev-dev
       # Pinned to the workspace's rust-version. `image` declares exactly this
@@ -63,10 +43,7 @@ jobs:
       # canary.
       - uses: dtolnay/rust-toolchain@1.88
       - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: galdeck-daemon
       - name: Check
-        working-directory: galdeck-daemon
         run: cargo check --workspace --all-targets --locked
 
   layering:

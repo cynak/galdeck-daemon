@@ -44,12 +44,25 @@ pub enum Patch {
     Set { path: String, value: Value },
     /// Remove a key. Removing something absent is not an error.
     Remove { path: String },
+    /// Append a table to an array of tables, creating the array if needed.
+    ///
+    /// This is how a new key, encoder or page is added. Written as `[[...]]`
+    /// so it reads the way a person would have written it by hand.
+    Append {
+        path: String,
+        fields: std::collections::BTreeMap<String, Value>,
+    },
+    /// Remove one element of an array of tables.
+    RemoveAt { path: String, index: usize },
 }
 
 impl Patch {
     pub fn path(&self) -> &str {
         match self {
-            Patch::Set { path, .. } | Patch::Remove { path } => path,
+            Patch::Set { path, .. }
+            | Patch::Remove { path }
+            | Patch::Append { path, .. }
+            | Patch::RemoveAt { path, .. } => path,
         }
     }
 }
@@ -158,6 +171,46 @@ fn table_of<'a>(
                 return Some(table as &mut dyn toml_edit::TableLike);
             };
             table_of(table.get_mut(name)?, rest)
+        }
+    }
+}
+
+/// Find an array of tables at a path, optionally creating it.
+fn array_at<'a>(
+    item: &'a mut Item,
+    segments: &[Segment],
+    create: bool,
+) -> Option<&'a mut toml_edit::ArrayOfTables> {
+    let Some((first, rest)) = segments.split_first() else {
+        return item.as_array_of_tables_mut();
+    };
+    match first {
+        Segment::Key(name) => {
+            if create && item.is_none() {
+                *item = Item::Table(toml_edit::Table::new());
+            }
+            let table = item.as_table_like_mut()?;
+            if table.get(name).is_none() {
+                if !create {
+                    return None;
+                }
+                table.insert(name, Item::ArrayOfTables(toml_edit::ArrayOfTables::new()));
+            }
+            array_at(table.get_mut(name)?, rest, create)
+        }
+        Segment::Index(index) => {
+            let array = item.as_array_of_tables_mut()?;
+            let table = array.get_mut(*index)?;
+            let (Segment::Key(name), rest) = rest.split_first()? else {
+                return None;
+            };
+            if table.get(name).is_none() {
+                if !create {
+                    return None;
+                }
+                table.insert(name, Item::ArrayOfTables(toml_edit::ArrayOfTables::new()));
+            }
+            array_at(table.get_mut(name)?, rest, create)
         }
     }
 }
@@ -321,6 +374,27 @@ fn apply_one(doc: &mut DocumentMut, patch: &Patch) -> Result<(), String> {
         Patch::Set { path, value } => {
             let segments = parse_path(path)?;
             set_in_item(doc.as_item_mut(), &segments, value.clone().into())
+        }
+        Patch::Append { path, fields } => {
+            let segments = parse_path(path)?;
+            let array = array_at(doc.as_item_mut(), &segments, true)
+                .ok_or_else(|| format!("{path:?} is not an array of tables"))?;
+            let mut table = toml_edit::Table::new();
+            for (name, value) in fields {
+                table.insert(name, Item::Value(value.clone().into()));
+            }
+            array.push(table);
+            Ok(())
+        }
+        Patch::RemoveAt { path, index } => {
+            let segments = parse_path(path)?;
+            let Some(array) = array_at(doc.as_item_mut(), &segments, false) else {
+                return Ok(());
+            };
+            if *index < array.len() {
+                array.remove(*index);
+            }
+            Ok(())
         }
         Patch::Remove { path } => {
             let segments = parse_path(path)?;

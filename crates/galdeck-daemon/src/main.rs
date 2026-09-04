@@ -25,6 +25,14 @@ struct Args {
     /// Config directory (default: ~/.config/galdeck)
     #[arg(long)]
     config: Option<PathBuf>,
+
+    /// Serve the configuration UI on loopback at this port.
+    ///
+    /// Off unless given, because this surface can set the shell commands the
+    /// daemon runs. Pass 0 to let the system choose a free port; the address,
+    /// with its token, is printed at startup.
+    #[arg(long, value_name = "PORT")]
+    http: Option<u16>,
 }
 
 fn main() -> Result<()> {
@@ -78,7 +86,24 @@ fn main() -> Result<()> {
 
     let (control_tx, control_rx) = channel();
     let control = engine::ControlSender::new(control_tx, waker.clone());
-    std::thread::spawn(move || ipc_server::serve(listener, control));
+    {
+        let control = control.clone();
+        std::thread::spawn(move || ipc_server::serve(listener, control));
+    }
+
+    let preview = galdeck_daemon::preview::Preview::new();
+    if let Some(port) = args.http {
+        let server = galdeck_daemon::http::HttpServer::bind(
+            port,
+            control.clone(),
+            preview.clone(),
+            Arc::clone(&shutdown),
+        )?;
+        println!("configuration UI: {}", server.url());
+        std::thread::Builder::new()
+            .name("galdeck-ui".into())
+            .spawn(move || server.run())?;
+    }
 
     // A whole page is sixteen paints. Sixty-four leaves room for a page
     // switch landing on top of a half-drained one; beyond that the device is
@@ -102,6 +127,7 @@ fn main() -> Result<()> {
 
     let mut engine = engine::Engine::new(
         config_dir, workspace, control_rx, device_rx, paint_tx, deadline, clock, wake_rx, shutdown,
+        preview,
     )?;
     engine.run();
 

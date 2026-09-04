@@ -1,0 +1,16 @@
+[package]
+name = "galdeck-http"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+description = "A small HTTP/1.1 subset and server-sent events, for serving the galdeck configuration UI on loopback."
+
+# Deliberately no galdeck dependencies at all. A CI job checks it: the crate
+# that parses bytes off a socket must be structurally incapable of touching the
+# device.
+[dependencies]
+log.workspace = true

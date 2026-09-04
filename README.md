@@ -121,9 +121,14 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
-The `galdeck` dependency is a path dependency to a sibling checkout until
-the framework is published; adjust it in the workspace `Cargo.toml` if your
-layout differs.
+The [`galdeck`](https://crates.io/crates/galdeck) framework comes from
+crates.io. To work against an unpublished change to it, add a patch in
+`.cargo/config.toml` (which is not committed):
+
+```toml
+[patch.crates-io]
+galdeck = { path = "../galdeck" }
+```
 
 ## License
 

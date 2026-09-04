@@ -14,6 +14,7 @@ use galdeck_device::{KeyTarget, Paint};
 use galdeck_ipc::{ConfigFile, ConfigSnapshot, Patch, Request, Response, Status};
 
 use crate::io::DeviceMsg;
+use crate::preview::Preview;
 
 use crate::render;
 use crate::ring::RingFeedback;
@@ -102,6 +103,9 @@ pub struct Engine {
     wake: WakeReceiver,
     shutdown: Arc<AtomicBool>,
     scheduler: Scheduler<TimerKind>,
+    /// What the deck is showing, and who is watching. Shared with the UI
+    /// server so a browser sees the same JPEGs the panel was sent.
+    preview: Preview,
     /// One serialized action runner per encoder; see [`RotationRunner`].
     rotation: Vec<RotationRunner>,
     /// Ring turn-feedback state, one per encoder.
@@ -147,6 +151,7 @@ impl Engine {
         clock: Arc<dyn Clock>,
         wake: WakeReceiver,
         shutdown: Arc<AtomicBool>,
+        preview: Preview,
     ) -> Result<Self> {
         let font = render::load_font(workspace.global.font.as_deref());
         let brightness = workspace.global.brightness;
@@ -174,6 +179,7 @@ impl Engine {
             wake,
             shutdown,
             scheduler: Scheduler::new(),
+            preview,
             rotation: Encoders::indices().map(|_| RotationRunner::new()).collect(),
             rings: Encoders::indices().map(|_| RingFeedback::new()).collect(),
         };
@@ -309,6 +315,10 @@ impl Engine {
     fn on_device(&mut self, msg: DeviceMsg) {
         match msg {
             DeviceMsg::Connected { firmware, serial } => {
+                self.preview.publish(galdeck_ipc::Event::DeviceConnected {
+                    firmware: firmware.clone(),
+                    serial: serial.clone(),
+                });
                 self.device = DeviceStatus {
                     connected: true,
                     firmware: Some(firmware),
@@ -318,6 +328,7 @@ impl Engine {
             }
             DeviceMsg::Disconnected => {
                 self.device = DeviceStatus::default();
+                self.preview.publish(galdeck_ipc::Event::DeviceDisconnected);
             }
             DeviceMsg::ModeReentry => {
                 // The firmware wiped what it was showing, so nothing we
@@ -399,6 +410,7 @@ impl Engine {
             return;
         }
         self.send(Paint::Brightness(self.brightness));
+        self.preview.set_brightness(self.brightness);
 
         // Cloned up front so the borrow of the workspace ends before the
         // paints go out; a page is a dozen small structs.
@@ -427,6 +439,11 @@ impl Engine {
                 }
                 None => KeyTarget::Blank,
             };
+            if let KeyTarget::Jpeg(jpeg) = &target {
+                self.preview.set_key(index, Some(Arc::clone(jpeg)));
+            } else {
+                self.preview.set_key(index, None);
+            }
             self.send(Paint::Key { index, target });
         }
 
@@ -444,7 +461,11 @@ impl Engine {
         let text = page.lcd_text.clone().unwrap_or_else(|| page.id.clone());
         let screen = render::lcd(&style, &text, self.font.as_ref());
         match screen.to_jpeg(galdeck::ids::DEFAULT_JPEG_QUALITY) {
-            Ok(jpeg) => self.send(Paint::Lcd { jpeg: jpeg.into() }),
+            Ok(jpeg) => {
+                let jpeg: Arc<[u8]> = jpeg.into();
+                self.preview.set_lcd(Arc::clone(&jpeg));
+                self.send(Paint::Lcd { jpeg });
+            }
             Err(e) => log::warn!("encoding the lcd failed: {e}"),
         }
     }
@@ -459,6 +480,7 @@ impl Engine {
         let colors = ring.colors();
         let deadline = ring.deadline();
 
+        self.preview.set_ring(encoder, colors);
         self.send(Paint::Ring { encoder, colors });
 
         // Registered as a deadline rather than polled for, which is what lets
@@ -482,6 +504,7 @@ impl Engine {
                     cfg.profile.clone(),
                     cfg.back,
                 );
+                self.preview.publish(galdeck_ipc::Event::KeyPressed { key });
                 if let Some(cmd) = exec {
                     spawn_action(&cmd);
                 }
@@ -496,6 +519,8 @@ impl Engine {
                 }
             }
             Event::EncoderDown(encoder) => {
+                self.preview
+                    .publish(galdeck_ipc::Event::EncoderPressed { encoder });
                 if let Some(ring) = self.rings.get_mut(encoder as usize) {
                     ring.click(at);
                     self.paint_ring(encoder);
@@ -506,6 +531,8 @@ impl Engine {
             }
             Event::EncoderRotate(encoder, delta) => {
                 // The ring answers every turn, bound or not.
+                self.preview
+                    .publish(galdeck_ipc::Event::EncoderTurned { encoder, delta });
                 if let Some(ring) = self.rings.get_mut(encoder as usize) {
                     ring.turn(delta, at);
                     self.paint_ring(encoder);
@@ -554,6 +581,10 @@ impl Engine {
                 }
                 self.page_index = index;
                 self.paint_page();
+                self.preview.publish(galdeck_ipc::Event::PageChanged {
+                    profile: self.profile_id.clone(),
+                    page: id.to_string(),
+                });
                 true
             }
             None => {
@@ -590,6 +621,9 @@ impl Engine {
         self.profile_id = id.to_string();
         self.enter_profile();
         self.paint_page();
+        self.preview.publish(galdeck_ipc::Event::ProfileChanged {
+            profile: self.profile_id.clone(),
+        });
         true
     }
 
@@ -638,6 +672,7 @@ impl Engine {
             }
         }
         self.paint_page();
+        self.preview.publish(galdeck_ipc::Event::ConfigChanged);
         Response::Ok
     }
 
@@ -678,6 +713,9 @@ impl Engine {
                 // drains. Nothing here waits on the device, which is the whole
                 // point of the split.
                 self.send(Paint::Brightness(percent));
+                self.preview.set_brightness(percent);
+                self.preview
+                    .publish(galdeck_ipc::Event::BrightnessChanged { percent });
                 Response::Ok
             }
             Request::SwitchPage { name } => {

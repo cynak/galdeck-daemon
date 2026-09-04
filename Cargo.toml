@@ -7,6 +7,7 @@ members = [
   "crates/galdeck-device",
   "crates/galdeck-core",
   "crates/galdeck-model",
+  "crates/galdeck-http",
 ]
 
 [workspace.package]
@@ -19,12 +20,17 @@ homepage = "https://github.com/cynak/galdeck-daemon"
 authors = ["galdeck contributors"]
 
 [workspace.dependencies]
-# The hardware framework. Switch to a version once galdeck is published.
-galdeck = { path = "../galdeck" }
+# The hardware framework, published at https://crates.io/crates/galdeck.
+# Pinned by Cargo.lock, which CI builds with --locked. For local work against
+# an unpublished framework change, add to .cargo/config.toml (not committed):
+#   [patch.crates-io]
+#   galdeck = { path = "../galdeck" }
+galdeck = "0.1.0"
 galdeck-ipc = { path = "crates/galdeck-ipc" }
 galdeck-device = { path = "crates/galdeck-device" }
 galdeck-core = { path = "crates/galdeck-core" }
 galdeck-model = { path = "crates/galdeck-model" }
+galdeck-http = { path = "crates/galdeck-http" }
 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
