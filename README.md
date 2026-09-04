@@ -80,6 +80,38 @@ so a knob answers even when its command has no visible effect. Fast spins
 run their detents in order through a bounded per-knob queue rather than
 racing; `GALDECK_DELTA` carries the signed step count to your command.
 
+### Widgets and animations
+
+A key can carry a **widget** — something that changes:
+
+```toml
+[[pages.keys]]
+key = 9
+label = "--:--"          # shown until the widget produces text
+
+[pages.keys.widget]
+kind = "clock"           # clock, date, cpu, memory, command
+format = "%H:%M"
+```
+
+`command` runs a shell command on a worker thread and shows its first line of
+output; it is killed if it takes more than five seconds, so a wedged script
+cannot hold up the deck. A sample that produces the same text as last time
+costs nothing at all.
+
+A key or a ring can also carry an **animation**:
+
+```toml
+[pages.keys.animation]
+kind = "breathe"         # pulse, breathe, blink; rings also spin and comet
+period_ms = 3000
+to = "@aurora-green"     # the colour it moves towards
+```
+
+Frames are rendered and encoded once when the page is applied and then cycled,
+so playing one costs nothing. Turning or clicking a knob still takes
+precedence over its ring animation.
+
 ## The configuration UI
 
 ```sh
