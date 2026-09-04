@@ -352,7 +352,7 @@ fn seen_pages_all(config: &Config) -> Vec<&str> {
 fn did_you_mean(target: &str, candidates: &[&str]) -> String {
     let best = candidates
         .iter()
-        .map(|c| (edit_distance(target, c), *c))
+        .map(|c| (crate::edit_distance(target, c), *c))
         .filter(|(d, _)| *d <= 3)
         .min_by_key(|(d, _)| *d);
     match best {
@@ -360,24 +360,6 @@ fn did_you_mean(target: &str, candidates: &[&str]) -> String {
         None if candidates.is_empty() => "no pages are defined".to_string(),
         None => format!("known pages: {}", candidates.join(", ")),
     }
-}
-
-/// Levenshtein distance, iterative with one row of state.
-fn edit_distance(a: &str, b: &str) -> usize {
-    let b_chars: Vec<char> = b.chars().collect();
-    let mut row: Vec<usize> = (0..=b_chars.len()).collect();
-    for (i, ca) in a.chars().enumerate() {
-        let mut previous = row[0];
-        row[0] = i + 1;
-        for (j, cb) in b_chars.iter().enumerate() {
-            let cost = usize::from(ca != *cb);
-            let insert_delete = (row[j] + 1).min(row[j + 1] + 1);
-            let substitute = previous + cost;
-            previous = row[j + 1];
-            row[j + 1] = insert_delete.min(substitute);
-        }
-    }
-    row[b_chars.len()]
 }
 
 /// Validate a `#rrggbb` color string.
