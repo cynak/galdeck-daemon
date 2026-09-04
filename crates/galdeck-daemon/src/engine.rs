@@ -17,6 +17,7 @@ use galdeck_ipc::{
 
 use crate::io::DeviceMsg;
 use crate::preview::Preview;
+use crate::widgets::{Sample, WidgetHost};
 
 use crate::render;
 use crate::ring::RingFeedback;
@@ -71,6 +72,23 @@ impl ControlSender {
     }
 }
 
+/// Everything the engine needs that is not configuration.
+///
+/// A struct rather than ten more parameters: the list had reached twelve and
+/// every new one meant editing four call sites that did not otherwise care.
+pub struct EngineParts {
+    pub control_rx: Receiver<ControlMsg>,
+    pub device_rx: Receiver<DeviceMsg>,
+    pub paint_tx: SyncSender<Paint>,
+    pub widget_rx: Receiver<Sample>,
+    pub wake: WakeReceiver,
+    pub deadline: Arc<DeadlineCell>,
+    pub clock: Arc<dyn Clock>,
+    pub shutdown: Arc<AtomicBool>,
+    pub preview: Preview,
+    pub widget_host: WidgetHost,
+}
+
 /// A control request paired with its reply channel.
 pub struct ControlMsg {
     pub request: Request,
@@ -119,6 +137,10 @@ pub struct Engine {
     key_animations: Vec<Option<KeyAnimation>>,
     /// Ring animations, one slot per encoder.
     ring_animations: Vec<Option<RingAnimation>>,
+    /// The widget runner, and the text each widget last produced.
+    widget_host: WidgetHost,
+    widget_rx: Receiver<Sample>,
+    widget_text: Vec<Option<String>>,
 }
 
 /// What the io thread has told us about the device.
@@ -138,6 +160,8 @@ enum TimerKind {
     KeyFrame { key: u8 },
     /// The next frame of a ring's animation is due.
     RingFrame { encoder: u8 },
+    /// A widget is due to be sampled again.
+    WidgetTick { key: u8 },
 }
 
 /// A key animation, with every frame already rendered and encoded.
@@ -209,19 +233,19 @@ pub enum DeviceMode {
 }
 
 impl Engine {
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        config_dir: PathBuf,
-        workspace: Workspace,
-        control_rx: Receiver<ControlMsg>,
-        device_rx: Receiver<DeviceMsg>,
-        paint_tx: SyncSender<Paint>,
-        deadline: Arc<DeadlineCell>,
-        clock: Arc<dyn Clock>,
-        wake: WakeReceiver,
-        shutdown: Arc<AtomicBool>,
-        preview: Preview,
-    ) -> Result<Self> {
+    pub fn new(config_dir: PathBuf, workspace: Workspace, parts: EngineParts) -> Result<Self> {
+        let EngineParts {
+            control_rx,
+            device_rx,
+            paint_tx,
+            widget_rx,
+            wake,
+            deadline,
+            clock,
+            shutdown,
+            preview,
+            widget_host,
+        } = parts;
         let font = render::load_font(workspace.global.font.as_deref());
         let brightness = workspace.global.brightness;
         let profile_id = workspace
@@ -253,6 +277,9 @@ impl Engine {
             rings: Encoders::indices().map(|_| RingFeedback::new()).collect(),
             key_animations: (0..Buttons::COUNT).map(|_| None).collect(),
             ring_animations: Encoders::indices().map(|_| None).collect(),
+            widget_host,
+            widget_rx,
+            widget_text: (0..Buttons::COUNT).map(|_| None).collect(),
         };
         engine.enter_profile();
         engine.load_documents();
@@ -302,6 +329,11 @@ impl Engine {
                     key: key.key,
                     index,
                     label: key.label.clone(),
+                    text: self.label_for(key),
+                    widget: key
+                        .widget
+                        .as_ref()
+                        .map(|w| format!("{:?}", w.kind).to_lowercase()),
                     icon: key.icon.as_ref().map(|p| p.display().to_string()),
                     exec: key.exec.clone(),
                     page: key.page.clone(),
@@ -431,6 +463,9 @@ impl Engine {
             while let Ok(msg) = self.device_rx.try_recv() {
                 self.on_device(msg);
             }
+            while let Ok(sample) = self.widget_rx.try_recv() {
+                self.on_widget_sample(sample);
+            }
             self.service_control();
 
             // Publish before sleeping: the io thread sizes its poll from this,
@@ -455,7 +490,91 @@ impl Engine {
             TimerKind::RingRest { encoder } => self.paint_ring(encoder),
             TimerKind::KeyFrame { key } => self.advance_key_animation(key),
             TimerKind::RingFrame { encoder } => self.advance_ring_animation(encoder),
+            TimerKind::WidgetTick { key } => self.tick_widget(key),
         }
+    }
+
+    /// Sample a widget and schedule its next refresh.
+    fn tick_widget(&mut self, key: u8) {
+        let Some(widget) = self
+            .current_page()
+            .and_then(|page| page.keys.iter().find(|k| k.key == key))
+            .and_then(|cfg| cfg.widget.clone())
+        else {
+            return;
+        };
+        // Blocking kinds answer through the channel instead of returning here.
+        if let Some(text) = self.widget_host.sample(key, &widget) {
+            self.on_widget_sample(Sample {
+                key,
+                text: Some(text),
+            });
+        }
+        let now = self.clock.now();
+        let interval = Duration::from_millis(u64::from(widget.interval_ms()));
+        self.scheduler
+            .after(now, interval, TimerKind::WidgetTick { key });
+    }
+
+    /// Take a widget's new text and repaint just that key.
+    fn on_widget_sample(&mut self, sample: Sample) {
+        if sample.key >= Buttons::COUNT {
+            return;
+        }
+        if self.widget_text[sample.key as usize] == sample.text {
+            // Nothing moved. A clock showing the same minute must not cost a
+            // JPEG encode every second.
+            return;
+        }
+        self.widget_text[sample.key as usize] = sample.text;
+        self.repaint_key(sample.key);
+    }
+
+    /// Re-render one key, without touching the rest of the page.
+    fn repaint_key(&mut self, key: u8) {
+        if !self.device.connected {
+            return;
+        }
+        let Some(cfg) = self
+            .current_page()
+            .and_then(|page| page.keys.iter().find(|k| k.key == key))
+            .cloned()
+        else {
+            return;
+        };
+        let style = self.style_for(Some(&cfg.style), "key");
+        let label = self.label_for(&cfg);
+        let canvas = render::key(
+            &style,
+            cfg.icon.as_deref(),
+            label.as_deref(),
+            self.font.as_ref(),
+        );
+        match canvas.to_jpeg(galdeck::ids::DEFAULT_JPEG_QUALITY) {
+            Ok(jpeg) => {
+                let jpeg: Arc<[u8]> = jpeg.into();
+                self.preview.set_key(key, Some(Arc::clone(&jpeg)));
+                self.send(Paint::Key {
+                    index: key,
+                    target: KeyTarget::Jpeg(jpeg),
+                });
+            }
+            Err(e) => log::warn!("encoding key {key} failed: {e}"),
+        }
+    }
+
+    /// What a key should show: its widget's text if it has produced any, then
+    /// the widget's placeholder, then the key's own label.
+    fn label_for(&self, cfg: &KeyConfig) -> Option<String> {
+        if cfg.widget.is_some() {
+            if let Some(text) = self.widget_text[cfg.key as usize].clone() {
+                return Some(text);
+            }
+            if let Some(placeholder) = cfg.widget.as_ref().and_then(|w| w.placeholder.clone()) {
+                return Some(placeholder);
+            }
+        }
+        cfg.label.clone()
     }
 
     /// Show the next frame of a key's animation and schedule the one after.
@@ -497,6 +616,29 @@ impl Engine {
         let now = self.clock.now();
         self.scheduler
             .after(now, interval, TimerKind::RingFrame { encoder });
+    }
+
+    /// Schedule the widgets on this page, and forget the ones that left.
+    fn start_widgets(&mut self, page: &galdeck_model::v2::Page) {
+        for key in Buttons::indices() {
+            self.scheduler.cancel_kind(TimerKind::WidgetTick { key });
+        }
+        // Text from the page we just left would otherwise show on whatever key
+        // happens to share its position here.
+        for slot in &mut self.widget_text {
+            *slot = None;
+        }
+
+        let now = self.clock.now();
+        for cfg in &page.keys {
+            if cfg.widget.is_none() || cfg.key >= Buttons::COUNT {
+                continue;
+            }
+            // Fire immediately rather than after one interval: a clock that
+            // takes a second to appear looks broken.
+            self.scheduler
+                .at(now, TimerKind::WidgetTick { key: cfg.key });
+        }
     }
 
     /// Render and encode every frame of the animations on this page.
@@ -719,10 +861,11 @@ impl Engine {
             let target = match cell {
                 Some(cfg) => {
                     let style = self.style_for(Some(&cfg.style), &format!("keys[{index}].style"));
+                    let label = self.label_for(cfg);
                     let canvas = render::key(
                         &style,
                         cfg.icon.as_deref(),
-                        cfg.label.as_deref(),
+                        label.as_deref(),
                         self.font.as_ref(),
                     );
                     match canvas.to_jpeg(galdeck::ids::DEFAULT_JPEG_QUALITY) {
@@ -754,6 +897,7 @@ impl Engine {
         }
 
         self.build_animations(&page);
+        self.start_widgets(&page);
 
         let style = self.style_for(None, "lcd.style");
         let text = page.lcd_text.clone().unwrap_or_else(|| page.id.clone());

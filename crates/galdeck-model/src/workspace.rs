@@ -146,6 +146,7 @@ impl Workspace {
                         profile: None,
                         back: false,
                         animation: None,
+                        widget: None,
                         style: StyleLayer {
                             // v1's `color` was the key background.
                             key_bg: key.color.as_deref().and_then(literal),
@@ -414,6 +415,26 @@ impl Workspace {
                             );
                         }
                         check_period(animation, &at("animation.period_ms"), &mut out);
+                    }
+                    if let Some(widget) = &key.widget {
+                        if widget.kind == crate::widget::WidgetKind::Command
+                            && widget.command.as_deref().unwrap_or_default().is_empty()
+                        {
+                            out.push(Diagnostic::error(
+                                "E0142",
+                                at("widget.command"),
+                                "a command widget needs a `command` to run",
+                            ));
+                        }
+                        if widget.kind != crate::widget::WidgetKind::Command
+                            && widget.command.is_some()
+                        {
+                            out.push(Diagnostic::warning(
+                                "W0143",
+                                at("widget.command"),
+                                format!("{:?} widgets ignore `command`", widget.kind),
+                            ));
+                        }
                     }
                     if !key.is_bound() {
                         out.push(

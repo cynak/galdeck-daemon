@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use galdeck_core::{wake_channel, Clock, DeadlineCell};
 use galdeck_daemon::clock::SystemClock;
-use galdeck_daemon::engine::{ControlMsg, ControlSender, Engine};
+use galdeck_daemon::engine::{ControlSender, Engine};
 use galdeck_daemon::io::IoThread;
 use galdeck_device::{DeckOp, FakeDeck, FakeDeckHandle};
 use galdeck_model::{v1, Workspace};
@@ -69,6 +69,8 @@ impl Harness {
         let (control_tx, control_rx) = channel();
         let control = ControlSender::new(control_tx, waker.clone());
 
+        let (widget_host, widget_rx) = galdeck_daemon::widgets::WidgetHost::new(waker.clone());
+
         let (deck, handle) = FakeDeck::new();
         let io = IoThread::with_deck(
             Box::new(deck),
@@ -84,14 +86,18 @@ impl Harness {
         let mut engine = Engine::new(
             dir,
             workspace,
-            control_rx,
-            device_rx,
-            paint_tx,
-            deadline,
-            clock,
-            wake_rx,
-            Arc::clone(&shutdown),
-            galdeck_daemon::preview::Preview::new(),
+            galdeck_daemon::engine::EngineParts {
+                control_rx,
+                device_rx,
+                paint_tx,
+                widget_rx,
+                wake: wake_rx,
+                deadline,
+                clock,
+                shutdown: Arc::clone(&shutdown),
+                preview: galdeck_daemon::preview::Preview::new(),
+                widget_host,
+            },
         )
         .expect("engine builds");
         let core = std::thread::spawn(move || engine.run());
@@ -294,4 +300,123 @@ fn the_v1_migration_path_still_works_alongside_animations() {
         .pages
         .iter()
         .all(|page| page.keys.iter().all(|key| key.animation.is_none())));
+}
+
+#[test]
+fn a_widget_paints_its_key_and_leaves_the_others_alone() {
+    let profile = r##"
+[[pages]]
+id = "main"
+
+[[pages.keys]]
+key = 0
+label = "Still"
+exec = "true"
+
+[[pages.keys]]
+key = 5
+label = "…"
+exec = "true"
+
+[pages.keys.widget]
+kind = "command"
+command = "date +%s%N"
+interval_ms = 100
+"##;
+    let harness = Harness::start(&[
+        ("galdeck.toml", &with_animation("")),
+        ("profiles/p.toml", profile),
+    ]);
+    std::thread::sleep(Duration::from_millis(300));
+    harness.deck.clear_ops();
+    std::thread::sleep(Duration::from_millis(600));
+
+    assert!(
+        harness.key_writes(5) >= 3,
+        "the widget key should keep updating, got {}",
+        harness.key_writes(5)
+    );
+    assert_eq!(
+        harness.key_writes(0),
+        0,
+        "a key with no widget must not be repainted"
+    );
+}
+
+#[test]
+fn a_widget_whose_text_has_not_changed_costs_nothing() {
+    // The reason this matters: a clock ticking once a second but showing
+    // minutes would otherwise re-encode a JPEG sixty times for every visible
+    // change. The comparison is on the text, not on the schedule.
+    let profile = r##"
+[[pages]]
+id = "main"
+
+[[pages.keys]]
+key = 0
+label = "steady"
+exec = "true"
+
+[pages.keys.widget]
+kind = "command"
+command = "echo unchanging"
+interval_ms = 100
+"##;
+    let harness = Harness::start(&[
+        ("galdeck.toml", &with_animation("")),
+        ("profiles/p.toml", profile),
+    ]);
+    std::thread::sleep(Duration::from_millis(400));
+    harness.deck.clear_ops();
+    std::thread::sleep(Duration::from_millis(600));
+
+    assert_eq!(
+        harness.key_writes(0),
+        0,
+        "six samples of the same text produced {} writes",
+        harness.key_writes(0)
+    );
+}
+
+#[test]
+fn a_slow_widget_does_not_stall_the_rest_of_the_deck() {
+    // The whole reason command widgets run on a worker. If this ran inline,
+    // the animated key would stop moving for as long as `sleep` took.
+    let profile = r##"
+[[pages]]
+id = "main"
+
+[[pages.keys]]
+key = 0
+label = "slow"
+exec = "true"
+
+[pages.keys.widget]
+kind = "command"
+command = "sleep 3; echo done"
+interval_ms = 200
+
+[[pages.keys]]
+key = 1
+label = "Moving"
+exec = "true"
+
+[pages.keys.animation]
+kind = "pulse"
+period_ms = 200
+frames = 4
+"##;
+    let harness = Harness::start(&[
+        ("galdeck.toml", &with_animation("")),
+        ("profiles/p.toml", profile),
+    ]);
+    std::thread::sleep(Duration::from_millis(300));
+    harness.deck.clear_ops();
+    std::thread::sleep(Duration::from_millis(600));
+
+    assert!(
+        harness.key_writes(1) >= 6,
+        "the animation stalled behind the slow widget: {} frames",
+        harness.key_writes(1)
+    );
 }

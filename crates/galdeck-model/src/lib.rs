@@ -12,6 +12,7 @@ pub mod doc;
 pub mod theme;
 pub mod v1;
 pub mod v2;
+pub mod widget;
 pub mod workspace;
 
 pub use animation::{Animation, AnimationKind};
@@ -21,6 +22,7 @@ pub use doc::{ConfigDocument, Patch, Staged, Value};
 pub use theme::{ResolvedStyle, StyleLayer, StyleSource, Theme};
 pub use v1::{default_config_path, Config, EncoderConfig, KeyConfig, LoadError, Page, ParseError};
 pub use v2::{Global, Workspace, CURRENT_VERSION};
+pub use widget::{Widget, WidgetKind};
 pub use workspace::{config_file_names, default_config_dir};
 
 /// Levenshtein distance, iterative with one row of state.

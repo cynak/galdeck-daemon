@@ -50,6 +50,8 @@ impl Harness {
         let (control_tx, control_rx) = channel();
         let control = ControlSender::new(control_tx, waker.clone());
 
+        let (widget_host, widget_rx) = galdeck_daemon::widgets::WidgetHost::new(waker.clone());
+
         let (deck, _handle) = FakeDeck::new();
         let io = IoThread::with_deck(
             Box::new(deck),
@@ -65,14 +67,18 @@ impl Harness {
         let mut engine = Engine::new(
             dir.clone(),
             workspace,
-            control_rx,
-            device_rx,
-            paint_tx,
-            deadline,
-            clock,
-            wake_rx,
-            Arc::clone(&shutdown),
-            galdeck_daemon::preview::Preview::new(),
+            galdeck_daemon::engine::EngineParts {
+                control_rx,
+                device_rx,
+                paint_tx,
+                widget_rx,
+                wake: wake_rx,
+                deadline,
+                clock,
+                shutdown: Arc::clone(&shutdown),
+                preview: galdeck_daemon::preview::Preview::new(),
+                widget_host,
+            },
         )
         .expect("engine builds");
         let core = std::thread::spawn(move || engine.run());

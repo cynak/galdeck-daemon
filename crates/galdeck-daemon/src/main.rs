@@ -112,6 +112,8 @@ fn main() -> Result<()> {
     let (paint_tx, paint_rx) = sync_channel(64);
     let (device_tx, device_rx) = sync_channel(256);
 
+    let (widget_host, widget_rx) = galdeck_daemon::widgets::WidgetHost::new(waker.clone());
+
     let io = IoThread::new(
         args.device.into(),
         paint_rx,
@@ -126,8 +128,20 @@ fn main() -> Result<()> {
         .spawn(move || io.run())?;
 
     let mut engine = engine::Engine::new(
-        config_dir, workspace, control_rx, device_rx, paint_tx, deadline, clock, wake_rx, shutdown,
-        preview,
+        config_dir,
+        workspace,
+        engine::EngineParts {
+            control_rx,
+            device_rx,
+            paint_tx,
+            widget_rx,
+            wake: wake_rx,
+            deadline,
+            clock,
+            shutdown,
+            preview,
+            widget_host,
+        },
     )?;
     engine.run();
 

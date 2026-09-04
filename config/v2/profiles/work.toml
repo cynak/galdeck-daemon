@@ -43,6 +43,34 @@ kind = "breathe"
 period_ms = 3000
 to = "@aurora-green"
 
+# A widget makes a key show something that changes. Its text replaces the
+# label once it has produced one; until then the label is what shows.
+#
+#   clock / date   the time, formatted with `format`
+#   cpu / memory   percentage in use
+#   command        the first line of a shell command's output
+#
+# Cheap widgets are read inline. A command runs on a worker thread and is
+# killed if it takes more than five seconds, so a wedged script cannot hold
+# up the deck.
+[[pages.keys]]
+key = 9
+label = "--:--"
+exec = "true"
+
+[pages.keys.widget]
+kind = "clock"
+format = "%H:%M"
+
+[[pages.keys]]
+key = 10
+label = "cpu"
+exec = "true"
+
+[pages.keys.widget]
+kind = "cpu"
+interval_ms = 2000
+
 [[pages.encoders]]
 encoder = 0
 press = "wpctl set-mute @DEFAULT_AUDIO_SINK@ toggle"

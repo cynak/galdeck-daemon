@@ -11,3 +11,4 @@ pub mod ipc_server;
 pub mod preview;
 pub mod render;
 pub mod ring;
+pub mod widgets;

@@ -12,6 +12,7 @@ use serde::Deserialize;
 
 use crate::animation::Animation;
 use crate::theme::StyleLayer;
+use crate::widget::Widget;
 
 /// The version this build writes and understands.
 pub const CURRENT_VERSION: u32 = 2;
@@ -124,6 +125,12 @@ pub struct KeyConfig {
     /// Makes this key move. Frames are pre-rendered when the page is applied.
     #[serde(default)]
     pub animation: Option<Animation>,
+    /// Makes this key show something that changes.
+    ///
+    /// The widget's text replaces the label once it has produced one; until
+    /// then, and whenever it fails, the label is what shows.
+    #[serde(default)]
+    pub widget: Option<Widget>,
 }
 
 impl KeyConfig {

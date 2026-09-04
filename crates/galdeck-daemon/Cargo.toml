@@ -26,6 +26,7 @@ galdeck-model = { workspace = true }
 galdeck-device = { workspace = true }
 galdeck-core = { workspace = true }
 galdeck-http = { workspace = true }
+jiff = { workspace = true }
 libc = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

@@ -126,7 +126,13 @@ pub struct KeyInfo {
     pub key: u8,
     /// Index within the page's `keys` array, for building a patch path.
     pub index: usize,
+    /// The label as configured, which is what an editor edits.
     pub label: Option<String>,
+    /// What the key is showing right now. Differs from `label` when a widget
+    /// has produced text, so an editor can show both without guessing.
+    pub text: Option<String>,
+    /// The widget's kind, if it has one.
+    pub widget: Option<String>,
     pub icon: Option<String>,
     pub exec: Option<String>,
     pub page: Option<String>,

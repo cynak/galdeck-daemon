@@ -203,9 +203,15 @@ function keyForm(info) {
     .join("");
   return `
     <h2>Key ${info.key}</h2>
+    ${info.widget
+      ? `<div class="field"><label>Showing</label>
+           <span class="hint"><code>${escapeHtml(info.widget)}</code> widget →
+           ${escapeHtml(info.text ?? "—")}</span></div>`
+      : ""}
     <div class="field">
       <label for="f-label">Label</label>
       <input id="f-label" value="${escapeHtml(info.label ?? "")}">
+      ${info.widget ? `<span class="hint">Shown until the widget produces text.</span>` : ""}
     </div>
     <div class="field">
       <label for="f-icon">Icon</label>
