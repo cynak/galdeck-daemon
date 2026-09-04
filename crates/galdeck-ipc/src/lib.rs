@@ -29,6 +29,12 @@ pub enum Request {
     Reload,
     /// Every configuration file, as text, for an editor to work on.
     GetConfig,
+    /// The current page, resolved, with the config path of every control.
+    ///
+    /// An editor needs to know that the key in the top-left corner is
+    /// `pages[0].keys[2]` in `profiles/work.toml`. Answering that here keeps
+    /// the model in one place instead of reimplemented in JavaScript.
+    GetLayout,
     /// Try edits without saving anything, and report what they would do.
     ///
     /// This is what makes live validation possible: the editor can show
@@ -59,6 +65,7 @@ pub enum Response {
     },
     Status(Status),
     Config(ConfigSnapshot),
+    Layout(Layout),
     /// Everything an edit would produce. An empty list means it is clean.
     Diagnostics {
         diagnostics: Vec<Diagnostic>,
@@ -94,6 +101,52 @@ pub struct ConfigFile {
     pub text: String,
     /// Bumped on every save. An edit carrying a stale one is refused.
     pub generation: u64,
+}
+
+/// The current page, with everything an editor needs to address it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Layout {
+    pub profile: String,
+    /// The file the current profile is written in, for patching.
+    pub file: String,
+    pub page: String,
+    /// Index of the current page within that file's `pages` array.
+    pub page_index: usize,
+    pub pages: Vec<String>,
+    pub keys: Vec<KeyInfo>,
+    pub encoders: Vec<EncoderInfo>,
+    /// Whether a `back` key would go anywhere.
+    pub can_go_back: bool,
+}
+
+/// One configured key.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KeyInfo {
+    /// Position on the 3x4 grid, 0-11.
+    pub key: u8,
+    /// Index within the page's `keys` array, for building a patch path.
+    pub index: usize,
+    pub label: Option<String>,
+    pub icon: Option<String>,
+    pub exec: Option<String>,
+    pub page: Option<String>,
+    pub profile: Option<String>,
+    pub back: bool,
+    /// The background this key resolves to, after the whole cascade.
+    pub background: String,
+    /// Whether the background came from this key rather than a theme above it.
+    pub background_is_own: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EncoderInfo {
+    pub encoder: u8,
+    pub index: usize,
+    pub press: Option<String>,
+    pub cw: Option<String>,
+    pub ccw: Option<String>,
+    pub ring: String,
+    pub ring_is_own: bool,
 }
 
 /// Something that happened, for clients that asked to be told.

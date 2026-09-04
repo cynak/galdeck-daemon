@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>galdeck</title>
+<link rel="stylesheet" href="/app.css">
+</head>
+<body>
+<header>
+  <h1>galdeck</h1>
+  <div class="chips">
+    <span id="device" class="chip">connecting…</span>
+    <label class="chip">profile
+      <select id="profile"></select>
+    </label>
+    <label class="chip">page
+      <select id="page"></select>
+    </label>
+    <label class="chip">brightness
+      <input id="brightness" type="range" min="0" max="100" step="1">
+      <output id="brightness-value">–</output>
+    </label>
+  </div>
+</header>
+
+<nav class="tabs">
+  <button data-tab="deck" class="active">Deck</button>
+  <button data-tab="theme">Theme</button>
+  <button data-tab="raw">Files</button>
+</nav>
+
+<main>
+  <section id="tab-deck" class="tab active">
+    <div class="deck">
+      <div class="lcd-wrap">
+        <img id="lcd" alt="LCD panel" class="lcd">
+      </div>
+      <div id="grid" class="grid"></div>
+      <div id="encoders" class="encoders"></div>
+    </div>
+    <aside id="inspector" class="inspector">
+      <p class="empty">Select a key or an encoder.</p>
+    </aside>
+  </section>
+
+  <section id="tab-theme" class="tab">
+    <div id="theme-editor"></div>
+  </section>
+
+  <section id="tab-raw" class="tab">
+    <div class="raw">
+      <select id="file-picker"></select>
+      <textarea id="file-text" spellcheck="false" readonly></textarea>
+    </div>
+  </section>
+</main>
+
+<div id="diagnostics" class="diagnostics" hidden></div>
+<div id="toast" class="toast" hidden></div>
+
+<script type="module" src="/app.js"></script>
+</body>
+</html>

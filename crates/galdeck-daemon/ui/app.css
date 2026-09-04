@@ -1,0 +1,237 @@
+/* The deck is dark and so is this: the previews are the real key images, and
+   a light chrome around them would misrepresent what the hardware shows. */
+:root {
+  --bg: #16181d;
+  --panel: #1e2129;
+  --line: #2c313c;
+  --text: #e6e9ef;
+  --dim: #99a1b3;
+  --accent: #88c0d0;
+  --danger: #bf616a;
+  --ok: #a3be8c;
+  color-scheme: dark;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font: 14px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+
+header {
+  display: flex;
+  align-items: center;
+  gap: 1.5rem;
+  flex-wrap: wrap;
+  padding: 0.9rem 1.25rem;
+  border-bottom: 1px solid var(--line);
+  background: var(--panel);
+}
+
+h1 {
+  margin: 0;
+  font-size: 1.05rem;
+  letter-spacing: 0.08em;
+  text-transform: lowercase;
+  color: var(--accent);
+}
+
+.chips { display: flex; gap: 0.75rem; flex-wrap: wrap; align-items: center; }
+
+.chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  padding: 0.3rem 0.6rem;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  font-size: 0.82rem;
+  color: var(--dim);
+}
+
+.chip.connected { border-color: var(--ok); color: var(--ok); }
+.chip.disconnected { border-color: var(--danger); color: var(--danger); }
+
+select, input, textarea, button {
+  font: inherit;
+  color: var(--text);
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 0.3rem 0.45rem;
+}
+
+button { cursor: pointer; }
+button:hover { border-color: var(--accent); }
+
+.tabs {
+  display: flex;
+  gap: 0.25rem;
+  padding: 0.6rem 1.25rem 0;
+  border-bottom: 1px solid var(--line);
+}
+
+.tabs button {
+  border: none;
+  border-bottom: 2px solid transparent;
+  border-radius: 0;
+  background: none;
+  color: var(--dim);
+  padding: 0.4rem 0.8rem;
+}
+
+.tabs button.active { color: var(--text); border-bottom-color: var(--accent); }
+
+.tab { display: none; }
+.tab.active { display: flex; }
+
+main { padding: 1.25rem; }
+
+#tab-deck { gap: 2rem; align-items: flex-start; flex-wrap: wrap; }
+
+.deck { display: flex; flex-direction: column; gap: 1rem; }
+
+.lcd-wrap {
+  width: 360px;
+  aspect-ratio: 720 / 384;
+  background: #000;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+.lcd { width: 100%; height: 100%; object-fit: cover; display: block; }
+
+/* Three columns by four rows, matching the module. */
+.grid {
+  display: grid;
+  grid-template-columns: repeat(3, 104px);
+  gap: 8px;
+}
+
+.key {
+  position: relative;
+  aspect-ratio: 1;
+  padding: 0;
+  border: 2px solid var(--line);
+  border-radius: 10px;
+  overflow: hidden;
+  background: #0d0f13;
+}
+
+.key img { width: 100%; height: 100%; display: block; }
+.key.selected { border-color: var(--accent); }
+.key.empty { border-style: dashed; }
+.key .index {
+  position: absolute;
+  top: 3px;
+  left: 5px;
+  font-size: 0.65rem;
+  color: var(--dim);
+  text-shadow: 0 1px 2px #000;
+}
+.key.pressed { transform: scale(0.95); border-color: var(--ok); }
+
+.encoders { display: flex; gap: 1.25rem; }
+
+.encoder {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.35rem;
+  padding: 0.6rem;
+  border: 2px solid var(--line);
+  border-radius: 10px;
+  background: var(--panel);
+  cursor: pointer;
+}
+
+.encoder.selected { border-color: var(--accent); }
+
+.ring {
+  width: 56px;
+  height: 56px;
+  border-radius: 50%;
+  /* Four segments, top first then clockwise, as the hardware numbers them. */
+  background: conic-gradient(
+    var(--s0) 0deg 90deg, var(--s1) 90deg 180deg,
+    var(--s2) 180deg 270deg, var(--s3) 270deg 360deg);
+  position: relative;
+}
+
+.ring::after {
+  content: "";
+  position: absolute;
+  inset: 10px;
+  border-radius: 50%;
+  background: var(--panel);
+}
+
+.inspector {
+  flex: 1 1 320px;
+  min-width: 300px;
+  padding: 1rem;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--panel);
+}
+
+.inspector h2 { margin: 0 0 0.75rem; font-size: 0.95rem; }
+.inspector .empty { color: var(--dim); }
+
+.field { display: flex; flex-direction: column; gap: 0.25rem; margin-bottom: 0.75rem; }
+.field label { font-size: 0.78rem; color: var(--dim); text-transform: uppercase; letter-spacing: 0.05em; }
+.field .hint { font-size: 0.75rem; color: var(--dim); }
+.row { display: flex; gap: 0.5rem; }
+.row > * { flex: 1; }
+
+.actions { display: flex; gap: 0.5rem; margin-top: 1rem; }
+.actions .danger { border-color: var(--danger); color: var(--danger); }
+
+.raw { display: flex; flex-direction: column; gap: 0.6rem; width: 100%; }
+#file-text {
+  width: 100%;
+  min-height: 60vh;
+  font-family: ui-monospace, "Cascadia Code", Menlo, monospace;
+  font-size: 12.5px;
+  line-height: 1.55;
+  white-space: pre;
+  overflow-wrap: normal;
+  overflow-x: auto;
+}
+
+#theme-editor { width: 100%; }
+.swatches { display: flex; flex-wrap: wrap; gap: 0.75rem; }
+.swatch { display: flex; align-items: center; gap: 0.5rem; padding: 0.4rem 0.6rem; border: 1px solid var(--line); border-radius: 8px; }
+.swatch .dot { width: 22px; height: 22px; border-radius: 5px; border: 1px solid var(--line); }
+.swatch code { color: var(--dim); font-size: 0.8rem; }
+
+.diagnostics {
+  position: fixed;
+  left: 1.25rem;
+  right: 1.25rem;
+  bottom: 1.25rem;
+  max-height: 30vh;
+  overflow: auto;
+  padding: 0.75rem 1rem;
+  border: 1px solid var(--danger);
+  border-radius: 10px;
+  background: #241a1c;
+}
+
+.diagnostics ul { margin: 0.35rem 0 0; padding-left: 1.1rem; }
+.diagnostics .warning { color: #ebcb8b; }
+.diagnostics .hint { color: var(--dim); }
+
+.toast {
+  position: fixed;
+  right: 1.25rem;
+  bottom: 1.25rem;
+  padding: 0.6rem 0.9rem;
+  border: 1px solid var(--ok);
+  border-radius: 8px;
+  background: #1c2620;
+}

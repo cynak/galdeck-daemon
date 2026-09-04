@@ -11,7 +11,9 @@ use anyhow::Result;
 use galdeck::{Buttons, Encoders, Event};
 use galdeck_core::{Clock, DeadlineCell, Scheduler, Tick, WakeReceiver, Waker};
 use galdeck_device::{KeyTarget, Paint};
-use galdeck_ipc::{ConfigFile, ConfigSnapshot, Patch, Request, Response, Status};
+use galdeck_ipc::{
+    ConfigFile, ConfigSnapshot, EncoderInfo, KeyInfo, Layout, Patch, Request, Response, Status,
+};
 
 use crate::io::DeviceMsg;
 use crate::preview::Preview;
@@ -205,6 +207,79 @@ impl Engine {
                 }
             }
         }
+    }
+
+    /// The current page, resolved, with the config path of every control.
+    fn layout(&self) -> Option<Layout> {
+        let profile = self.current_profile()?;
+        let page = self.current_page()?;
+        let mut out = Diagnostics::new();
+
+        let keys = page
+            .keys
+            .iter()
+            .enumerate()
+            .map(|(index, key)| {
+                let (style, from) = self.workspace.style_for(
+                    &self.theme,
+                    &self.palette,
+                    profile,
+                    page,
+                    Some(&key.style),
+                    "key",
+                    &mut out,
+                );
+                KeyInfo {
+                    key: key.key,
+                    index,
+                    label: key.label.clone(),
+                    icon: key.icon.as_ref().map(|p| p.display().to_string()),
+                    exec: key.exec.clone(),
+                    page: key.page.clone(),
+                    profile: key.profile.clone(),
+                    back: key.back,
+                    background: hex(style.key_bg),
+                    background_is_own: from.key_bg == galdeck_model::StyleSource::Cell,
+                }
+            })
+            .collect();
+
+        let encoders = page
+            .encoders
+            .iter()
+            .enumerate()
+            .map(|(index, encoder)| {
+                let (style, from) = self.workspace.style_for(
+                    &self.theme,
+                    &self.palette,
+                    profile,
+                    page,
+                    Some(&encoder.style),
+                    "encoder",
+                    &mut out,
+                );
+                EncoderInfo {
+                    encoder: encoder.encoder,
+                    index,
+                    press: encoder.press.clone(),
+                    cw: encoder.cw.clone(),
+                    ccw: encoder.ccw.clone(),
+                    ring: hex(style.ring),
+                    ring_is_own: from.ring == galdeck_model::StyleSource::Cell,
+                }
+            })
+            .collect();
+
+        Some(Layout {
+            profile: self.profile_id.clone(),
+            file: format!("profiles/{}.toml", self.profile_id),
+            page: page.id.clone(),
+            page_index: self.page_index.min(profile.pages.len().saturating_sub(1)),
+            pages: profile.pages.iter().map(|p| p.id.clone()).collect(),
+            keys,
+            encoders,
+            can_go_back: !self.page_stack.is_empty(),
+        })
     }
 
     fn config_snapshot(&self) -> ConfigSnapshot {
@@ -737,6 +812,12 @@ impl Engine {
                 }
             }
             Request::GetConfig => Response::Config(self.config_snapshot()),
+            Request::GetLayout => match self.layout() {
+                Some(layout) => Response::Layout(layout),
+                None => Response::Error {
+                    message: "no profile is loaded".into(),
+                },
+            },
             Request::ValidateConfig {
                 file,
                 patches,
@@ -850,6 +931,10 @@ fn action_command(cmd: &str, delta: Option<i8>) -> std::process::Command {
         command.env("GALDECK_DELTA", delta.to_string());
     }
     command
+}
+
+fn hex(color: galdeck::Rgb) -> String {
+    format!("#{:02x}{:02x}{:02x}", color.r, color.g, color.b)
 }
 
 #[cfg(test)]
