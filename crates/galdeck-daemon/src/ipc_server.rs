@@ -2,6 +2,7 @@
 //! the engine thread.
 
 use std::io::{BufRead, BufReader, Write};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
 use std::sync::mpsc::{channel, Sender};
@@ -15,7 +16,18 @@ use crate::engine::ControlMsg;
 const REPLY_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Bind the control socket, replacing a stale one from a dead daemon.
+///
+/// This socket can already switch pages and set brightness, and is about to be
+/// able to define what commands a key runs -- so it is bound 0600 and, when it
+/// lives in the `/tmp` fallback, inside a directory this user owns.
 pub fn bind(path: &Path) -> Result<UnixListener> {
+    // Only our own /tmp fallback directory is ours to police. An explicitly
+    // configured XDG_RUNTIME_DIR belongs to whoever set it.
+    if let Some(parent) = path.parent() {
+        if parent == galdeck_ipc::fallback_dir() {
+            ensure_private_dir(parent)?;
+        }
+    }
     if path.exists() {
         if UnixStream::connect(path).is_ok() {
             bail!(
@@ -26,7 +38,60 @@ pub fn bind(path: &Path) -> Result<UnixListener> {
         std::fs::remove_file(path)
             .with_context(|| format!("removing stale socket {}", path.display()))?;
     }
-    UnixListener::bind(path).with_context(|| format!("binding {}", path.display()))
+
+    // Bind to a private name and rename it into place. Binding directly would
+    // leave a window in which the socket exists at its well-known path with
+    // whatever the umask happened to allow.
+    let staging = path.with_extension(format!("sock.{}", std::process::id()));
+    let _ = std::fs::remove_file(&staging);
+    let listener =
+        UnixListener::bind(&staging).with_context(|| format!("binding {}", staging.display()))?;
+    std::fs::set_permissions(&staging, std::fs::Permissions::from_mode(0o600))
+        .with_context(|| format!("restricting {}", staging.display()))?;
+    std::fs::rename(&staging, path)
+        .with_context(|| format!("moving the socket into place at {}", path.display()))?;
+    Ok(listener)
+}
+
+/// Make sure `dir` exists, is a real directory this user owns, and is not
+/// readable by anyone else.
+///
+/// `/tmp` is world-writable and sticky, so without this another account could
+/// pre-create the directory -- or a symlink standing in for it -- and receive
+/// the connections meant for this daemon.
+fn ensure_private_dir(dir: &Path) -> Result<()> {
+    match std::fs::DirBuilder::new().mode(0o700).create(dir) {
+        Ok(()) => return Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(e) => {
+            return Err(e).with_context(|| format!("creating {}", dir.display()));
+        }
+    }
+
+    // It was already there. Trust it only if it is exactly what we would have
+    // created: symlink_metadata so a symlink is not silently followed.
+    let meta =
+        std::fs::symlink_metadata(dir).with_context(|| format!("inspecting {}", dir.display()))?;
+    if !meta.is_dir() {
+        bail!("{} exists but is not a directory", dir.display());
+    }
+    // Safety: getuid cannot fail and touches no memory.
+    let uid = unsafe { libc::getuid() };
+    if meta.uid() != uid {
+        bail!(
+            "{} is owned by uid {}, not {uid} — refusing to use it",
+            dir.display(),
+            meta.uid()
+        );
+    }
+    if meta.mode() & 0o077 != 0 {
+        bail!(
+            "{} is accessible to other users (mode {:o}) — refusing to use it",
+            dir.display(),
+            meta.mode() & 0o7777
+        );
+    }
+    Ok(())
 }
 
 /// Accept connections forever, forwarding requests to the engine.

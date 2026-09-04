@@ -36,13 +36,26 @@ pub struct Status {
 }
 
 /// Path of the daemon's control socket: `$XDG_RUNTIME_DIR/galdeck.sock`,
-/// falling back to a per-user name under /tmp.
+/// falling back to a per-user directory under /tmp.
+///
+/// The fallback keys on the numeric uid rather than `$USER`. `$USER` is
+/// attacker-controlled in the general case and simply absent in some service
+/// managers, where it previously collapsed to a single shared
+/// `/tmp/galdeck-unknown.sock` in a world-writable directory. Two accounts
+/// would then race for one path, and this socket is about to be able to
+/// define what commands the daemon runs.
 pub fn socket_path() -> PathBuf {
     if let Ok(dir) = std::env::var("XDG_RUNTIME_DIR") {
         if !dir.is_empty() {
             return PathBuf::from(dir).join("galdeck.sock");
         }
     }
-    let user = std::env::var("USER").unwrap_or_else(|_| "unknown".into());
-    PathBuf::from(format!("/tmp/galdeck-{user}.sock"))
+    fallback_dir().join("galdeck.sock")
+}
+
+/// The `/tmp` fallback directory for this user.
+pub fn fallback_dir() -> PathBuf {
+    // Safety: getuid cannot fail and touches no memory.
+    let uid = unsafe { libc::getuid() };
+    PathBuf::from(format!("/tmp/galdeck-{uid}"))
 }

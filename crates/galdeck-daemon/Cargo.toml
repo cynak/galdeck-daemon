@@ -25,6 +25,7 @@ galdeck-ipc = { workspace = true }
 galdeck-model = { workspace = true }
 galdeck-device = { workspace = true }
 galdeck-core = { workspace = true }
+libc = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 toml = { workspace = true }
