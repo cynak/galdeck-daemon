@@ -26,6 +26,15 @@ struct Args {
     #[arg(long)]
     config: Option<PathBuf>,
 
+    /// Control socket path (default: $GALDECK_SOCKET, else
+    /// $XDG_RUNTIME_DIR/galdeck.sock).
+    ///
+    /// Give this a path of its own to run a second daemon alongside an
+    /// installed one, which is what developing against `--device virtual`
+    /// wants.
+    #[arg(long, value_name = "PATH")]
+    socket: Option<PathBuf>,
+
     /// Serve the configuration UI on loopback at this port.
     ///
     /// Off unless given, because this surface can set the shell commands the
@@ -76,7 +85,7 @@ fn main() -> Result<()> {
         })?;
     }
 
-    let socket_path = galdeck_ipc::socket_path();
+    let socket_path = args.socket.clone().unwrap_or_else(galdeck_ipc::socket_path);
     let listener = ipc_server::bind(&socket_path)?;
     log::info!("control socket: {}", socket_path.display());
 

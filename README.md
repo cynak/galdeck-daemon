@@ -159,11 +159,18 @@ browser.
 
 `--device virtual` runs the whole daemon against a deck that exists only in
 memory, so the configuration, themes and profiles can be developed and tested
-on a machine with no keyboard attached:
+on a machine with no keyboard attached. Give it a socket of its own and it runs
+happily alongside the installed service:
 
 ```sh
-cargo run --bin galdeck-daemon -- --device virtual --config config/v2
+cargo run --bin galdeck-daemon -- --device virtual --config config/v2 \
+    --socket /tmp/galdeck-dev.sock --http 8787
+
+galdeck --socket /tmp/galdeck-dev.sock status
 ```
+
+`$GALDECK_SOCKET` does the same thing for both binaries if you would rather not
+pass the flag every time.
 
 
 ```sh

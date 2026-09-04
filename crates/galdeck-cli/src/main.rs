@@ -9,6 +9,13 @@ use galdeck_ipc::{Request, Response};
 #[derive(Parser)]
 #[command(version, about)]
 struct Args {
+    /// Control socket path (default: $GALDECK_SOCKET, else
+    /// $XDG_RUNTIME_DIR/galdeck.sock).
+    ///
+    /// Point this at a development daemon running alongside the installed one.
+    #[arg(long, global = true, value_name = "PATH")]
+    socket: Option<std::path::PathBuf>,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -115,7 +122,14 @@ fn detect() -> Result<()> {
 }
 
 fn main() -> Result<()> {
-    match Args::parse().command {
+    let args = Args::parse();
+    // Set before anything connects, and before any thread exists, so that
+    // `socket_path()` picks it up wherever it is called from. An explicit flag
+    // beats the environment, which is why this overwrites rather than checks.
+    if let Some(path) = &args.socket {
+        std::env::set_var("GALDECK_SOCKET", path);
+    }
+    match args.command {
         Command::Ping => {
             expect_ok(request(&Request::Ping)?)?;
             println!("pong");
@@ -129,8 +143,13 @@ fn main() -> Result<()> {
                 if let Some(serial) = status.serial {
                     println!("serial:     {serial}");
                 }
-                println!("profile:    {}", status.profile);
-                println!("profiles:   {}", status.profiles.join(", "));
+                // Absent when talking to a daemon older than profiles.
+                if !status.profile.is_empty() {
+                    println!("profile:    {}", status.profile);
+                }
+                if !status.profiles.is_empty() {
+                    println!("profiles:   {}", status.profiles.join(", "));
+                }
                 println!("page:       {}", status.page);
                 println!("pages:      {}", status.pages.join(", "));
                 println!("brightness: {}", status.brightness);

@@ -78,7 +78,13 @@ pub struct Status {
     pub firmware: Option<String>,
     pub serial: Option<String>,
     /// Which profile is showing.
+    ///
+    /// Defaulted rather than required so a current CLI still gets a readable
+    /// answer out of a daemon built before profiles existed -- which is the
+    /// normal state of affairs for as long as an old build is installed.
+    #[serde(default)]
     pub profile: String,
+    #[serde(default)]
     pub profiles: Vec<String>,
     pub page: String,
     pub pages: Vec<String>,
@@ -170,8 +176,10 @@ pub enum Event {
     ConfigChanged,
 }
 
-/// Path of the daemon's control socket: `$XDG_RUNTIME_DIR/galdeck.sock`,
-/// falling back to a per-user directory under /tmp.
+/// Path of the daemon's control socket.
+///
+/// `$GALDECK_SOCKET` if set, else `$XDG_RUNTIME_DIR/galdeck.sock`, else a
+/// per-user directory under /tmp.
 ///
 /// The fallback keys on the numeric uid rather than `$USER`. `$USER` is
 /// attacker-controlled in the general case and simply absent in some service
@@ -180,6 +188,13 @@ pub enum Event {
 /// would then race for one path, and this socket can define what commands the
 /// daemon runs.
 pub fn socket_path() -> PathBuf {
+    // An explicit override, so a development build can run alongside the
+    // installed service instead of fighting it for one well-known path.
+    if let Ok(path) = std::env::var("GALDECK_SOCKET") {
+        if !path.is_empty() {
+            return PathBuf::from(path);
+        }
+    }
     if let Ok(dir) = std::env::var("XDG_RUNTIME_DIR") {
         if !dir.is_empty() {
             return PathBuf::from(dir).join("galdeck.sock");
