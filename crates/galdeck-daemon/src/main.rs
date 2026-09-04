@@ -1,10 +1,13 @@
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::channel;
+use std::sync::mpsc::{channel, sync_channel};
 use std::sync::Arc;
 
 use anyhow::Result;
 use clap::ValueEnum;
+use galdeck_core::{wake_channel, Clock, DeadlineCell};
+use galdeck_daemon::clock::SystemClock;
+use galdeck_daemon::io::IoThread;
 use galdeck_daemon::{engine, ipc_server};
 
 use clap::Parser;
@@ -53,18 +56,50 @@ fn main() -> Result<()> {
     let listener = ipc_server::bind(&socket_path)?;
     log::info!("control socket: {}", socket_path.display());
 
+    let clock: Arc<dyn Clock> = Arc::new(SystemClock::new());
+    let deadline = Arc::new(DeadlineCell::new());
+    let (waker, wake_rx) = wake_channel();
+
     let (control_tx, control_rx) = channel();
-    std::thread::spawn(move || ipc_server::serve(listener, control_tx));
+    let control = engine::ControlSender::new(control_tx, waker.clone());
+    std::thread::spawn(move || ipc_server::serve(listener, control));
+
+    // A whole page is sixteen paints. Sixty-four leaves room for a page
+    // switch landing on top of a half-drained one; beyond that the device is
+    // further behind than a page, which only happens when it has stopped
+    // answering, and the io thread is about to reconnect and repaint anyway.
+    let (paint_tx, paint_rx) = sync_channel(64);
+    let (device_tx, device_rx) = sync_channel(256);
+
+    let io = IoThread::new(
+        args.device.into(),
+        paint_rx,
+        device_tx,
+        Arc::clone(&deadline),
+        Arc::clone(&clock),
+        waker,
+        Arc::clone(&shutdown),
+    );
+    let io_thread = std::thread::Builder::new()
+        .name("galdeck-io".into())
+        .spawn(move || io.run())?;
 
     let mut engine = engine::Engine::new(
         config_path,
         config,
         control_rx,
+        device_rx,
+        paint_tx,
+        deadline,
+        clock,
+        wake_rx,
         shutdown,
-        args.device.into(),
     )?;
     engine.run();
 
+    // The io thread owns the device and blanks it on the way out; wait for
+    // that rather than leaving the panel mid-page.
+    let _ = io_thread.join();
     let _ = std::fs::remove_file(&socket_path);
     Ok(())
 }

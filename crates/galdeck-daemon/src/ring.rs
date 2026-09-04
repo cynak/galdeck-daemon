@@ -11,7 +11,9 @@
 //! only the segments whose colour actually changed — a detent costs two
 //! writes, not four.
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+use galdeck_core::Tick;
 
 use galdeck::{Rgb, Ring};
 
@@ -39,7 +41,7 @@ pub struct RingFeedback {
     /// Lit segment, stepped one place per detent.
     cursor: u8,
     /// When the current animation returns to rest; `None` when resting.
-    until: Option<Instant>,
+    until: Option<Tick>,
 }
 
 impl RingFeedback {
@@ -90,27 +92,24 @@ impl RingFeedback {
     /// One detent: step the lit segment one place in the turn's direction.
     /// Segments are numbered clockwise from the top, so a clockwise turn
     /// counts up.
-    pub fn turn(&mut self, delta: i8, now: Instant) {
+    pub fn turn(&mut self, delta: i8, now: Tick) {
         let step = if delta > 0 { 1 } else { SEGMENTS - 1 };
         self.cursor = ((self.cursor as usize + step) % SEGMENTS) as u8;
         self.want = [self.base; SEGMENTS];
         self.want[self.cursor as usize] = self.highlight();
-        self.until = Some(now + TURN_HOLD);
+        self.until = Some(now.saturating_add(TURN_HOLD));
     }
 
     /// A click: light the whole ring.
-    pub fn click(&mut self, now: Instant) {
+    pub fn click(&mut self, now: Tick) {
         self.want = [self.highlight(); SEGMENTS];
-        self.until = Some(now + CLICK_HOLD);
+        self.until = Some(now.saturating_add(CLICK_HOLD));
     }
 
     /// The segments needing a repaint, as `(segment, colour)`. Returns the
     /// changed ones only, and assumes the caller writes every one it gets.
-    pub fn updates(&mut self, now: Instant) -> Vec<(u8, Rgb)> {
-        if self.until.is_some_and(|until| now >= until) {
-            self.want = [self.base; SEGMENTS];
-            self.until = None;
-        }
+    pub fn updates(&mut self, now: Tick) -> Vec<(u8, Rgb)> {
+        self.expire(now);
         let mut updates = Vec::new();
         for segment in 0..SEGMENTS {
             if self.shown[segment] != Some(self.want[segment]) {
@@ -119,6 +118,30 @@ impl RingFeedback {
             }
         }
         updates
+    }
+
+    /// Drop back to rest if the hold has run out.
+    ///
+    /// Separate from `updates` because the diffing now happens in the device
+    /// mirror; this is the part that is still the ring's own business.
+    pub fn expire(&mut self, now: Tick) {
+        if self.until.is_some_and(|until| now >= until) {
+            self.want = [self.base; SEGMENTS];
+            self.until = None;
+        }
+    }
+
+    /// When the ring owes itself a return to rest, if it does.
+    ///
+    /// The core loop registers this as a deadline rather than polling for it,
+    /// which is what lets an idle daemon cost nothing.
+    pub fn deadline(&self) -> Option<Tick> {
+        self.until
+    }
+
+    /// The colours the ring should currently be showing.
+    pub fn colors(&self) -> [Rgb; SEGMENTS] {
+        self.want
     }
 
     /// True while the ring still owes itself a return to rest. The engine
@@ -145,10 +168,10 @@ mod tests {
 
     const BASE: Rgb = Rgb::new(0, 200, 150);
 
-    fn rested() -> (RingFeedback, Instant) {
+    fn rested() -> (RingFeedback, Tick) {
         let mut ring = RingFeedback::new();
         ring.painted(BASE);
-        (ring, Instant::now())
+        (ring, Tick(1_000_000))
     }
 
     #[test]
@@ -210,10 +233,10 @@ mod tests {
         assert!(ring.is_active());
 
         // Still lit part way through the hold.
-        assert!(ring.updates(now + TURN_HOLD / 2).is_empty());
+        assert!(ring.updates(now.saturating_add(TURN_HOLD / 2)).is_empty());
         assert!(ring.is_active());
 
-        assert_eq!(ring.updates(now + TURN_HOLD), vec![(1, BASE)]);
+        assert_eq!(ring.updates(now.saturating_add(TURN_HOLD)), vec![(1, BASE)]);
         assert!(!ring.is_active());
     }
 
@@ -223,7 +246,7 @@ mod tests {
         ring.click(now);
         assert_eq!(ring.updates(now).len(), SEGMENTS);
 
-        let cleared = ring.updates(now + CLICK_HOLD);
+        let cleared = ring.updates(now.saturating_add(CLICK_HOLD));
         assert_eq!(cleared.len(), SEGMENTS);
         assert!(cleared.iter().all(|(_, color)| *color == BASE));
     }
@@ -232,7 +255,7 @@ mod tests {
     fn an_unconfigured_black_ring_still_lights_up() {
         let mut ring = RingFeedback::new();
         ring.painted(Rgb::BLACK);
-        let now = Instant::now();
+        let now = Tick(1_000_000);
         ring.turn(1, now);
         let updates = ring.updates(now);
         assert_eq!(updates.len(), 1);
@@ -270,7 +293,7 @@ mod tests {
         // that has never been painted must still emit its first four writes.
         let mut ring = RingFeedback::new();
         ring.rest(BASE);
-        let updates = ring.updates(Instant::now());
+        let updates = ring.updates(Tick(1_000_000));
         assert_eq!(updates.len(), SEGMENTS);
     }
 }

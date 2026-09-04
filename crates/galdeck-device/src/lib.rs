@@ -25,10 +25,12 @@ use galdeck::{Buttons, Encoders, Error, Event, Lcd, Rgb, Ring};
 mod error;
 mod fake;
 mod hardware;
+mod shadow;
 
 pub use error::{DeckError, DeckResult};
 pub use fake::{DeckSurface, FakeDeck, FakeDeckHandle, KeySurface, LcdPatch, Violation};
 pub use hardware::HardwareDeck;
+pub use shadow::{DeckShadow, KeyTarget, Paint};
 
 /// The forced pause after every feature report.
 ///

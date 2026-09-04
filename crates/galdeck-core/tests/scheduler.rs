@@ -198,3 +198,36 @@ fn the_manual_clock_moves_only_when_told() {
     assert_eq!(clock.now(), Tick(500_000));
     assert_eq!(clock.now().duration_since(Tick::ZERO), ms(500));
 }
+
+#[test]
+fn a_published_deadline_reads_back_as_a_wait() {
+    use galdeck_core::DeadlineCell;
+
+    let cell = DeadlineCell::new();
+    assert_eq!(cell.remaining(Tick(0)), None, "nothing scheduled");
+
+    cell.publish(Some(Tick(5_000)));
+    assert_eq!(
+        cell.remaining(Tick(1_000)),
+        Some(Duration::from_micros(4_000))
+    );
+
+    // Already past: zero, not a wrapped enormous wait.
+    assert_eq!(cell.remaining(Tick(9_000)), Some(Duration::ZERO));
+
+    cell.publish(None);
+    assert_eq!(cell.remaining(Tick(0)), None);
+}
+
+#[test]
+fn a_later_deadline_replaces_an_earlier_one() {
+    use galdeck_core::DeadlineCell;
+
+    // Deliberately a plain store rather than a minimum: latching the earliest
+    // deadline ever seen would, once it fell into the past, pin the reader to
+    // its shortest poll forever.
+    let cell = DeadlineCell::new();
+    cell.publish(Some(Tick(1_000)));
+    cell.publish(Some(Tick(50_000)));
+    assert_eq!(cell.peek(), Some(Tick(50_000)));
+}

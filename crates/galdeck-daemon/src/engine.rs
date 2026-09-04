@@ -3,25 +3,28 @@
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{Receiver, Sender, SyncSender};
+use std::sync::mpsc::{Receiver, Sender, SyncSender, TrySendError};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::Result;
 use galdeck::{Buttons, Encoders, Event, Rgb};
-use galdeck_device::{Deck, DeckError, FakeDeck, FakeDeckHandle, HardwareDeck};
+use galdeck_core::{Clock, DeadlineCell, Scheduler, Tick, WakeReceiver, Waker};
+use galdeck_device::{KeyTarget, Paint};
 use galdeck_ipc::{Request, Response, Status};
+
+use crate::io::DeviceMsg;
 
 use crate::render;
 use crate::ring::RingFeedback;
 use galdeck_model::{Config, EncoderConfig, KeyConfig, Page};
 
-const RECONNECT_INTERVAL: Duration = Duration::from_secs(2);
-/// How long one poll waits for input when the device is idle.
-const POLL_TIMEOUT: Duration = Duration::from_millis(200);
-/// Shorter poll while a ring is animating, so it returns to rest on time
-/// instead of waiting for the next input event.
-const RING_FRAME: Duration = Duration::from_millis(40);
+/// Longest the core loop sleeps with nothing scheduled.
+///
+/// Nothing depends on this for correctness: every real deadline is registered
+/// with the scheduler and every message rings the waker. It only bounds how
+/// long shutdown takes to notice.
+const CORE_IDLE: Duration = Duration::from_millis(250);
 const DEFAULT_KEY_COLOR: Rgb = Rgb::new(24, 26, 32);
 /// Cap on commands spawned for one coalesced rotation report.
 const MAX_DETENTS_PER_EVENT: u32 = 8;
@@ -29,6 +32,30 @@ const MAX_DETENTS_PER_EVENT: u32 = 8;
 /// spin, shallow enough that a slow action cannot build a backlog the
 /// knob keeps paying off after the user has stopped turning.
 const ROTATION_QUEUE_DEPTH: usize = 16;
+
+/// A sender that always wakes the core loop.
+///
+/// The loop sleeps until its next scheduled deadline, so a request that is
+/// merely queued would not be looked at until that fires -- which is how a
+/// ping ends up taking a quarter of a second. Bundling the waker with the
+/// channel makes it impossible for a caller to forget.
+#[derive(Clone)]
+pub struct ControlSender {
+    tx: Sender<ControlMsg>,
+    waker: Waker,
+}
+
+impl ControlSender {
+    pub fn new(tx: Sender<ControlMsg>, waker: Waker) -> Self {
+        Self { tx, waker }
+    }
+
+    pub fn send(&self, msg: ControlMsg) -> Result<(), std::sync::mpsc::SendError<ControlMsg>> {
+        self.tx.send(msg)?;
+        self.waker.notify();
+        Ok(())
+    }
+}
 
 /// A control request paired with its reply channel.
 pub struct ControlMsg {
@@ -42,22 +69,36 @@ pub struct Engine {
     font: Option<galdeck::Font>,
     page_index: usize,
     brightness: u8,
-    device: Option<DeviceState>,
-    device_mode: DeviceMode,
-    /// Kept alive for the virtual deck so its surface can be inspected and
-    /// input can be injected into it.
-    virtual_handle: Option<FakeDeckHandle>,
-    last_connect_attempt: Option<Instant>,
+    /// What the io thread last told us about the device. The engine never
+    /// touches it directly.
+    device: DeviceStatus,
     control_rx: Receiver<ControlMsg>,
+    device_rx: Receiver<DeviceMsg>,
+    paint_tx: SyncSender<Paint>,
+    deadline: Arc<DeadlineCell>,
+    clock: Arc<dyn Clock>,
+    wake: WakeReceiver,
     shutdown: Arc<AtomicBool>,
+    scheduler: Scheduler<TimerKind>,
     /// One serialized action runner per encoder; see [`RotationRunner`].
     rotation: Vec<RotationRunner>,
     /// Ring turn-feedback state, one per encoder.
     rings: Vec<RingFeedback>,
 }
 
-struct DeviceState {
-    deck: Box<dyn Deck>,
+/// What the io thread has told us about the device.
+#[derive(Default, Debug)]
+struct DeviceStatus {
+    connected: bool,
+    firmware: Option<String>,
+    serial: Option<String>,
+}
+
+/// Something that wants to happen later.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+enum TimerKind {
+    /// A ring's turn or click feedback has run its course.
+    RingRest { encoder: u8 },
 }
 
 /// Which deck the daemon drives.
@@ -73,12 +114,17 @@ pub enum DeviceMode {
 }
 
 impl Engine {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         config_path: PathBuf,
         config: Config,
         control_rx: Receiver<ControlMsg>,
+        device_rx: Receiver<DeviceMsg>,
+        paint_tx: SyncSender<Paint>,
+        deadline: Arc<DeadlineCell>,
+        clock: Arc<dyn Clock>,
+        wake: WakeReceiver,
         shutdown: Arc<AtomicBool>,
-        device_mode: DeviceMode,
     ) -> Result<Self> {
         let font = render::load_font(config.font.as_deref());
         let brightness = config.brightness;
@@ -88,12 +134,15 @@ impl Engine {
             font,
             page_index: 0,
             brightness,
-            device: None,
-            device_mode,
-            virtual_handle: None,
-            last_connect_attempt: None,
+            device: DeviceStatus::default(),
             control_rx,
+            device_rx,
+            paint_tx,
+            deadline,
+            clock,
+            wake,
             shutdown,
+            scheduler: Scheduler::new(),
             rotation: Encoders::indices().map(|_| RotationRunner::new()).collect(),
             rings: Encoders::indices().map(|_| RingFeedback::new()).collect(),
         })
@@ -102,115 +151,74 @@ impl Engine {
     pub fn run(&mut self) {
         log::info!("engine started, config: {}", self.config_path.display());
         while !self.shutdown.load(Ordering::Relaxed) {
+            let now = self.clock.now();
+            for (_, kind) in self.scheduler.due(now) {
+                self.fire(kind);
+            }
+            while let Ok(msg) = self.device_rx.try_recv() {
+                self.on_device(msg);
+            }
             self.service_control();
 
-            if self.device.is_none() {
-                self.maybe_connect();
-                if self.device.is_none() {
-                    std::thread::sleep(Duration::from_millis(100));
-                    continue;
-                }
-            }
+            // Publish before sleeping: the io thread sizes its poll from this,
+            // and a deadline registered after it has already gone to sleep
+            // would not be noticed until its next pass.
+            let now = self.clock.now();
+            let next = self.scheduler.next_deadline(now);
+            self.deadline.publish(next.map(|d| now.saturating_add(d)));
 
-            let timeout = if self.rings.iter().any(|ring| ring.is_active()) {
-                RING_FRAME
-            } else {
-                POLL_TIMEOUT
-            };
-            let state = self.device.as_mut().unwrap();
-            match state.deck.poll(timeout) {
-                Ok(events) => {
-                    // A keepalive gap (suspend, long stall) means the module
-                    // re-entered software mode and the firmware wiped our
-                    // state — redraw the page.
-                    if state.deck.take_mode_reentry() {
-                        log::info!("module re-entered software mode, re-applying page");
-                        // The firmware wiped the ring LEDs white, so what we
-                        // believe they show is no longer true.
-                        for ring in &mut self.rings {
-                            ring.forget();
-                        }
-                        self.apply_page();
-                    }
-                    for event in events {
-                        self.handle_event(event);
-                    }
-                    self.tick_rings();
-                }
-                // A garbled report is worth ignoring; a vanished device is
-                // not. Telling them apart is why the seam classifies errors.
-                Err(e) if e.is_disconnected() => {
-                    log::warn!("device error, will reconnect: {e}");
-                    self.device = None;
-                }
-                Err(e) => log::debug!("device hiccup, continuing: {e}"),
+            // A floor of one millisecond, because a deadline that is already
+            // due would otherwise turn the loop into a spin.
+            let wait = next.unwrap_or(CORE_IDLE).max(Duration::from_millis(1));
+            if !self.wake.wait(wait) {
+                break;
             }
-        }
-
-        // Leave the module tidy: blank everything and hand it back to
-        // hardware mode via the logo screen.
-        if let Some(state) = self.device.as_mut() {
-            let _ = state.deck.clear_all();
-            let _ = state.deck.reset_to_logo();
         }
         log::info!("engine stopped");
     }
 
-    fn maybe_connect(&mut self) {
-        if let Some(last) = self.last_connect_attempt {
-            if last.elapsed() < RECONNECT_INTERVAL {
-                return;
-            }
+    fn fire(&mut self, kind: TimerKind) {
+        match kind {
+            TimerKind::RingRest { encoder } => self.paint_ring(encoder),
         }
-        self.last_connect_attempt = Some(Instant::now());
+    }
 
-        if self.device_mode == DeviceMode::Virtual {
-            let (deck, handle) = FakeDeck::new();
-            log::info!(
-                "connected: virtual deck, firmware {}, serial {}",
-                deck.firmware(),
-                deck.serial()
-            );
-            self.virtual_handle = Some(handle);
-            self.device = Some(DeviceState {
-                deck: Box::new(deck),
-            });
-            self.apply_page();
-            return;
-        }
-
-        let api = match galdeck::hidapi::HidApi::new() {
-            Ok(api) => api,
-            Err(e) => {
-                log::warn!("hidapi init failed: {e}");
-                return;
+    fn on_device(&mut self, msg: DeviceMsg) {
+        match msg {
+            DeviceMsg::Connected { firmware, serial } => {
+                self.device = DeviceStatus {
+                    connected: true,
+                    firmware: Some(firmware),
+                    serial: Some(serial),
+                };
+                self.paint_page();
             }
-        };
-        match HardwareDeck::open(&api) {
-            Ok(deck) => {
-                log::info!(
-                    "connected: firmware {}, serial {}",
-                    deck.firmware(),
-                    deck.serial()
-                );
-                if !deck.firmware_is_validated() {
-                    log::warn!(
-                        "firmware {} differs from the validated versions {:?} — if the module drops out of software mode, the keepalive may have changed on this firmware; please report it",
-                        deck.firmware(),
-                        galdeck::ids::VALIDATED_FIRMWARES
-                    );
+            DeviceMsg::Disconnected => {
+                self.device = DeviceStatus::default();
+            }
+            DeviceMsg::ModeReentry => {
+                // The firmware wiped what it was showing, so nothing we
+                // believe about the rings still holds.
+                log::info!("re-applying page after software-mode re-entry");
+                for ring in &mut self.rings {
+                    ring.forget();
                 }
-                self.device = Some(DeviceState {
-                    deck: Box::new(deck),
-                });
-                self.apply_page();
+                self.paint_page();
             }
-            Err(galdeck::Error::DeviceNotFound) => {
-                log::debug!("device not present, retrying");
-            }
-            Err(e) => {
-                log::warn!("open failed: {e}");
-            }
+            DeviceMsg::Input(event, at) => self.handle_event(event, at),
+        }
+    }
+
+    /// Hand one paint to the io thread.
+    ///
+    /// A full channel means the device is further behind than a whole page of
+    /// paint, which only happens when it has stopped responding. Dropping is
+    /// right: the io thread will reconnect and everything gets repainted.
+    fn send(&self, paint: Paint) {
+        match self.paint_tx.try_send(paint) {
+            Ok(()) => {}
+            Err(TrySendError::Full(_)) => log::debug!("paint queue full, dropping"),
+            Err(TrySendError::Disconnected(_)) => {}
         }
     }
 
@@ -230,120 +238,100 @@ impl Engine {
     }
 
     /// Push the current page's full state to the device.
-    fn apply_page(&mut self) {
-        let Some(state) = self.device.as_mut() else {
+    /// Describe the current page to the io thread.
+    ///
+    /// This sends what every surface *should* show and lets the device mirror
+    /// decide what actually differs. A page switch that changes one key
+    /// therefore costs one key image rather than twelve images, eight ring
+    /// segments and a full LCD frame.
+    fn paint_page(&mut self) {
+        if !self.device.connected {
             return;
-        };
-        let page = &self.config.pages[self.page_index.min(self.config.pages.len() - 1)];
-        log::info!("applying page {:?}", page.name);
+        }
+        self.send(Paint::Brightness(self.brightness));
+
+        let page = self.current_page();
+        for index in Buttons::indices() {
+            let target = match page.keys.iter().find(|k| k.key == index) {
+                Some(cfg) => {
+                    let background = cfg
+                        .color
+                        .as_deref()
+                        .and_then(Rgb::from_hex)
+                        .unwrap_or(DEFAULT_KEY_COLOR);
+                    let canvas = render::key(
+                        background,
+                        cfg.image.as_deref(),
+                        cfg.label.as_deref(),
+                        self.font.as_ref(),
+                    );
+                    match canvas.to_jpeg(galdeck::ids::DEFAULT_JPEG_QUALITY) {
+                        Ok(jpeg) => KeyTarget::Jpeg(jpeg.into()),
+                        Err(e) => {
+                            log::warn!("encoding key {index} failed: {e}");
+                            KeyTarget::Color(background)
+                        }
+                    }
+                }
+                None => KeyTarget::Blank,
+            };
+            self.send(Paint::Key { index, target });
+        }
 
         let ring_colors: Vec<Rgb> = Encoders::indices()
             .map(|index| {
-                page.encoders
+                self.current_page()
+                    .encoders
                     .iter()
                     .find(|e| e.encoder == index)
-                    .and_then(|e| e.ring.as_deref())
+                    .and_then(|cfg| cfg.ring.as_deref())
                     .and_then(Rgb::from_hex)
                     .unwrap_or(Rgb::BLACK)
             })
             .collect();
+        for (index, color) in Encoders::indices().zip(ring_colors) {
+            // The page paints the ring, so the feedback state rests there --
+            // but it does not get to claim the hardware shows it. Only the
+            // mirror, on the far side of a real write, says that.
+            self.rings[index as usize].rest(color);
+            self.paint_ring(index);
+        }
 
-        let result: std::result::Result<(), DeckError> = (|| {
-            state.deck.set_brightness(self.brightness)?;
-
-            for index in Buttons::indices() {
-                match page.keys.iter().find(|k| k.key == index) {
-                    Some(cfg) => {
-                        let background = cfg
-                            .color
-                            .as_deref()
-                            .and_then(Rgb::from_hex)
-                            .unwrap_or(DEFAULT_KEY_COLOR);
-                        let canvas = render::key(
-                            background,
-                            cfg.image.as_deref(),
-                            cfg.label.as_deref(),
-                            self.font.as_ref(),
-                        );
-                        // Encode here rather than in the framework's
-                        // Button::draw: the seam takes bytes, which is what
-                        // will let the compositor encode off this thread.
-                        let jpeg = canvas
-                            .to_jpeg(galdeck::ids::DEFAULT_JPEG_QUALITY)
-                            .map_err(DeckError::classify)?;
-                        state.deck.set_key_jpeg(index, &jpeg)?;
-                    }
-                    None => state.deck.clear_key(index)?,
-                }
-            }
-
-            for (index, color) in Encoders::indices().zip(ring_colors.iter().copied()) {
-                for segment in 0..galdeck::Ring::SEGMENTS {
-                    state.deck.set_ring_segment(index, segment, color)?;
-                }
-            }
-
-            let text = page
-                .lcd_text
-                .as_deref()
-                .or(self.config.lcd_text.as_deref())
-                .unwrap_or(&page.name);
-            let screen = render::lcd(text, self.font.as_ref());
-            let jpeg = screen
-                .to_jpeg(galdeck::ids::DEFAULT_JPEG_QUALITY)
-                .map_err(DeckError::classify)?;
-            state
-                .deck
-                .draw_lcd_jpeg(0, 0, galdeck::Lcd::WIDTH, galdeck::Lcd::HEIGHT, &jpeg)?;
-            Ok(())
-        })();
-
-        match result {
-            // The rings now show these colours, and rest back to them
-            // after every turn.
-            Ok(()) => {
-                for (ring, color) in self.rings.iter_mut().zip(ring_colors) {
-                    ring.painted(color);
-                }
-            }
-            // Only a disconnect is worth tearing the handle down for. A bad
-            // argument would otherwise spin the reconnect loop forever, and
-            // every attempt blocks 1.2 seconds re-opening the device.
-            Err(e) if e.is_disconnected() => {
-                log::warn!("applying page failed, will reconnect: {e}");
-                self.device = None;
-            }
-            Err(e) => log::warn!("applying page failed: {e}"),
+        let page = self.current_page();
+        let text = page
+            .lcd_text
+            .as_deref()
+            .or(self.config.lcd_text.as_deref())
+            .unwrap_or(&page.name)
+            .to_string();
+        let screen = render::lcd(&text, self.font.as_ref());
+        match screen.to_jpeg(galdeck::ids::DEFAULT_JPEG_QUALITY) {
+            Ok(jpeg) => self.send(Paint::Lcd { jpeg: jpeg.into() }),
+            Err(e) => log::warn!("encoding the lcd failed: {e}"),
         }
     }
 
-    /// Push any ring repaints the feedback state machine is waiting on.
-    fn tick_rings(&mut self) {
-        let Some(state) = self.device.as_mut() else {
+    /// Send one ring's current colours and re-arm its return-to-rest timer.
+    fn paint_ring(&mut self, encoder: u8) {
+        let now = self.clock.now();
+        let Some(ring) = self.rings.get_mut(encoder as usize) else {
             return;
         };
-        let now = Instant::now();
-        let mut failure = None;
-        'rings: for (index, ring) in self.rings.iter_mut().enumerate() {
-            for (segment, color) in ring.updates(now) {
-                let write = state.deck.set_ring_segment(index as u8, segment, color);
-                if let Err(e) = write {
-                    failure = Some(e);
-                    break 'rings;
-                }
-            }
-        }
-        if let Some(e) = failure {
-            if e.is_disconnected() {
-                log::warn!("ring feedback failed, will reconnect: {e}");
-                self.device = None;
-            } else {
-                log::warn!("ring feedback failed: {e}");
-            }
+        ring.expire(now);
+        let colors = ring.colors();
+        let deadline = ring.deadline();
+
+        self.send(Paint::Ring { encoder, colors });
+
+        // Registered as a deadline rather than polled for, which is what lets
+        // an idle daemon cost nothing at all.
+        self.scheduler.cancel_kind(TimerKind::RingRest { encoder });
+        if let Some(at) = deadline {
+            self.scheduler.at(at, TimerKind::RingRest { encoder });
         }
     }
 
-    fn handle_event(&mut self, event: Event) {
+    fn handle_event(&mut self, event: Event, at: Tick) {
         log::debug!("event: {event:?}");
         match event {
             Event::KeyDown(key) => {
@@ -360,7 +348,8 @@ impl Engine {
             }
             Event::EncoderDown(encoder) => {
                 if let Some(ring) = self.rings.get_mut(encoder as usize) {
-                    ring.click(Instant::now());
+                    ring.click(at);
+                    self.paint_ring(encoder);
                 }
                 if let Some(cmd) = self.encoder_config(encoder).and_then(|e| e.press.clone()) {
                     spawn_action(&cmd);
@@ -369,7 +358,8 @@ impl Engine {
             Event::EncoderRotate(encoder, delta) => {
                 // The ring answers every turn, bound or not.
                 if let Some(ring) = self.rings.get_mut(encoder as usize) {
-                    ring.turn(delta, Instant::now());
+                    ring.turn(delta, at);
+                    self.paint_ring(encoder);
                 }
                 let cfg = self.encoder_config(encoder);
                 let cmd = if delta > 0 {
@@ -401,7 +391,7 @@ impl Engine {
         match self.config.pages.iter().position(|p| p.name == name) {
             Some(index) => {
                 self.page_index = index;
-                self.apply_page();
+                self.paint_page();
                 true
             }
             None => {
@@ -422,9 +412,9 @@ impl Engine {
         match request {
             Request::Ping => Response::Ok,
             Request::Status => Response::Status(Status {
-                connected: self.device.is_some(),
-                firmware: self.device.as_ref().map(|d| d.deck.firmware().to_string()),
-                serial: self.device.as_ref().map(|d| d.deck.serial().to_string()),
+                connected: self.device.connected,
+                firmware: self.device.firmware.clone(),
+                serial: self.device.serial.clone(),
                 page: self.current_page().name.clone(),
                 pages: self.config.pages.iter().map(|p| p.name.clone()).collect(),
                 brightness: self.brightness,
@@ -436,14 +426,10 @@ impl Engine {
                     };
                 }
                 self.brightness = percent;
-                if let Some(state) = self.device.as_mut() {
-                    if let Err(e) = state.deck.set_brightness(percent) {
-                        self.device = None;
-                        return Response::Error {
-                            message: e.to_string(),
-                        };
-                    }
-                }
+                // Answered immediately; the io thread applies it when it next
+                // drains. Nothing here waits on the device, which is the whole
+                // point of the split.
+                self.send(Paint::Brightness(percent));
                 Response::Ok
             }
             Request::SwitchPage { name } => {
@@ -466,7 +452,7 @@ impl Engine {
                         .position(|p| p.name == current)
                         .unwrap_or(0);
                     self.config = config;
-                    self.apply_page();
+                    self.paint_page();
                     Response::Ok
                 }
                 Err(e) => Response::Error {
@@ -566,10 +552,10 @@ mod tests {
             assert!(runner.push(&cmd, 1), "queue is deeper than eight detents");
         }
 
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
         let count = loop {
             let count = std::fs::read_to_string(&path).unwrap_or_default();
-            if count.trim() == "8" || Instant::now() >= deadline {
+            if count.trim() == "8" || std::time::Instant::now() >= deadline {
                 break count;
             }
             std::thread::sleep(Duration::from_millis(20));

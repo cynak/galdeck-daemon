@@ -5,13 +5,13 @@ use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
-use std::sync::mpsc::{channel, Sender};
+use std::sync::mpsc::channel;
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use galdeck_ipc::{Request, Response};
 
-use crate::engine::ControlMsg;
+use crate::engine::{ControlMsg, ControlSender};
 
 const REPLY_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -95,7 +95,7 @@ fn ensure_private_dir(dir: &Path) -> Result<()> {
 }
 
 /// Accept connections forever, forwarding requests to the engine.
-pub fn serve(listener: UnixListener, control_tx: Sender<ControlMsg>) {
+pub fn serve(listener: UnixListener, control_tx: ControlSender) {
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
@@ -118,7 +118,7 @@ pub fn serve(listener: UnixListener, control_tx: Sender<ControlMsg>) {
 
 const CLIENT_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 
-fn handle_client(stream: UnixStream, control_tx: Sender<ControlMsg>) -> Result<()> {
+fn handle_client(stream: UnixStream, control_tx: ControlSender) -> Result<()> {
     // Don't let an idle client pin its handler thread forever.
     stream.set_read_timeout(Some(CLIENT_IDLE_TIMEOUT))?;
     let mut writer = stream.try_clone()?;

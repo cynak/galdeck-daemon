@@ -6,9 +6,11 @@
 //! what order.
 
 pub mod clock;
+pub mod deadline;
 pub mod scheduler;
 pub mod wake;
 
 pub use clock::{Clock, ManualClock, Tick};
+pub use deadline::DeadlineCell;
 pub use scheduler::{Scheduler, TimerId};
 pub use wake::{wake_channel, WakeReceiver, Waker};
