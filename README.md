@@ -80,6 +80,25 @@ so a knob answers even when its command has no visible effect. Fast spins
 run their detents in order through a bounded per-knob queue rather than
 racing; `GALDECK_DELTA` carries the signed step count to your command.
 
+## The configuration UI
+
+```sh
+galdeck-daemon --http 8787
+# configuration UI: http://127.0.0.1:8787/?token=…
+```
+
+Open the printed address. The page shows the twelve keys as the images the
+panel is actually being sent, the LCD, and both encoder rings; click one to
+edit its label, icon, action and colour. Saving validates the whole
+configuration first and refuses anything that would break it, and your
+comments and formatting are preserved.
+
+It is **off unless you ask for it**, binds loopback only, and requires the
+token printed at startup — this surface can set the shell commands the daemon
+runs, so it also refuses any request whose `Host` or `Origin` is not its own,
+which is what stops a page you happen to visit from driving it through your
+browser.
+
 ## CLI
 
 | Command | What it does |
