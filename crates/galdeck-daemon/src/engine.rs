@@ -17,6 +17,7 @@ use galdeck_ipc::{
 };
 
 use crate::io::DeviceMsg;
+use crate::plugins::{PluginEvent, PluginHost};
 use crate::preview::Preview;
 use crate::widgets::{Sample, WidgetHost};
 
@@ -88,6 +89,8 @@ pub struct EngineParts {
     pub shutdown: Arc<AtomicBool>,
     pub preview: Preview,
     pub widget_host: WidgetHost,
+    pub plugin_host: PluginHost,
+    pub plugin_rx: Receiver<PluginEvent>,
 }
 
 /// A control request paired with its reply channel.
@@ -142,6 +145,13 @@ pub struct Engine {
     widget_host: WidgetHost,
     widget_rx: Receiver<Sample>,
     widget_text: Vec<Option<String>>,
+    /// Plugins, and what they have put on their keys.
+    plugin_host: PluginHost,
+    plugin_rx: Receiver<PluginEvent>,
+    plugin_text: Vec<Option<String>>,
+    plugin_color: Vec<Option<Rgb>>,
+    /// Which keys each plugin currently has, so it can be told when they go.
+    plugin_visible: std::collections::BTreeMap<String, Vec<u8>>,
 }
 
 /// What the io thread has told us about the device.
@@ -246,6 +256,8 @@ impl Engine {
             shutdown,
             preview,
             widget_host,
+            plugin_host,
+            plugin_rx,
         } = parts;
         let font = render::load_font(workspace.global.font.as_deref());
         let brightness = workspace.global.brightness;
@@ -281,6 +293,11 @@ impl Engine {
             widget_host,
             widget_rx,
             widget_text: (0..Buttons::COUNT).map(|_| None).collect(),
+            plugin_host,
+            plugin_rx,
+            plugin_text: (0..Buttons::COUNT).map(|_| None).collect(),
+            plugin_color: (0..Buttons::COUNT).map(|_| None).collect(),
+            plugin_visible: Default::default(),
         };
         engine.enter_profile();
         engine.load_documents();
@@ -487,6 +504,12 @@ impl Engine {
             while let Ok(sample) = self.widget_rx.try_recv() {
                 self.on_widget_sample(sample);
             }
+            while let Ok(event) = self.plugin_rx.try_recv() {
+                self.on_plugin_event(event);
+            }
+            // Non-blocking; a plugin that has exited can then be started again
+            // the next time one of its keys appears.
+            self.plugin_host.reap();
             self.service_control();
 
             // Publish before sleeping: the io thread sizes its poll from this,
@@ -503,6 +526,10 @@ impl Engine {
                 break;
             }
         }
+
+        // Asked to stop before the process exits, so a plugin gets a chance to
+        // tidy up rather than being killed outright.
+        self.plugin_host.shutdown();
         log::info!("engine stopped");
     }
 
@@ -537,6 +564,120 @@ impl Engine {
             .after(now, interval, TimerKind::WidgetTick { key });
     }
 
+    /// Act on something a plugin said.
+    ///
+    /// A plugin may only touch keys the config currently gives it. Without
+    /// that check any plugin could paint over any key, which would make the
+    /// binding in the config a suggestion rather than a grant.
+    fn on_plugin_event(&mut self, event: PluginEvent) {
+        match event.message {
+            galdeck_plugin::FromPlugin::Ready { name } => {
+                log::info!("plugin {:?} ready ({name})", event.plugin);
+            }
+            galdeck_plugin::FromPlugin::Log { message } => {
+                log::info!("[{}] {message}", event.plugin);
+            }
+            galdeck_plugin::FromPlugin::SetText { key, text } => {
+                if !self.plugin_owns(&event.plugin, key) {
+                    return;
+                }
+                if self.plugin_text[key as usize].as_deref() != Some(text.as_str()) {
+                    self.plugin_text[key as usize] = Some(text);
+                    self.repaint_key(key);
+                }
+            }
+            galdeck_plugin::FromPlugin::SetColor { key, color } => {
+                if !self.plugin_owns(&event.plugin, key) {
+                    return;
+                }
+                // A plugin may name a theme colour, so it can stay inside the
+                // user's palette rather than inventing its own.
+                let resolved = galdeck_model::ColorRef::parse(&color)
+                    .ok()
+                    .and_then(|reference| {
+                        self.palette
+                            .resolve(&reference, "plugin.color", &mut Diagnostics::new())
+                    });
+                let Some(rgb) = resolved else {
+                    log::debug!(
+                        "plugin {:?} sent an unusable colour {color:?}",
+                        event.plugin
+                    );
+                    return;
+                };
+                if self.plugin_color[key as usize] != Some(rgb) {
+                    self.plugin_color[key as usize] = Some(rgb);
+                    self.repaint_key(key);
+                }
+            }
+        }
+    }
+
+    fn plugin_owns(&self, plugin: &str, key: u8) -> bool {
+        key < Buttons::COUNT
+            && self
+                .plugin_visible
+                .get(plugin)
+                .is_some_and(|keys| keys.contains(&key))
+    }
+
+    /// Tell plugins which of their keys are on the page now.
+    ///
+    /// The disappear half matters as much as the appear: a plugin whose page
+    /// is not showing should be able to stop working entirely, rather than
+    /// polling something for a key nobody can see.
+    fn update_plugin_visibility(&mut self, page: &galdeck_model::v2::Page) {
+        let mut now: std::collections::BTreeMap<String, Vec<u8>> = Default::default();
+        for cfg in &page.keys {
+            let Some(binding) = &cfg.plugin else { continue };
+            if cfg.key >= Buttons::COUNT {
+                continue;
+            }
+            if !self.plugin_host.known(&binding.id) {
+                log::warn!(
+                    "key {} is bound to unknown plugin {:?}",
+                    cfg.key,
+                    binding.id
+                );
+                continue;
+            }
+            now.entry(binding.id.clone()).or_default().push(cfg.key);
+        }
+
+        // Gone.
+        let previous = std::mem::take(&mut self.plugin_visible);
+        for (id, keys) in &previous {
+            for key in keys {
+                if !now.get(id).is_some_and(|current| current.contains(key)) {
+                    self.plugin_host
+                        .send(id, galdeck_plugin::ToPlugin::Disappear { key: *key });
+                    self.plugin_text[*key as usize] = None;
+                    self.plugin_color[*key as usize] = None;
+                }
+            }
+        }
+
+        // Arrived. Set before sending, so a plugin that answers immediately is
+        // not rejected for touching a key we have not recorded yet.
+        self.plugin_visible = now;
+        let arrivals: Vec<(String, u8, std::collections::BTreeMap<String, String>)> = page
+            .keys
+            .iter()
+            .filter_map(|cfg| {
+                let binding = cfg.plugin.as_ref()?;
+                let was_visible = previous
+                    .get(&binding.id)
+                    .is_some_and(|keys| keys.contains(&cfg.key));
+                (!was_visible && self.plugin_host.known(&binding.id))
+                    .then(|| (binding.id.clone(), cfg.key, binding.options.clone()))
+            })
+            .collect();
+        for (id, key, options) in arrivals {
+            self.plugin_host
+                .send(&id, galdeck_plugin::ToPlugin::Appear { key, options });
+        }
+    }
+
     /// Take a widget's new text and repaint just that key.
     fn on_widget_sample(&mut self, sample: Sample) {
         if sample.key >= Buttons::COUNT {
@@ -563,7 +704,10 @@ impl Engine {
         else {
             return;
         };
-        let style = self.style_for(Some(&cfg.style), "key");
+        let mut style = self.style_for(Some(&cfg.style), "key");
+        if let Some(color) = self.plugin_color[key as usize] {
+            style.key_bg = color;
+        }
         let label = self.label_for(&cfg);
         let canvas = render::key(
             &style,
@@ -587,6 +731,11 @@ impl Engine {
     /// What a key should show: its widget's text if it has produced any, then
     /// the widget's placeholder, then the key's own label.
     fn label_for(&self, cfg: &KeyConfig) -> Option<String> {
+        if cfg.plugin.is_some() {
+            if let Some(text) = self.plugin_text[cfg.key as usize].clone() {
+                return Some(text);
+            }
+        }
         if cfg.widget.is_some() {
             if let Some(text) = self.widget_text[cfg.key as usize].clone() {
                 return Some(text);
@@ -919,6 +1068,7 @@ impl Engine {
 
         self.build_animations(&page);
         self.start_widgets(&page);
+        self.update_plugin_visibility(&page);
 
         let style = self.style_for(None, "lcd.style");
         let text = page.lcd_text.clone().unwrap_or_else(|| page.id.clone());
@@ -968,6 +1118,10 @@ impl Engine {
                     cfg.back,
                 );
                 self.preview.publish(galdeck_ipc::Event::KeyPressed { key });
+                if let Some(binding) = self.key_config(key).and_then(|c| c.plugin.clone()) {
+                    self.plugin_host
+                        .send(&binding.id, galdeck_plugin::ToPlugin::Press { key });
+                }
                 if let Some(cmd) = exec {
                     spawn_action(&cmd);
                 }

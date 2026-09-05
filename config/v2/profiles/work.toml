@@ -71,6 +71,19 @@ exec = "true"
 kind = "cpu"
 interval_ms = 2000
 
+# A plugin owns this key's text and colour. Plugins are separate processes
+# under `plugins/<id>/`, speaking line-delimited JSON over stdin and stdout --
+# see plugins/counter/ for one in forty lines of Python.
+[[pages.keys]]
+key = 6
+label = "0"
+
+[pages.keys.plugin]
+id = "counter"
+
+[pages.keys.plugin.options]
+label = "presses"
+
 [[pages.encoders]]
 encoder = 0
 press = "wpctl set-mute @DEFAULT_AUDIO_SINK@ toggle"

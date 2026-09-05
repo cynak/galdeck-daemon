@@ -131,12 +131,34 @@ pub struct KeyConfig {
     /// then, and whenever it fails, the label is what shows.
     #[serde(default)]
     pub widget: Option<Widget>,
+    /// Hands this key to a plugin, which then owns its text and colour.
+    #[serde(default)]
+    pub plugin: Option<PluginBinding>,
+}
+
+/// A key given over to a plugin.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct PluginBinding {
+    /// The plugin's id, which is its directory name under `plugins/`.
+    pub id: String,
+    /// Passed to the plugin verbatim when the key appears, so one plugin can
+    /// serve several keys that mean different things.
+    #[serde(default)]
+    pub options: std::collections::BTreeMap<String, String>,
 }
 
 impl KeyConfig {
     /// Whether pressing this key does anything at all.
+    ///
+    /// A key owned by a plugin counts: the plugin is told about the press, and
+    /// whether it does anything with it is its business.
     pub fn is_bound(&self) -> bool {
-        self.exec.is_some() || self.page.is_some() || self.profile.is_some() || self.back
+        self.exec.is_some()
+            || self.page.is_some()
+            || self.profile.is_some()
+            || self.back
+            || self.plugin.is_some()
     }
 }
 

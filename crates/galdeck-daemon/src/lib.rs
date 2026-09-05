@@ -8,6 +8,7 @@ pub mod engine;
 pub mod http;
 pub mod io;
 pub mod ipc_server;
+pub mod plugins;
 pub mod preview;
 pub mod render;
 pub mod ring;

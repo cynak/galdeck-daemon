@@ -359,6 +359,7 @@ dependencies = [
  "galdeck-http",
  "galdeck-ipc",
  "galdeck-model",
+ "galdeck-plugin",
  "jiff",
  "libc",
  "log",
@@ -403,6 +404,15 @@ dependencies = [
  "serde",
  "toml",
  "toml_edit",
+]
+
+[[package]]
+name = "galdeck-plugin"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "toml",
 ]
 
 [[package]]

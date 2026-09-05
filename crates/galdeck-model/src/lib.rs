@@ -21,7 +21,7 @@ pub use diag::{Diagnostic, Diagnostics, LineIndex, Loc, Severity};
 pub use doc::{ConfigDocument, Patch, Staged, Value};
 pub use theme::{ResolvedStyle, StyleLayer, StyleSource, Theme};
 pub use v1::{default_config_path, Config, EncoderConfig, KeyConfig, LoadError, Page, ParseError};
-pub use v2::{Global, Workspace, CURRENT_VERSION};
+pub use v2::{Global, PluginBinding, Workspace, CURRENT_VERSION};
 pub use widget::{Widget, WidgetKind};
 pub use workspace::{config_file_names, default_config_dir};
 

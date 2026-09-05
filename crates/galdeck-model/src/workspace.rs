@@ -147,6 +147,7 @@ impl Workspace {
                         back: false,
                         animation: None,
                         widget: None,
+                        plugin: None,
                         style: StyleLayer {
                             // v1's `color` was the key background.
                             key_bg: key.color.as_deref().and_then(literal),
@@ -438,10 +439,16 @@ impl Workspace {
                     }
                     if !key.is_bound() {
                         out.push(
-                            Diagnostic::hint("H0113", at(""), "this key does nothing when pressed")
-                                .with_help(
-                                    "give it an `exec`, a `page`, a `profile`, or `back = true`",
-                                ),
+                            Diagnostic::hint(
+                                "H0113",
+                                // Not `at("")`, which leaves a trailing dot on
+                                // a path the user reads.
+                                format!("profiles.{id}.pages[{p}].keys[{k}]"),
+                                "this key does nothing when pressed",
+                            )
+                            .with_help(
+                                "give it an `exec`, a `page`, a `profile`, or `back = true`",
+                            ),
                         );
                     }
                 }

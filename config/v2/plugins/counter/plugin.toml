@@ -1,0 +1,7 @@
+# A plugin is a directory under `plugins/` with one of these in it. The
+# directory name is the plugin's id, and what a key refers to.
+name = "Counter"
+description = "Counts presses. The smallest thing that shows the protocol working."
+
+# Run with `sh -c`, from this directory, so relative paths work.
+command = "python3 counter.py"

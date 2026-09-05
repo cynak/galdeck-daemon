@@ -70,6 +70,8 @@ impl Harness {
         let control = ControlSender::new(control_tx, waker.clone());
 
         let (widget_host, widget_rx) = galdeck_daemon::widgets::WidgetHost::new(waker.clone());
+        let (plugin_host, plugin_rx) =
+            galdeck_daemon::plugins::PluginHost::discover(&dir, waker.clone());
 
         let (deck, handle) = FakeDeck::new();
         let io = IoThread::with_deck(
@@ -97,6 +99,8 @@ impl Harness {
                 shutdown: Arc::clone(&shutdown),
                 preview: galdeck_daemon::preview::Preview::new(),
                 widget_host,
+                plugin_host,
+                plugin_rx,
             },
         )
         .expect("engine builds");

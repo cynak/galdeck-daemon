@@ -127,6 +127,8 @@ fn main() -> Result<()> {
     let (device_tx, device_rx) = sync_channel(256);
 
     let (widget_host, widget_rx) = galdeck_daemon::widgets::WidgetHost::new(waker.clone());
+    let (plugin_host, plugin_rx) =
+        galdeck_daemon::plugins::PluginHost::discover(&config_dir, waker.clone());
 
     let io = IoThread::new(
         args.device.into(),
@@ -155,6 +157,8 @@ fn main() -> Result<()> {
             shutdown,
             preview,
             widget_host,
+            plugin_host,
+            plugin_rx,
         },
     )?;
     engine.run();
