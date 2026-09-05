@@ -48,6 +48,21 @@ page to switch to, a profile to switch to, or `back = true` to return to
 wherever the current page was reached from. An encoder can bind commands to
 press, clockwise and anticlockwise, and rests at a ring colour.
 
+A key can also answer differently to a tap, a hold and a double tap:
+
+```toml
+[[pages.keys]]
+key = 1
+label = "Browser"
+exec = "xdg-open https://example.com"
+hold = "xdg-open https://example.com/settings"
+double = "xdg-open about:blank"
+```
+
+Binding `hold` or `double` changes *when* `exec` fires — until the key is
+released nobody knows which gesture it was. A key with neither still fires the
+instant it goes down, so nothing you have already gets slower.
+
 ### Profiles and themes
 
 A configuration directory looks like this:
