@@ -112,6 +112,42 @@ Frames are rendered and encoded once when the page is applied and then cycled,
 so playing one costs nothing. Turning or clicking a knob still takes
 precedence over its ring animation.
 
+### Plugins
+
+A plugin is a separate process the daemon starts, speaking line-delimited JSON
+over stdin and stdout. It lives in a directory under `plugins/`, and the
+directory name is its id:
+
+```
+~/.config/galdeck/plugins/counter/
+  plugin.toml       name, description, and the command to run
+  counter.py        the plugin itself
+```
+
+A key hands itself over with:
+
+```toml
+[pages.keys.plugin]
+id = "counter"
+
+[pages.keys.plugin.options]     # passed through verbatim
+label = "presses"
+```
+
+The plugin is told when its keys appear, disappear and are pressed, and can set
+their text and colour — colours may be `@tokens`, so it stays inside your
+palette. It cannot touch keys it was not given, push arbitrary images, or ask
+the daemon to run commands.
+
+Everything it does happens on threads of its own, and both message queues are
+bounded, so a plugin that wedges or floods cannot slow the deck down — which
+matters because the thread that owns the device also owns the module's
+half-second keepalive.
+
+See [config/v2/plugins/counter](config/v2/plugins/counter) for a working one in
+forty lines of Python; [`galdeck-plugin`](crates/galdeck-plugin) has the message
+types and a small Rust SDK.
+
 ## The configuration UI
 
 ```sh
