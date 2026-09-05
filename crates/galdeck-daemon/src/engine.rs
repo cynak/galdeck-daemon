@@ -12,7 +12,8 @@ use galdeck::{Buttons, Encoders, Event, Rgb};
 use galdeck_core::{Clock, DeadlineCell, Scheduler, Tick, WakeReceiver, Waker};
 use galdeck_device::{KeyTarget, Paint};
 use galdeck_ipc::{
-    ConfigFile, ConfigSnapshot, EncoderInfo, KeyInfo, Layout, Patch, Request, Response, Status,
+    AnimationInfo, ConfigFile, ConfigSnapshot, EncoderInfo, KeyInfo, Layout, Patch, Request,
+    Response, Status, WidgetInfo,
 };
 
 use crate::io::DeviceMsg;
@@ -305,6 +306,21 @@ impl Engine {
         }
     }
 
+    /// An animation's settings, with its colour resolved through the palette
+    /// so an editor shows what it will look like rather than `@accent`.
+    fn animation_info(&self, animation: &Animation) -> AnimationInfo {
+        AnimationInfo {
+            kind: format!("{:?}", animation.kind).to_lowercase(),
+            period_ms: animation.period_ms(),
+            to: animation.to.as_ref().and_then(|color| {
+                self.palette
+                    .resolve(color, "animation.to", &mut Diagnostics::new())
+                    .map(hex)
+            }),
+            frames: animation.frames(),
+        }
+    }
+
     /// The current page, resolved, with the config path of every control.
     fn layout(&self) -> Option<Layout> {
         let profile = self.current_profile()?;
@@ -330,10 +346,14 @@ impl Engine {
                     index,
                     label: key.label.clone(),
                     text: self.label_for(key),
-                    widget: key
-                        .widget
-                        .as_ref()
-                        .map(|w| format!("{:?}", w.kind).to_lowercase()),
+                    widget: key.widget.as_ref().map(|w| WidgetInfo {
+                        kind: format!("{:?}", w.kind).to_lowercase(),
+                        interval_ms: w.interval_ms(),
+                        format: w.format.clone(),
+                        command: w.command.clone(),
+                        placeholder: w.placeholder.clone(),
+                    }),
+                    animation: key.animation.as_ref().map(|a| self.animation_info(a)),
                     icon: key.icon.as_ref().map(|p| p.display().to_string()),
                     exec: key.exec.clone(),
                     page: key.page.clone(),
@@ -367,6 +387,7 @@ impl Engine {
                     ccw: encoder.ccw.clone(),
                     ring: hex(style.ring),
                     ring_is_own: from.ring == galdeck_model::StyleSource::Cell,
+                    animation: encoder.animation.as_ref().map(|a| self.animation_info(a)),
                 }
             })
             .collect();

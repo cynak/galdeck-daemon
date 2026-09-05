@@ -137,8 +137,10 @@ pub struct KeyInfo {
     /// What the key is showing right now. Differs from `label` when a widget
     /// has produced text, so an editor can show both without guessing.
     pub text: Option<String>,
-    /// The widget's kind, if it has one.
-    pub widget: Option<String>,
+    /// The widget on this key, if any, with everything an editor needs to
+    /// show its current settings rather than guess at them.
+    pub widget: Option<WidgetInfo>,
+    pub animation: Option<AnimationInfo>,
     pub icon: Option<String>,
     pub exec: Option<String>,
     pub page: Option<String>,
@@ -150,6 +152,28 @@ pub struct KeyInfo {
     pub background_is_own: bool,
 }
 
+/// A widget's settings, as configured.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WidgetInfo {
+    pub kind: String,
+    /// The interval actually in use, after clamping.
+    pub interval_ms: u32,
+    pub format: Option<String>,
+    pub command: Option<String>,
+    pub placeholder: Option<String>,
+}
+
+/// An animation's settings, as configured.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AnimationInfo {
+    pub kind: String,
+    /// The period actually in use, after clamping.
+    pub period_ms: u32,
+    /// The colour it moves towards, resolved through the palette.
+    pub to: Option<String>,
+    pub frames: u8,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EncoderInfo {
     pub encoder: u8,
@@ -159,6 +183,7 @@ pub struct EncoderInfo {
     pub ccw: Option<String>,
     pub ring: String,
     pub ring_is_own: bool,
+    pub animation: Option<AnimationInfo>,
 }
 
 /// Something that happened, for clients that asked to be told.

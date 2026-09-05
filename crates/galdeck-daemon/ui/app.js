@@ -215,7 +215,7 @@ function keyForm(info) {
     <h2>Key ${info.key}</h2>
     ${info.widget
       ? `<div class="field"><label>Showing</label>
-           <span class="hint"><code>${escapeHtml(info.widget)}</code> widget →
+           <span class="hint"><code>${escapeHtml(info.widget.kind)}</code> widget →
            ${escapeHtml(info.text ?? "—")}</span></div>`
       : ""}
     <div class="field">
@@ -260,17 +260,90 @@ function keyForm(info) {
         ? "Set on this key."
         : "Inherited from the theme."}</span>
     </div>
+    ${widgetFields(info.widget)}
+    ${animationFields(info.animation, false)}
     <div class="actions">
-      <button id="save" class="primary">Save</button>
-      <button id="remove" class="danger">Remove key</button>
+      <button id="f-save" class="primary">Save</button>
+      <button id="f-remove" class="danger">Remove key</button>
     </div>`;
+}
+
+/// The widget section. `kind = none` is how a widget is removed, so there is
+/// one control rather than a checkbox and a dropdown that can disagree.
+function widgetFields(widget) {
+  const kind = widget?.kind ?? "none";
+  const option = (value, label) =>
+    `<option value="${value}" ${kind === value ? "selected" : ""}>${label}</option>`;
+  const needsFormat = kind === "clock" || kind === "date";
+  return `
+    <fieldset>
+      <legend>Widget</legend>
+      <div class="field">
+        <label for="f-widget">Shows</label>
+        <select id="f-widget">
+          ${option("none", "nothing — just the label")}
+          ${option("clock", "the time")}
+          ${option("date", "the date")}
+          ${option("cpu", "CPU use")}
+          ${option("memory", "memory use")}
+          ${option("command", "a command's output")}
+        </select>
+      </div>
+      <div class="field" data-widget="has" ${kind === "none" ? "hidden" : ""}>
+        <label for="f-widget-interval">Refresh every (ms)</label>
+        <input id="f-widget-interval" type="number" min="100" step="100"
+               value="${widget?.interval_ms ?? 1000}">
+      </div>
+      <div class="field" data-widget="format" ${needsFormat ? "" : "hidden"}>
+        <label for="f-widget-format">Format</label>
+        <input id="f-widget-format" value="${escapeHtml(widget?.format ?? "%H:%M")}">
+        <span class="hint">strftime, so <code>%H:%M</code> or <code>%a %d %b</code>.</span>
+      </div>
+      <div class="field" data-widget="command" ${kind === "command" ? "" : "hidden"}>
+        <label for="f-widget-command">Command</label>
+        <input id="f-widget-command" value="${escapeHtml(widget?.command ?? "")}">
+        <span class="hint">First line of output. Killed after five seconds.</span>
+      </div>
+    </fieldset>`;
+}
+
+/// The animation section. Rings get two kinds keys do not.
+function animationFields(animation, isRing) {
+  const kind = animation?.kind ?? "none";
+  const option = (value, label) =>
+    `<option value="${value}" ${kind === value ? "selected" : ""}>${label}</option>`;
+  return `
+    <fieldset>
+      <legend>Animation</legend>
+      <div class="field">
+        <label for="f-anim">Moves</label>
+        <select id="f-anim">
+          ${option("none", "not at all")}
+          ${option("pulse", "pulse")}
+          ${option("breathe", "breathe")}
+          ${option("blink", "blink")}
+          ${isRing ? option("spin", "spin") : ""}
+          ${isRing ? option("comet", "comet") : ""}
+        </select>
+      </div>
+      <div class="field" data-anim="has" ${kind === "none" ? "hidden" : ""}>
+        <label for="f-anim-period">Cycle (ms)</label>
+        <input id="f-anim-period" type="number" min="120" max="60000" step="100"
+               value="${animation?.period_ms ?? 2000}">
+      </div>
+      <div class="field" data-anim="has" ${kind === "none" ? "hidden" : ""}>
+        <label for="f-anim-to">Towards</label>
+        <input id="f-anim-to" type="color" value="${escapeHtml(animation?.to ?? "#ffffff")}">
+        <span class="hint">Frames are rendered once when the page loads.</span>
+      </div>
+    </fieldset>`;
 }
 
 function emptyKeyForm(key) {
   return `
     <h2>Key ${key}</h2>
     <p class="empty">Nothing is bound here.</p>
-    <div class="actions"><button id="add">Add this key</button></div>`;
+    <div class="actions"><button id="f-add">Add this key</button></div>`;
 }
 
 function encoderForm(info) {
@@ -296,9 +369,10 @@ function encoderForm(info) {
         ? "Set on this encoder."
         : "Inherited from the theme."}</span>
     </div>
+    ${animationFields(info.animation, true)}
     <div class="actions">
-      <button id="save" class="primary">Save</button>
-      <button id="remove" class="danger">Remove encoder</button>
+      <button id="f-save" class="primary">Save</button>
+      <button id="f-remove" class="danger">Remove encoder</button>
     </div>`;
 }
 
@@ -306,7 +380,7 @@ function emptyEncoderForm(encoder) {
   return `
     <h2>Encoder ${encoder}</h2>
     <p class="empty">Nothing is bound here.</p>
-    <div class="actions"><button id="add">Add this encoder</button></div>`;
+    <div class="actions"><button id="f-add">Add this encoder</button></div>`;
 }
 
 function wireInspector() {
@@ -318,9 +392,30 @@ function wireInspector() {
       }
     });
   }
-  el("save")?.addEventListener("click", save);
-  el("add")?.addEventListener("click", add);
-  el("remove")?.addEventListener("click", remove);
+  const widget = el("f-widget");
+  widget?.addEventListener("change", () => {
+    const kind = widget.value;
+    for (const field of document.querySelectorAll("[data-widget]")) {
+      const shows = field.dataset.widget;
+      field.hidden =
+        shows === "has"
+          ? kind === "none"
+          : shows === "format"
+            ? !(kind === "clock" || kind === "date")
+            : kind !== shows;
+    }
+  });
+
+  const anim = el("f-anim");
+  anim?.addEventListener("change", () => {
+    for (const field of document.querySelectorAll("[data-anim]")) {
+      field.hidden = anim.value === "none";
+    }
+  });
+
+  el("f-save")?.addEventListener("click", save);
+  el("f-add")?.addEventListener("click", add);
+  el("f-remove")?.addEventListener("click", remove);
   el("f-bg-clear")?.addEventListener("click", clearBackground);
 }
 
@@ -370,7 +465,54 @@ function collectKeyPatches(info) {
   if (info.background_is_own || bg.toLowerCase() !== info.background.toLowerCase()) {
     patches.push({ op: "set", path: `${base}.style.key_bg`, value: str(bg) });
   }
+  collectWidget(patches, base);
+  collectAnimation(patches, base, false);
   return patches;
+}
+
+/// Widget settings, or its removal.
+///
+/// Fields that do not apply to the chosen kind are removed rather than left
+/// behind: a stale `command` under a clock widget is a warning the validator
+/// would rightly raise about something the user cannot see.
+function collectWidget(patches, base) {
+  const kind = el("f-widget")?.value ?? "none";
+  if (kind === "none") {
+    patches.push({ op: "remove", path: `${base}.widget` });
+    return;
+  }
+  patches.push({ op: "set", path: `${base}.widget.kind`, value: str(kind) });
+  patches.push({
+    op: "set",
+    path: `${base}.widget.interval_ms`,
+    value: int(Number(el("f-widget-interval").value) || 1000),
+  });
+
+  const wantsFormat = kind === "clock" || kind === "date";
+  setOrRemove(patches, `${base}.widget.format`,
+    wantsFormat ? el("f-widget-format").value.trim() : "");
+  setOrRemove(patches, `${base}.widget.command`,
+    kind === "command" ? el("f-widget-command").value.trim() : "");
+}
+
+function collectAnimation(patches, base, isRing) {
+  const kind = el("f-anim")?.value ?? "none";
+  if (kind === "none") {
+    patches.push({ op: "remove", path: `${base}.animation` });
+    return;
+  }
+  patches.push({ op: "set", path: `${base}.animation.kind`, value: str(kind) });
+  patches.push({
+    op: "set",
+    path: `${base}.animation.period_ms`,
+    value: int(Number(el("f-anim-period").value) || 2000),
+  });
+  patches.push({
+    op: "set",
+    path: `${base}.animation.to`,
+    value: str(el("f-anim-to").value),
+  });
+  void isRing;
 }
 
 function collectEncoderPatches(info) {
@@ -383,6 +525,7 @@ function collectEncoderPatches(info) {
   if (info.ring_is_own || ring.toLowerCase() !== info.ring.toLowerCase()) {
     patches.push({ op: "set", path: `${base}.style.ring`, value: str(ring) });
   }
+  collectAnimation(patches, base, true);
   return patches;
 }
 

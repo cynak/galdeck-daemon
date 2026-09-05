@@ -66,31 +66,23 @@ fn every_command_the_ui_sends_is_one_the_protocol_has() {
 #[test]
 fn every_element_the_script_looks_up_exists_in_the_page() {
     // `el("typo")` returns null and the failure surfaces somewhere unrelated.
-    // Ids built into the inspector's own markup are excluded: they are created
-    // by the script itself.
-    let built_by_script = [
-        "f-label",
-        "f-icon",
-        "f-action",
-        "f-exec",
-        "f-page",
-        "f-profile",
-        "f-bg",
-        "f-bg-clear",
-        "f-press",
-        "f-cw",
-        "f-ccw",
-        "f-ring",
-        "save",
-        "add",
-        "remove",
-    ];
+    //
+    // Ids the inspector builds into its own markup are told apart by prefix
+    // rather than by a list: a list of them rots every time a form gains a
+    // field, and a rotting test gets deleted rather than fixed. Everything the
+    // inspector creates is named `f-something`, which is a convention worth
+    // holding to on its own -- so those are checked against the script, and
+    // everything else against the page.
     for (index, _) in APP_JS.match_indices("el(\"") {
         let id: String = APP_JS[index + 4..]
             .chars()
             .take_while(|c| *c != '"')
             .collect();
-        if built_by_script.contains(&id.as_str()) {
+        if id.starts_with("f-") {
+            assert!(
+                APP_JS.contains(&format!("id=\"{id}\"")),
+                "app.js looks up #{id} but never builds it either"
+            );
             continue;
         }
         assert!(

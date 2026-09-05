@@ -188,6 +188,21 @@ main { padding: 1.25rem; }
 .row { display: flex; gap: 0.5rem; }
 .row > * { flex: 1; }
 
+fieldset {
+  margin: 0 0 0.9rem;
+  padding: 0.75rem 0.85rem 0.35rem;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+}
+
+legend {
+  padding: 0 0.4rem;
+  font-size: 0.75rem;
+  color: var(--dim);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
 .actions { display: flex; gap: 0.5rem; margin-top: 1rem; }
 .actions .danger { border-color: var(--danger); color: var(--danger); }
 

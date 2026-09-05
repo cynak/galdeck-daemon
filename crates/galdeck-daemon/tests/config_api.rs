@@ -279,3 +279,109 @@ fn status_reports_the_profile_as_well_as_the_page() {
     assert!(status.profiles.contains(&"play".to_string()));
     assert_eq!(status.page, "main");
 }
+
+#[test]
+fn a_widget_can_be_added_and_removed_through_the_api() {
+    // The path the UI's widget dropdown takes. Worth testing end to end
+    // because it writes nested sub-tables, which is the part of the patch
+    // layer with the most to go wrong.
+    let harness = Harness::start();
+    let response = harness.request(Request::ApplyConfig {
+        file: "profiles/work.toml".into(),
+        patches: vec![
+            Patch::Set {
+                path: "pages[0].keys[0].widget.kind".into(),
+                value: Value::String("clock".into()),
+            },
+            Patch::Set {
+                path: "pages[0].keys[0].widget.format".into(),
+                value: Value::String("%H:%M:%S".into()),
+            },
+        ],
+        generation: None,
+    });
+    assert!(matches!(response, Response::Ok), "got {response:?}");
+
+    let written = std::fs::read_to_string(harness.dir.join("profiles/work.toml")).unwrap();
+    // Written as a sub-table, which is how a person would have written it.
+    assert!(written.contains("[pages.keys.widget]"));
+    assert!(written.contains("kind = \"clock\""));
+    // And the comments around it survived.
+    assert!(written.contains("# A widget makes a key show something that changes."));
+
+    // Choosing "nothing" in the dropdown removes the whole table.
+    let response = harness.request(Request::ApplyConfig {
+        file: "profiles/work.toml".into(),
+        patches: vec![Patch::Remove {
+            path: "pages[0].keys[0].widget".into(),
+        }],
+        generation: None,
+    });
+    assert!(matches!(response, Response::Ok), "got {response:?}");
+    let written = std::fs::read_to_string(harness.dir.join("profiles/work.toml")).unwrap();
+    let first_key = written.split("[[pages.keys]]").nth(1).unwrap_or_default();
+    assert!(
+        !first_key.contains("[pages.keys.widget]"),
+        "the widget should be gone from key 0"
+    );
+}
+
+#[test]
+fn an_animation_survives_the_round_trip_with_its_colour_resolved() {
+    let harness = Harness::start();
+    harness.request(Request::ApplyConfig {
+        file: "profiles/work.toml".into(),
+        patches: vec![
+            Patch::Set {
+                path: "pages[0].keys[0].animation.kind".into(),
+                value: Value::String("breathe".into()),
+            },
+            Patch::Set {
+                path: "pages[0].keys[0].animation.period_ms".into(),
+                value: Value::Integer(2500),
+            },
+            Patch::Set {
+                path: "pages[0].keys[0].animation.to".into(),
+                value: Value::String("#f6d32d".into()),
+            },
+        ],
+        generation: None,
+    });
+
+    let Response::Layout(layout) = harness.request(Request::GetLayout) else {
+        panic!("expected a layout");
+    };
+    let key = layout.keys.iter().find(|k| k.key == 0).unwrap();
+    let animation = key
+        .animation
+        .as_ref()
+        .expect("the animation should be there");
+    assert_eq!(animation.kind, "breathe");
+    assert_eq!(animation.period_ms, 2500);
+    assert_eq!(animation.to.as_deref(), Some("#f6d32d"));
+    // Reported after clamping, so an editor shows what will actually happen.
+    assert_eq!(animation.frames, 8);
+}
+
+#[test]
+fn an_animation_kind_a_key_cannot_have_is_refused_before_it_is_written() {
+    let harness = Harness::start();
+    let before = std::fs::read_to_string(harness.dir.join("profiles/work.toml")).unwrap();
+
+    let response = harness.request(Request::ApplyConfig {
+        file: "profiles/work.toml".into(),
+        patches: vec![Patch::Set {
+            path: "pages[0].keys[0].animation.kind".into(),
+            value: Value::String("comet".into()),
+        }],
+        generation: None,
+    });
+    let Response::Diagnostics { diagnostics } = response else {
+        panic!("expected a refusal, got {response:?}");
+    };
+    assert!(diagnostics.iter().any(|d| d.code == "E0140"));
+    assert_eq!(
+        std::fs::read_to_string(harness.dir.join("profiles/work.toml")).unwrap(),
+        before
+    );
+}
