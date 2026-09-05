@@ -28,6 +28,7 @@ galdeck-core = { workspace = true }
 galdeck-http = { workspace = true }
 jiff = { workspace = true }
 galdeck-plugin = { workspace = true }
+image = { workspace = true }
 libc = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

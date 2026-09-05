@@ -9,6 +9,15 @@ use std::path::Path;
 use galdeck::{Align, Button, Canvas, Font, Lcd, TextStyle};
 use galdeck_model::ResolvedStyle;
 
+/// Most lines a key label may wrap to.
+///
+/// A key is 160 pixels tall and shares them with an icon. Past two lines the
+/// text is too small to read from across a desk, which is the only distance a
+/// deck is ever read from.
+const MAX_LABEL_LINES: usize = 2;
+/// How much smaller a wrapped line may go before giving up and truncating.
+const MIN_LABEL_SIZE: f32 = 11.0;
+
 /// Render one key from a resolved style: background, optional icon, optional
 /// label.
 ///
@@ -30,27 +39,36 @@ pub fn key(
     };
 
     if let Some(path) = icon {
-        match Canvas::load_scaled(path, width - 8, height - strip - 8) {
-            Ok(icon) => {
+        match load_icon(path, width - 8, height.saturating_sub(strip + 8)) {
+            Some(icon) => {
                 let x = (width as i32 - icon.width() as i32) / 2;
                 let y = (height as i32 - strip as i32 - icon.height() as i32) / 2;
-                canvas.blit(&icon, x, y);
+                blend_over(&mut canvas, &icon, x, y);
             }
-            Err(e) => log::warn!("loading icon {}: {e}", path.display()),
+            None => log::warn!("could not use icon {}", path.display()),
         }
     }
 
     if let (Some(label), Some(font)) = (label, font) {
-        let baseline = if icon.is_some() {
+        let usable = width - 12;
+        let (lines, size) = wrap(label, font, style.key_label_size, usable);
+        // Centred on where a single line would have gone, so adding a second
+        // line grows the block symmetrically rather than pushing it down.
+        let centre = if icon.is_some() {
             height as i32 - strip as i32 / 2 - 4
         } else {
             height as i32 / 2
         };
-        let text = TextStyle::new(font, style.key_label_size)
+        let spacing = font.line_height(size);
+        let first = centre as f32 - spacing * (lines.len() as f32 - 1.0) / 2.0;
+        let text = TextStyle::new(font, size)
             .color(style.key_label_color)
             .align(Align::Center)
-            .max_width(width - 12);
-        canvas.draw_text(label, width as i32 / 2, baseline, &text);
+            .max_width(usable);
+        for (index, line) in lines.iter().enumerate() {
+            let y = first + spacing * index as f32;
+            canvas.draw_text(line, width as i32 / 2, y as i32, &text);
+        }
     }
 
     canvas
@@ -87,6 +105,94 @@ pub fn load_font(configured: Option<&Path>) -> Option<Font> {
         log::warn!("no usable font found — labels will be skipped; set `font` in the config");
     }
     font
+}
+
+/// Break a label into lines that fit, shrinking a little before truncating.
+///
+/// The framework's text drawing is one line that shrinks to fit, which turns
+/// "Screenshot Region" into something unreadable rather than into two words on
+/// two lines. This tries the given size, then progressively smaller ones, and
+/// only truncates when even the smallest will not do.
+fn wrap(text: &str, font: &Font, size: f32, max_width: u32) -> (Vec<String>, f32) {
+    let fits = |line: &str, size: f32| font.measure(line, size) <= max_width as f32;
+
+    // One line at the asked-for size is the common case and the nicest result.
+    if fits(text, size) {
+        return (vec![text.to_string()], size);
+    }
+
+    let mut size = size;
+    while size >= MIN_LABEL_SIZE {
+        if let Some(lines) = break_into(text, |line| fits(line, size)) {
+            if lines.len() <= MAX_LABEL_LINES {
+                return (lines, size);
+            }
+        }
+        size -= 1.0;
+    }
+
+    // Nothing fits. Truncate with an ellipsis rather than overflow the key.
+    let mut truncated = text.to_string();
+    while !truncated.is_empty() && !fits(&format!("{truncated}…"), MIN_LABEL_SIZE) {
+        truncated.pop();
+    }
+    (vec![format!("{truncated}…")], MIN_LABEL_SIZE)
+}
+
+/// Greedy word wrap. `None` when a single word will never fit.
+fn break_into(text: &str, fits: impl Fn(&str) -> bool) -> Option<Vec<String>> {
+    let mut lines: Vec<String> = Vec::new();
+    for word in text.split_whitespace() {
+        if !fits(word) {
+            return None;
+        }
+        match lines.last_mut() {
+            Some(line) if fits(&format!("{line} {word}")) => {
+                line.push(' ');
+                line.push_str(word);
+            }
+            _ => lines.push(word.to_string()),
+        }
+    }
+    (!lines.is_empty()).then_some(lines)
+}
+
+/// Load an icon at its own aspect ratio, keeping its transparency.
+///
+/// `Canvas::load` flattens alpha to black, so a PNG with a transparent
+/// background arrives as a black square on whatever the key's colour is. This
+/// keeps the alpha channel so it can actually be composited.
+fn load_icon(path: &Path, max_width: u32, max_height: u32) -> Option<image::RgbaImage> {
+    if max_width == 0 || max_height == 0 {
+        return None;
+    }
+    let image = image::open(path)
+        .map_err(|e| log::warn!("loading icon {}: {e}", path.display()))
+        .ok()?;
+    // Fit inside, never enlarge: blowing a 16x16 icon up to fill a key looks
+    // worse than leaving it small.
+    let scaled = if image.width() > max_width || image.height() > max_height {
+        image.resize(max_width, max_height, image::imageops::FilterType::Triangle)
+    } else {
+        image
+    };
+    Some(scaled.to_rgba8())
+}
+
+/// Composite an image over a canvas, respecting its alpha.
+fn blend_over(canvas: &mut Canvas, image: &image::RgbaImage, x: i32, y: i32) {
+    for (ix, iy, pixel) in image.enumerate_pixels() {
+        let [r, g, b, a] = pixel.0;
+        if a == 0 {
+            continue;
+        }
+        canvas.blend_pixel(
+            x + ix as i32,
+            y + iy as i32,
+            galdeck::Rgb::new(r, g, b),
+            f32::from(a) / 255.0,
+        );
+    }
 }
 
 #[cfg(test)]

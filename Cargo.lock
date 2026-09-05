@@ -360,6 +360,7 @@ dependencies = [
  "galdeck-ipc",
  "galdeck-model",
  "galdeck-plugin",
+ "image",
  "jiff",
  "libc",
  "log",
