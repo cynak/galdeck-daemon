@@ -16,6 +16,8 @@ use galdeck_ipc::{
     Response, Status, WidgetInfo,
 };
 
+use crate::actions::ActionRunner;
+use crate::input::{Bindings, Decision, Gesture, InputMachine};
 use crate::io::DeviceMsg;
 use crate::plugins::{PluginEvent, PluginHost};
 use crate::preview::Preview;
@@ -152,6 +154,11 @@ pub struct Engine {
     plugin_color: Vec<Option<Rgb>>,
     /// Which keys each plugin currently has, so it can be told when they go.
     plugin_visible: std::collections::BTreeMap<String, Vec<u8>>,
+    /// Turns edges into taps, holds and double taps.
+    input: InputMachine,
+    /// Launches key actions, and reaps them centrally rather than one
+    /// parked thread at a time.
+    actions: ActionRunner,
 }
 
 /// What the io thread has told us about the device.
@@ -173,6 +180,9 @@ enum TimerKind {
     RingFrame { encoder: u8 },
     /// A widget is due to be sampled again.
     WidgetTick { key: u8 },
+    /// A gesture on this key needs deciding: a hold has matured, or a
+    /// double-tap window has closed.
+    Gesture { key: u8 },
 }
 
 /// A key animation, with every frame already rendered and encoded.
@@ -298,6 +308,8 @@ impl Engine {
             plugin_text: (0..Buttons::COUNT).map(|_| None).collect(),
             plugin_color: (0..Buttons::COUNT).map(|_| None).collect(),
             plugin_visible: Default::default(),
+            input: InputMachine::new(),
+            actions: ActionRunner::new(),
         };
         engine.enter_profile();
         engine.load_documents();
@@ -539,7 +551,83 @@ impl Engine {
             TimerKind::KeyFrame { key } => self.advance_key_animation(key),
             TimerKind::RingFrame { encoder } => self.advance_ring_animation(encoder),
             TimerKind::WidgetTick { key } => self.tick_widget(key),
+            TimerKind::Gesture { key } => {
+                let now = self.clock.now();
+                let bindings = self.bindings_for(key);
+                let decision = self.input.timeout(key, now, bindings);
+                self.act_on(key, decision);
+            }
         }
+    }
+
+    /// What gestures this key has been given.
+    fn bindings_for(&self, key: u8) -> Bindings {
+        match self.key_config(key) {
+            Some(cfg) => Bindings {
+                // A tap is anything the key does on a plain press, including
+                // navigating rather than running something.
+                has_tap: cfg.exec.is_some()
+                    || cfg.page.is_some()
+                    || cfg.profile.is_some()
+                    || cfg.back
+                    || cfg.plugin.is_some(),
+                has_hold: cfg.hold.is_some(),
+                has_double: cfg.double.is_some(),
+            },
+            None => Bindings::default(),
+        }
+    }
+
+    /// Carry out what the input machine decided.
+    fn act_on(&mut self, key: u8, decision: Decision) {
+        match decision {
+            Decision::Fire(gesture) => self.fire_gesture(key, gesture),
+            Decision::Wait(at) => {
+                self.scheduler.cancel_kind(TimerKind::Gesture { key });
+                self.scheduler.at(at, TimerKind::Gesture { key });
+            }
+            Decision::Idle => {}
+        }
+    }
+
+    fn fire_gesture(&mut self, key: u8, gesture: Gesture) {
+        let Some(cfg) = self.key_config(key).cloned() else {
+            return;
+        };
+        match gesture {
+            Gesture::Hold => {
+                if let Some(cmd) = cfg.hold {
+                    self.run_action(&cmd);
+                }
+            }
+            Gesture::Double => {
+                if let Some(cmd) = cfg.double {
+                    self.run_action(&cmd);
+                }
+            }
+            Gesture::Tap => {
+                if let Some(cmd) = cfg.exec {
+                    self.run_action(&cmd);
+                }
+                if let Some(binding) = cfg.plugin {
+                    self.plugin_host
+                        .send(&binding.id, galdeck_plugin::ToPlugin::Press { key });
+                }
+                // At most one navigation, in the order a key would sensibly
+                // declare them.
+                if let Some(name) = cfg.profile {
+                    self.switch_profile(&name);
+                } else if let Some(name) = cfg.page {
+                    self.switch_page(&name);
+                } else if cfg.back {
+                    self.go_back();
+                }
+            }
+        }
+    }
+
+    fn run_action(&self, cmd: &str) {
+        self.actions.run(cmd, None);
     }
 
     /// Sample a widget and schedule its next refresh.
@@ -1066,6 +1154,10 @@ impl Engine {
             self.paint_ring(index);
         }
 
+        self.input.forget();
+        for key in Buttons::indices() {
+            self.scheduler.cancel_kind(TimerKind::Gesture { key });
+        }
         self.build_animations(&page);
         self.start_widgets(&page);
         self.update_plugin_visibility(&page);
@@ -1108,32 +1200,15 @@ impl Engine {
         log::debug!("event: {event:?}");
         match event {
             Event::KeyDown(key) => {
-                let Some(cfg) = self.key_config(key) else {
-                    return;
-                };
-                let (exec, page, profile, back) = (
-                    cfg.exec.clone(),
-                    cfg.page.clone(),
-                    cfg.profile.clone(),
-                    cfg.back,
-                );
                 self.preview.publish(galdeck_ipc::Event::KeyPressed { key });
-                if let Some(binding) = self.key_config(key).and_then(|c| c.plugin.clone()) {
-                    self.plugin_host
-                        .send(&binding.id, galdeck_plugin::ToPlugin::Press { key });
-                }
-                if let Some(cmd) = exec {
-                    spawn_action(&cmd);
-                }
-                // At most one navigation, in the order a key would sensibly
-                // declare them.
-                if let Some(name) = profile {
-                    self.switch_profile(&name);
-                } else if let Some(name) = page {
-                    self.switch_page(&name);
-                } else if back {
-                    self.go_back();
-                }
+                let bindings = self.bindings_for(key);
+                let decision = self.input.down(key, at, bindings);
+                self.act_on(key, decision);
+            }
+            Event::KeyUp(key) => {
+                let bindings = self.bindings_for(key);
+                let decision = self.input.up(key, at, bindings);
+                self.act_on(key, decision);
             }
             Event::EncoderDown(encoder) => {
                 self.preview
@@ -1143,7 +1218,7 @@ impl Engine {
                     self.paint_ring(encoder);
                 }
                 if let Some(cmd) = self.encoder_config(encoder).and_then(|e| e.press.clone()) {
-                    spawn_action(&cmd);
+                    self.actions.run(&cmd, None);
                 }
             }
             Event::EncoderRotate(encoder, delta) => {
@@ -1438,41 +1513,16 @@ impl RotationRunner {
 }
 
 /// Run a shell command without blocking the engine; a helper thread reaps it.
-fn spawn_action(cmd: &str) {
-    log::info!("exec: {cmd}");
-    match action_command(cmd, None).spawn() {
-        Ok(mut child) => {
-            std::thread::spawn(move || match child.wait() {
-                Ok(status) if !status.success() => log::warn!("action exited with {status}"),
-                Err(e) => log::warn!("waiting on action: {e}"),
-                _ => {}
-            });
-        }
-        Err(e) => log::warn!("spawning action failed: {e}"),
-    }
-}
-
 /// Run a shell command to completion. Only the rotation workers call this;
 /// everything else goes through [`spawn_action`] so the engine keeps
 /// polling the device.
 fn run_action(cmd: &str, delta: Option<i8>) {
     log::info!("exec: {cmd}");
-    match action_command(cmd, delta).status() {
+    match crate::actions::action_command(cmd, delta).status() {
         Ok(status) if !status.success() => log::warn!("action exited with {status}"),
         Err(e) => log::warn!("spawning action failed: {e}"),
         _ => {}
     }
-}
-
-/// `sh -c <cmd>`, with the signed rotation delta exported as
-/// `GALDECK_DELTA` for scripts that prefer one scaled step per event.
-fn action_command(cmd: &str, delta: Option<i8>) -> std::process::Command {
-    let mut command = std::process::Command::new("sh");
-    command.arg("-c").arg(cmd);
-    if let Some(delta) = delta {
-        command.env("GALDECK_DELTA", delta.to_string());
-    }
-    command
 }
 
 fn hex(color: galdeck::Rgb) -> String {

@@ -111,6 +111,17 @@ pub struct KeyConfig {
     /// Shell command to run when pressed.
     #[serde(default)]
     pub exec: Option<String>,
+    /// Shell command to run when the key is held.
+    ///
+    /// Binding this changes when `exec` fires: a key that might be held cannot
+    /// be answered until it is released, because until then nobody knows which
+    /// it was. A key with no `hold` and no `double` still fires the instant it
+    /// goes down.
+    #[serde(default)]
+    pub hold: Option<String>,
+    /// Shell command to run on two quick presses.
+    #[serde(default)]
+    pub double: Option<String>,
     /// Page to switch to when pressed.
     #[serde(default)]
     pub page: Option<String>,
@@ -155,6 +166,8 @@ impl KeyConfig {
     /// whether it does anything with it is its business.
     pub fn is_bound(&self) -> bool {
         self.exec.is_some()
+            || self.hold.is_some()
+            || self.double.is_some()
             || self.page.is_some()
             || self.profile.is_some()
             || self.back

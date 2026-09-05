@@ -142,6 +142,8 @@ impl Workspace {
                         label: key.label.clone(),
                         icon: key.image.clone(),
                         exec: key.exec.clone(),
+                        hold: None,
+                        double: None,
                         page: key.page.clone(),
                         profile: None,
                         back: false,
