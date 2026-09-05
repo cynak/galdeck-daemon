@@ -125,3 +125,56 @@ fn the_token_is_taken_out_of_the_address_bar() {
     assert!(APP_JS.contains("history.replaceState"));
     assert!(INDEX.contains(r#"name="referrer" content="no-referrer""#));
 }
+
+#[test]
+fn everything_the_page_loads_by_itself_is_served_without_a_token() {
+    // The browser fetches a `<script src>` and a `<link href>` with no way to
+    // attach a header or a query string, so anything referenced that way has
+    // to be public or the page loads with no script and no styling -- which is
+    // exactly what happened, and looked like the daemon being unreachable
+    // rather than like a 401.
+    let public = ["/", "/index.html", "/app.js", "/app.css"];
+    let source = include_str!("../src/http.rs");
+
+    let mut referenced = Vec::new();
+    for (index, _) in INDEX
+        .match_indices("src=\"/")
+        .chain(INDEX.match_indices("href=\"/"))
+    {
+        let start = INDEX[index..].find('"').unwrap() + index + 1;
+        let path: String = INDEX[start..].chars().take_while(|c| *c != '"').collect();
+        referenced.push(path);
+    }
+    assert!(
+        !referenced.is_empty(),
+        "the page should reference its assets"
+    );
+
+    for path in &referenced {
+        assert!(
+            public.contains(&path.as_str()),
+            "index.html loads {path} with no token, so it must be public"
+        );
+        // And the allowlist in the router has to actually contain it.
+        assert!(
+            source.contains(&format!("\"{path}\"")),
+            "{path} is not in the router's public list"
+        );
+    }
+}
+
+#[test]
+fn the_ui_clears_a_token_the_daemon_rejected() {
+    // Otherwise a stored token that will never work again sits there
+    // outliving every reload, and the only way out is to know to clear site
+    // data — which is not something anyone should have to work out.
+    assert!(APP_JS.contains("sessionStorage.removeItem(\"galdeck-token\")"));
+    assert!(APP_JS.contains("class StaleToken"));
+}
+
+#[test]
+fn a_rejected_token_says_what_to_do_about_it() {
+    // "401: a valid token is required" is true and useless.
+    assert!(APP_JS.contains("galdeck ui"));
+    assert!(APP_JS.contains("restarted"));
+}

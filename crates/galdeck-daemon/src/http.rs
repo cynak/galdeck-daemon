@@ -8,6 +8,8 @@
 
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::channel;
 use std::sync::Arc;
@@ -27,6 +29,8 @@ const CONTROL_TIMEOUT: Duration = Duration::from_secs(5);
 /// How often an idle event stream sends a comment, so a dead peer is noticed
 /// and a proxy does not reap the connection.
 const SSE_KEEPALIVE: Duration = Duration::from_secs(15);
+/// Length of the UI token, in bytes before hex encoding.
+const TOKEN_BYTES: usize = 24;
 
 /// The embedded configuration UI.
 const INDEX_HTML: &str = include_str!("../ui/index.html");
@@ -50,6 +54,17 @@ impl HttpServer {
         preview: Preview,
         shutdown: Arc<AtomicBool>,
     ) -> Result<Self> {
+        Self::bind_with_token(port, control, preview, shutdown, token_path())
+    }
+
+    /// Bind, keeping the token in a named file.
+    pub fn bind_with_token(
+        port: u16,
+        control: ControlSender,
+        preview: Preview,
+        shutdown: Arc<AtomicBool>,
+        token_file: PathBuf,
+    ) -> Result<Self> {
         // Loopback only, and explicitly rather than by configuration: there is
         // no reason to expose this and every reason not to.
         let address = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
@@ -58,7 +73,7 @@ impl HttpServer {
         let port = listener.local_addr()?.port();
         Ok(Self {
             listener,
-            token: generate_token()?,
+            token: load_or_create_token(&token_file)?,
             port,
             control,
             preview,
@@ -110,12 +125,82 @@ impl HttpServer {
     }
 }
 
+/// Where the UI token is kept, given the control socket it sits beside.
+///
+/// Public so the CLI can find it without asking the daemon -- which matters
+/// precisely when the browser's token has gone stale and the daemon is the
+/// thing refusing to talk.
+pub fn token_path_for(socket: &std::path::Path) -> PathBuf {
+    socket
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("/tmp"))
+        .join("galdeck-ui-token")
+}
+
+fn token_path() -> PathBuf {
+    token_path_for(&galdeck_ipc::socket_path())
+}
+
+/// Reuse the token from a previous run, or mint one.
+///
+/// A fresh token every run means every open browser tab is holding a dead one
+/// the moment the daemon restarts -- and since the token is stripped from the
+/// address bar on load, a refresh cannot recover it either. Keeping it in a
+/// file the user owns and nobody else can read makes restarting the daemon a
+/// non-event for a tab that is already open.
+fn load_or_create_token(path: &std::path::Path) -> Result<String> {
+    if let Some(existing) = read_token(path) {
+        return Ok(existing);
+    }
+    let token = generate_token()?;
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    // Removed first, because `mode` only applies to a file this call creates.
+    // Opening an existing world-readable file with `.mode(0o600)` silently
+    // keeps its old permissions and writes the new token into it -- which
+    // would leak exactly the token we replaced it for leaking.
+    let _ = std::fs::remove_file(path);
+    // Created 0600 rather than created and then chmodded, so there is no
+    // window in which it is readable by anyone else.
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)
+        .with_context(|| format!("writing the ui token to {}", path.display()))?;
+    file.write_all(token.as_bytes())?;
+    Ok(token)
+}
+
+/// Read a stored token, if it is one we would have written.
+///
+/// Anything else -- wrong owner, readable by others, not the right shape -- is
+/// replaced rather than trusted.
+fn read_token(path: &std::path::Path) -> Option<String> {
+    let meta = std::fs::metadata(path).ok()?;
+    // Safety: getuid cannot fail and touches no memory.
+    if meta.uid() != unsafe { libc::getuid() } {
+        log::warn!("{} is owned by someone else; replacing it", path.display());
+        return None;
+    }
+    if meta.mode() & 0o077 != 0 {
+        log::warn!("{} is readable by others; replacing it", path.display());
+        return None;
+    }
+    let token = std::fs::read_to_string(path).ok()?.trim().to_string();
+    let looks_right =
+        token.len() == TOKEN_BYTES * 2 && token.chars().all(|c| c.is_ascii_hexdigit());
+    looks_right.then_some(token)
+}
+
 /// A token with enough entropy that guessing it is not a strategy.
 ///
 /// Read straight from the kernel rather than taking a dependency for it: this
 /// is the only random number the daemon needs.
 fn generate_token() -> Result<String> {
-    let mut bytes = [0u8; 24];
+    let mut bytes = [0u8; TOKEN_BYTES];
     std::fs::File::open("/dev/urandom")
         .context("opening /dev/urandom for the ui token")?
         .read_exact(&mut bytes)
@@ -140,10 +225,19 @@ fn serve_one(
         }
     };
 
-    // The index page is the one thing served without a token, because it is
-    // how the user gets a token into their browser in the first place. It
-    // contains no data -- everything it shows comes from the API.
-    let public = request.path == "/" || request.path == "/index.html";
+    // The page and its assets are served without a token. The index is how the
+    // token reaches the browser in the first place, and the browser then asks
+    // for the script and stylesheet with a plain `<script src>` and
+    // `<link href>` -- it has no way to attach a header or a query to those.
+    //
+    // Nothing is given away by it: these are the same bytes for everyone,
+    // compiled into the binary, containing no configuration and no state.
+    // Everything that reads or changes anything is under /api and needs the
+    // token.
+    let public = matches!(
+        request.path.as_str(),
+        "/" | "/index.html" | "/app.js" | "/app.css"
+    );
     if !public {
         if let Err(response) = authorize(&request, token, port) {
             let _ = stream.write_all(&response.to_bytes());

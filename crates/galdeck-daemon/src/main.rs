@@ -102,11 +102,16 @@ fn main() -> Result<()> {
 
     let preview = galdeck_daemon::preview::Preview::new();
     if let Some(port) = args.http {
-        let server = galdeck_daemon::http::HttpServer::bind(
+        // Derived from the socket actually in use rather than from the
+        // environment, or `--socket` would move the socket and leave the
+        // token behind somewhere `galdeck ui` cannot find it.
+        let token_file = galdeck_daemon::http::token_path_for(&socket_path);
+        let server = galdeck_daemon::http::HttpServer::bind_with_token(
             port,
             control.clone(),
             preview.clone(),
             Arc::clone(&shutdown),
+            token_file,
         )?;
         println!("configuration UI: {}", server.url());
         std::thread::Builder::new()

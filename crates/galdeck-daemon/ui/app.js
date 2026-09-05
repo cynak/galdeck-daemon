@@ -23,6 +23,10 @@ const token = (() => {
 })();
 
 const el = (id) => document.getElementById(id);
+
+/// Thrown when the daemon rejects our token, which is worth telling apart from
+/// every other failure because the user can do something about it.
+class StaleToken extends Error {}
 const state = { status: null, layout: null, config: null, selected: null };
 
 async function call(request) {
@@ -34,6 +38,12 @@ async function call(request) {
     },
     body: JSON.stringify(request),
   });
+  if (response.status === 401 || response.status === 403) {
+    // Whatever we had is no good. Drop it, so a reload with a fresh link is
+    // not fighting a stored value that will never work again.
+    sessionStorage.removeItem("galdeck-token");
+    throw new StaleToken(await response.text());
+  }
   if (!response.ok) {
     throw new Error(`${response.status}: ${await response.text()}`);
   }
@@ -557,8 +567,17 @@ function init() {
   el("file-picker").addEventListener("change", renderFiles);
 
   refresh().then(listen).catch((e) => {
-    document.body.insertAdjacentHTML("afterbegin",
-      `<p style="padding:1rem;color:#bf616a">Could not reach the daemon: ${escapeHtml(e.message)}</p>`);
+    const message =
+      e instanceof StaleToken
+        ? `This page's access token is no longer valid — the daemon has been
+           restarted since it was opened. Open the address it printed at
+           startup, which looks like
+           <code>http://127.0.0.1:${location.port}/?token=…</code>, or run
+           <code>galdeck ui</code> to print it again.`
+        : `Could not reach the daemon: ${escapeHtml(e.message)}`;
+    document.body.insertAdjacentHTML(
+      "afterbegin",
+      `<p style="padding:1rem 1.25rem;margin:0;color:#ebcb8b;border-bottom:1px solid #2c313c">${message}</p>`);
   });
 }
 
