@@ -9,6 +9,9 @@ Description=galdeck — Corsair Galleon 100 SD Stream Deck daemon
 
 [Service]
 Type=simple
+# Add --http <port> to serve the configuration UI on loopback. It is off by
+# default because that surface can set the shell commands this daemon runs; see
+# the README for what guards it. `galdeck ui` prints the address and token.
 ExecStart=%h/.cargo/bin/galdeck-daemon
 Restart=on-failure
 RestartSec=2
