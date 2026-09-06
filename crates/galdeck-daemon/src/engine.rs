@@ -883,9 +883,7 @@ impl Engine {
         }
         // Text from the page we just left would otherwise show on whatever key
         // happens to share its position here.
-        for slot in &mut self.widget_text {
-            *slot = None;
-        }
+        self.widget_text.fill(None);
 
         let now = self.clock.now();
         for cfg in &page.keys {
