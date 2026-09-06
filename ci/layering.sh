@@ -5,6 +5,11 @@
 # The workspace is split into more crates than a project this size would
 # usually justify. Each boundary is worth its ceremony only because it is
 # checked, so this script is what earns the split.
+#
+# The largest boundary is not in this repository at all: the control protocol
+# and the configuration model live with the CLI, in ../galdeck-cli, and the
+# dependency runs one way. The CLI repository enforces its own half; what is
+# checked here is that this side keeps declaring it the way publishing needs.
 set -uo pipefail
 
 fail=0
@@ -32,30 +37,29 @@ no_match() {
     return 0
 }
 
-PURE=(crates/galdeck-model/src crates/galdeck-core/src)
+# galdeck-model was the other one; it lives in ../galdeck-cli now, and that
+# repository checks it with the same two greps.
+PURE=(crates/galdeck-core/src)
 
 printf '\nlayering\n'
 
-# The pure crates are pure so their tests can name every instant. A sixty
+# The pure crate is pure so its tests can name every instant. A sixty
 # second soak that takes sixty seconds is a soak nobody runs.
-printf '%-58s' "no wall clock in the pure crates"
+printf '%-58s' "no wall clock in the pure crate"
 no_match '(Instant|SystemTime)::now\(\)' "${PURE[@]}" && printf 'ok\n' || fail=1
 
-# Ambient authority in the pure crates would make them untestable in the same
+# Ambient authority in the pure crate would make it untestable in the same
 # way. This targets spawning and sockets specifically rather than the whole
 # `std::process` module: reading our own pid is neither, and a staging filename
 # legitimately wants it.
-printf '%-58s' "no subprocesses or sockets in the pure crates"
+printf '%-58s' "no subprocesses or sockets in the pure crate"
 no_match 'std::process::(Command|exit|abort)|std::net::' "${PURE[@]}" && printf 'ok\n' || fail=1
 
 # One file may name the concrete device type. Everything else goes through
 # the Deck trait, which is what keeps the workspace testable with no keyboard.
-# galdeck-cli is allowed: `galdeck detect` deliberately bypasses the daemon
-# and opens the device passively.
 printf '%-58s' "only the hardware adapter names Galleon"
 offenders=$(code_grep 'Galleon' crates/*/src \
-    | grep -v '^crates/galdeck-device/src/hardware.rs:' \
-    | grep -v '^crates/galdeck-cli/src/main.rs:')
+    | grep -v '^crates/galdeck-device/src/hardware.rs:')
 if [ -n "$offenders" ]; then
     printf 'FAIL\n'; printf '%s\n' "$offenders" | sed 's/^/    /'; fail=1
 else
@@ -69,6 +73,40 @@ if grep -q 'galdeck-device' crates/galdeck-core/Cargo.toml 2>/dev/null; then
     printf 'FAIL\n'; note 'galdeck-core/Cargo.toml names galdeck-device'; fail=1
 else
     printf 'ok\n'
+fi
+
+# The two crates that come from the CLI repository must carry a version as
+# well as a path. A bare path builds perfectly well here and then fails at
+# `cargo publish`, which strips `path` and refuses a dependency with no
+# version left -- a long way from the edit that caused it.
+for shared in galdeck-ipc galdeck-model; do
+    printf '%-58s' "$shared is declared with a version and a path"
+    line=$(grep -E "^$shared = " Cargo.toml)
+    if [ -z "$line" ]; then
+        printf 'FAIL\n'; note "Cargo.toml does not declare $shared"; fail=1
+    elif ! printf '%s' "$line" | grep -q 'version *='; then
+        printf 'FAIL\n'; note "no version, so it cannot be published: $line"; fail=1
+    elif ! printf '%s' "$line" | grep -q 'path *= *"\.\./galdeck-cli/'; then
+        printf 'FAIL\n'; note "does not point at the sibling checkout: $line"; fail=1
+    else
+        printf 'ok\n'
+    fi
+done
+
+# Nothing here may be reachable from the CLI. It is the half of the boundary
+# this repository can break by accident -- adding a path dependency the other
+# way round would compile and quietly make the CLI need the UI. Skipped when
+# the sibling is absent, because then there is nothing to contradict.
+printf '%-58s' "the CLI repository does not depend on this one"
+if [ ! -d ../galdeck-cli ]; then
+    printf 'skipped (no ../galdeck-cli)\n'
+else
+    back=$(grep -rnE 'galdeck-(daemon|core|device|http|plugin)' ../galdeck-cli/Cargo.toml ../galdeck-cli/crates/*/Cargo.toml 2>/dev/null)
+    if [ -n "$back" ]; then
+        printf 'FAIL\n'; printf '%s\n' "$back" | sed 's/^/    /'; fail=1
+    else
+        printf 'ok\n'
+    fi
 fi
 
 printf '\n'

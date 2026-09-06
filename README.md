@@ -9,9 +9,20 @@ Built on [galdeck](https://github.com/cynak/galdeck), the hardware
 framework — this repository is the user-experience layer, and doubles as
 the reference example of consuming that framework.
 
+It also needs [galdeck-cli](https://github.com/cynak/galdeck-cli), which owns
+the `galdeck` command, the control protocol and the configuration model. The
+dependency runs one way: the CLI is usable on its own, and this daemon and its
+configuration UI are what require it. Check the two out side by side —
+`../galdeck-cli` is where the build looks.
+
 ## Quick start
 
 ```sh
+# both repositories, side by side: this one builds against ../galdeck-cli
+git clone https://github.com/cynak/galdeck-cli
+git clone https://github.com/cynak/galdeck-daemon
+cd galdeck-daemon
+
 # device access (build needs libudev headers: apt install libudev-dev)
 sudo cp systemd/../../galdeck/udev/70-galdeck.rules /etc/udev/rules.d/ 2>/dev/null \
   || echo "grab udev/70-galdeck.rules from the galdeck repository"
@@ -19,7 +30,7 @@ sudo udevadm control --reload && sudo udevadm trigger
 # replug the keyboard
 
 cargo install --path crates/galdeck-daemon
-cargo install --path crates/galdeck-cli
+cargo install --path ../galdeck-cli/crates/galdeck-cli
 
 mkdir -p ~/.config/galdeck && cp config/galdeck.example.toml ~/.config/galdeck/config.toml
 mkdir -p ~/.config/systemd/user && cp systemd/galdeck.service ~/.config/systemd/user/
@@ -184,15 +195,16 @@ browser.
 
 ## CLI
 
+The `galdeck` command lives in
+[galdeck-cli](https://github.com/cynak/galdeck-cli), which has the full table.
+The ones this page refers to:
+
 | Command | What it does |
 |---|---|
-| `galdeck detect` | Find the module and read its firmware (works without the daemon, changes nothing) |
 | `galdeck status` | Daemon and device state |
-| `galdeck page <name>` | Switch page within the current profile |
 | `galdeck profile <name>` | Switch profile |
-| `galdeck brightness <0-100>` | Set panel brightness |
 | `galdeck reload` | Re-read the config; a broken edit leaves the running one alone |
-| `galdeck ping` | Check the daemon is alive |
+| `galdeck ui` | Print the configuration UI's address, token included |
 
 ## Running as a service
 
@@ -228,7 +240,17 @@ pass the flag every time.
 cargo fmt --all
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
+./ci/layering.sh
 ```
+
+None of that runs without `../galdeck-cli` beside this directory: the control
+protocol and the configuration model are found by relative path, so a clone of
+this repository on its own does not build. That is the split doing its job
+rather than a rough edge — the CLI stands alone, and this does not.
+
+`ci/layering.sh` checks the boundaries the workspace is split along, including
+that the two shared crates are still declared in a shape `cargo publish` will
+accept, and that the CLI has not acquired a dependency pointing back this way.
 
 The [`galdeck`](https://crates.io/crates/galdeck) framework comes from
 crates.io. To work against an unpublished change to it, add a patch in
@@ -237,6 +259,15 @@ crates.io. To work against an unpublished change to it, add a patch in
 ```toml
 [patch.crates-io]
 galdeck = { path = "../galdeck" }
+```
+
+The same trick works for the CLI's crates once they are published, if you
+would rather not rely on the sibling checkout:
+
+```toml
+[patch.crates-io]
+galdeck-ipc = { path = "../galdeck-cli/crates/galdeck-ipc" }
+galdeck-model = { path = "../galdeck-cli/crates/galdeck-model" }
 ```
 
 ## License

@@ -316,26 +316,15 @@ dependencies = [
 
 [[package]]
 name = "galdeck"
-version = "0.1.0"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "918a893bc56f7925f08d5dd013c05d727d8916abf4bd745cdd62b32133619ccc"
+checksum = "02be391f6c750bfbfda6f5193596f7c8cfe2833aa8f820e3f8759f35eb2057b9"
 dependencies = [
  "ab_glyph",
  "hidapi",
  "image",
  "log",
  "thiserror",
-]
-
-[[package]]
-name = "galdeck-cli"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "clap",
- "galdeck",
- "galdeck-ipc",
- "serde_json",
 ]
 
 [[package]]

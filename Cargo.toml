@@ -2,11 +2,8 @@
 resolver = "2"
 members = [
   "crates/galdeck-daemon",
-  "crates/galdeck-cli",
-  "crates/galdeck-ipc",
   "crates/galdeck-device",
   "crates/galdeck-core",
-  "crates/galdeck-model",
   "crates/galdeck-http",
   "crates/galdeck-plugin",
 ]
@@ -26,18 +23,32 @@ authors = ["galdeck contributors"]
 # an unpublished framework change, add to .cargo/config.toml (not committed):
 #   [patch.crates-io]
 #   galdeck = { path = "../galdeck" }
-galdeck = "0.1.0"
-galdeck-ipc = { path = "crates/galdeck-ipc" }
+galdeck = "0.2.0"
+
+# The control protocol and the configuration model, which belong to the CLI:
+# https://github.com/cynak/galdeck-cli. The dependency runs one way only --
+# the CLI is usable on its own, and this daemon plus its configuration UI is
+# what needs it -- so nothing there may ever point back here.
+#
+# Both a version and a path, deliberately. The path is what a local build
+# resolves, so the two repositories are checked out side by side:
+#
+#   ~/Code/galdeck-cli
+#   ~/Code/galdeck-daemon
+#
+# The version is what `cargo publish` substitutes, because cargo strips `path`
+# from a published manifest and refuses a dependency carrying no version.
+galdeck-ipc = { version = "0.1.0", path = "../galdeck-cli/crates/galdeck-ipc" }
+galdeck-model = { version = "0.1.0", path = "../galdeck-cli/crates/galdeck-model" }
+
 galdeck-device = { path = "crates/galdeck-device" }
 galdeck-core = { path = "crates/galdeck-core" }
-galdeck-model = { path = "crates/galdeck-model" }
 galdeck-http = { path = "crates/galdeck-http" }
 galdeck-plugin = { path = "crates/galdeck-plugin" }
 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
-toml_edit = "0.22"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 clap = { version = "4", features = ["derive"] }
 anyhow = "1"
