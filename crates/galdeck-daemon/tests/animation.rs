@@ -61,6 +61,7 @@ impl Harness {
         assert!(errors.is_empty(), "fixture config is broken: {errors:#?}");
 
         let shutdown = Arc::new(AtomicBool::new(false));
+        let parked = Arc::new(AtomicBool::new(false));
         let clock: Arc<dyn Clock> = Arc::new(SystemClock::new());
         let deadline = Arc::new(DeadlineCell::new());
         let (waker, wake_rx) = wake_channel();
@@ -82,6 +83,7 @@ impl Harness {
             Arc::clone(&clock),
             waker,
             Arc::clone(&shutdown),
+            Arc::clone(&parked),
         );
         let io_thread = std::thread::spawn(move || io.run());
 
@@ -101,6 +103,14 @@ impl Harness {
                 widget_host,
                 plugin_host,
                 plugin_rx,
+                parked: Arc::clone(&parked),
+                zone_paint: true,
+                // Deliberately absent: these tests are not about
+                // calibration, and must not pick up one from the home
+                // directory of whoever is running them.
+                calibration_path: Some(
+                    std::env::temp_dir().join("galdeck-no-such-calibration.conf"),
+                ),
             },
         )
         .expect("engine builds");

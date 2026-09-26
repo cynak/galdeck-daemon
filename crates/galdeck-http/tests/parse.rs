@@ -1,6 +1,6 @@
 //! Parsing bytes off a socket, tested without a socket.
 
-use galdeck_http::{parse_request, ParseError, Response};
+use galdeck_http::{parse_request, ParseError, Response, CONTENT_SECURITY_POLICY};
 
 fn req(raw: &str) -> Result<galdeck_http::Request, ParseError> {
     parse_request(raw.as_bytes())
@@ -108,4 +108,31 @@ fn a_response_serializes_with_a_length_and_the_hardening_headers() {
     assert!(text.contains("x-frame-options: DENY\r\n"));
     assert!(text.contains("cache-control: no-store\r\n"));
     assert!(text.ends_with("\r\n\r\n{}"));
+
+    // Written out in full, so loosening the policy is a change to this test
+    // and not something that happens along the way.
+    assert_eq!(
+        CONTENT_SECURITY_POLICY,
+        "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; \
+         connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
+    );
+    let script_src = CONTENT_SECURITY_POLICY
+        .split(';')
+        .map(str::trim)
+        .find(|directive| directive.starts_with("script-src "))
+        .expect("the policy names where script may come from");
+    assert!(!script_src.contains("'unsafe-inline'"), "{script_src}");
+    assert!(!script_src.contains("'unsafe-eval'"), "{script_src}");
+
+    // Errors carry it too: they are what a browser shows for a stale link.
+    let header = format!("content-security-policy: {CONTENT_SECURITY_POLICY}\r\n");
+    for response in [
+        Response::json(200, "{}"),
+        Response::html("<p>hi</p>"),
+        Response::text(401, "a valid token is required"),
+        Response::empty(204),
+    ] {
+        let text = String::from_utf8(response.to_bytes()).unwrap();
+        assert!(text.contains(&header), "{text}");
+    }
 }

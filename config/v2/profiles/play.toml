@@ -16,10 +16,10 @@ key = 11
 label = "Work"
 profile = "work"
 
+# The knob is still volume, from galdeck.toml; this page only adds an
+# animation to its ring.
 [[pages.encoders]]
 encoder = 0
-cw = "wpctl set-volume -l 1.0 @DEFAULT_AUDIO_SINK@ 2%+"
-ccw = "wpctl set-volume @DEFAULT_AUDIO_SINK@ 2%-"
 
 # Rings can animate too, and cost nothing to do so: a ring frame is four
 # colours with no image encoding at all. Turning or clicking the knob still

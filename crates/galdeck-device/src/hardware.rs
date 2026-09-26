@@ -116,6 +116,23 @@ impl Deck for HardwareDeck {
             .map_err(DeckError::classify)
     }
 
+    fn draw_panel_jpeg(
+        &mut self,
+        x: u16,
+        y: u16,
+        width: u16,
+        height: u16,
+        jpeg: &[u8],
+    ) -> DeckResult<()> {
+        // `panel()`, not `lcd()`: the info screen control enforces a 720x384
+        // contract, and the whole point here is to reach the key area below
+        // it.
+        self.deck
+            .panel()
+            .draw_jpeg_at(x, y, width, height, jpeg)
+            .map_err(DeckError::classify)
+    }
+
     fn clear_all(&mut self) -> DeckResult<()> {
         self.deck.clear_all().map_err(DeckError::classify)
     }

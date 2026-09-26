@@ -49,6 +49,10 @@ const WRITE_BUDGET: Duration = Duration::from_millis(12);
 const RECONNECT_INTERVAL: Duration = Duration::from_secs(2);
 /// A batch slower than this says something is wrong with the cost model.
 const SLOW_BATCH_WARN: Duration = Duration::from_millis(100);
+/// How long to sleep when there is nothing to poll: no device present, or the
+/// device handed to another process. Long enough not to spin, short enough
+/// that resuming feels immediate.
+const IDLE_SLEEP: Duration = Duration::from_millis(100);
 
 /// What the io thread tells the rest of the daemon.
 #[derive(Debug)]
@@ -78,6 +82,12 @@ pub struct IoThread {
     clock: Arc<dyn Clock>,
     waker: Waker,
     shutdown: Arc<AtomicBool>,
+    /// Set by the engine while another process holds the device.
+    ///
+    /// An atomic rather than a message because it has to be readable from
+    /// inside this loop without draining a mailbox, and because the engine
+    /// sets it from a request it is about to leave unanswered.
+    parked: Arc<AtomicBool>,
     active_until: Tick,
     last_connect_attempt: Option<Tick>,
     /// Kept so a virtual deck's surface stays reachable for the preview.
@@ -94,6 +104,7 @@ impl IoThread {
         clock: Arc<dyn Clock>,
         waker: Waker,
         shutdown: Arc<AtomicBool>,
+        parked: Arc<AtomicBool>,
     ) -> Self {
         Self {
             deck: None,
@@ -106,6 +117,7 @@ impl IoThread {
             clock,
             waker,
             shutdown,
+            parked,
             active_until: Tick::ZERO,
             last_connect_attempt: None,
             virtual_handle: None,
@@ -125,6 +137,7 @@ impl IoThread {
         clock: Arc<dyn Clock>,
         waker: Waker,
         shutdown: Arc<AtomicBool>,
+        parked: Arc<AtomicBool>,
     ) -> Self {
         let mut io = Self::new(
             DeviceMode::Virtual,
@@ -134,6 +147,7 @@ impl IoThread {
             clock,
             waker,
             shutdown,
+            parked,
         );
         io.send(DeviceMsg::Connected {
             firmware: deck.firmware().to_string(),
@@ -149,6 +163,22 @@ impl IoThread {
 
     pub fn run(mut self) {
         while !self.shutdown.load(Ordering::Relaxed) {
+            // Handed to another process. Closing the handle is the easy half;
+            // the important half is the `continue`, because a parked loop
+            // that still reached try_connect would reopen the hidraw node
+            // underneath whoever just took it -- which is the exact failure
+            // the handover exists to prevent.
+            if self.parked.load(Ordering::Relaxed) {
+                if self.deck.is_some() {
+                    // Sends Disconnected, which is what the engine is waiting
+                    // for before it answers the release.
+                    self.drop_device();
+                }
+                self.discard_paints();
+                std::thread::sleep(IDLE_SLEEP);
+                continue;
+            }
+
             if self.deck.is_none() {
                 self.try_connect();
                 if self.deck.is_none() {
@@ -156,7 +186,7 @@ impl IoThread {
                     // wait without the device: drain paints so the channel
                     // cannot back up, and sleep briefly.
                     self.discard_paints();
-                    std::thread::sleep(Duration::from_millis(100));
+                    std::thread::sleep(IDLE_SLEEP);
                     continue;
                 }
             }

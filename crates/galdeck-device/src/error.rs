@@ -38,6 +38,12 @@ impl DeckError {
             galdeck::Error::MalformedReport(_) => DeckError::Transient(source),
             galdeck::Error::InvalidArgument(_) => DeckError::Invalid(source),
             galdeck::Error::Image(_) => DeckError::Invalid(source),
+            // Anything newer than this crate knows of -- the keyboard's own
+            // lighting channel, in frameworks that have one -- is not about
+            // the deck handle, so nothing to tear down over. Unreachable
+            // against a framework with no such variants.
+            #[allow(unreachable_patterns)]
+            _ => DeckError::Transient(source),
         }
     }
 

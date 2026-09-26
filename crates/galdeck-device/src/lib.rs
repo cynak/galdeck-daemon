@@ -116,6 +116,27 @@ pub trait Deck: Send {
         jpeg: &[u8],
     ) -> DeckResult<()>;
 
+    /// Push a pre-encoded JPEG anywhere on the panel, including the key area
+    /// below the info screen.
+    ///
+    /// The same `02 0c` report as [`Deck::draw_lcd_jpeg`], without the info
+    /// screen's 720x384 contract. This is the only way to put pixels on the
+    /// part of a physical key that the `02 07` key path cannot reach: that
+    /// path blits a fixed-size image and does not scale it, so on a unit
+    /// whose keys measure larger than [`galdeck::ids::KEY_PIXELS`] a band
+    /// around every key is simply unaddressable through it.
+    ///
+    /// Where the keys are is not in the protocol -- it is measured per unit,
+    /// which is what a calibration is -- so the caller supplies the rectangle.
+    fn draw_panel_jpeg(
+        &mut self,
+        x: u16,
+        y: u16,
+        width: u16,
+        height: u16,
+        jpeg: &[u8],
+    ) -> DeckResult<()>;
+
     fn clear_all(&mut self) -> DeckResult<()>;
     fn reset_to_logo(&mut self) -> DeckResult<()>;
 }
@@ -151,6 +172,19 @@ pub enum DeckOp {
         height: u16,
         jpeg: Arc<[u8]>,
     },
+    /// A key drawn as a panel region rather than through the key path.
+    ///
+    /// Carries the key index as well as the rectangle so the mirror can
+    /// record it against that key -- a bare region tells you nothing about
+    /// whose pixels it was.
+    KeyRegion {
+        key: u8,
+        x: u16,
+        y: u16,
+        width: u16,
+        height: u16,
+        jpeg: Arc<[u8]>,
+    },
     ClearAll,
     ResetToLogo,
 }
@@ -169,7 +203,9 @@ impl DeckOp {
             | DeckOp::RingSegment { .. }
             | DeckOp::ResetToLogo => FEATURE_REPORT_COST,
             DeckOp::KeyJpeg { jpeg, .. } => image_cost(jpeg.len(), KEY_IMAGE_PAYLOAD),
-            DeckOp::LcdRegion { jpeg, .. } => image_cost(jpeg.len(), LCD_REGION_PAYLOAD),
+            DeckOp::LcdRegion { jpeg, .. } | DeckOp::KeyRegion { jpeg, .. } => {
+                image_cost(jpeg.len(), LCD_REGION_PAYLOAD)
+            }
             // 12 key fills plus 8 ring LEDs, then a full black LCD frame.
             // 12 key fills plus 8 ring LEDs, and then -- easy to miss -- a
             // full black LCD frame, which the framework encodes on the spot
@@ -207,6 +243,14 @@ impl DeckOp {
                 height,
                 jpeg,
             } => deck.draw_lcd_jpeg(*x, *y, *width, *height, jpeg),
+            DeckOp::KeyRegion {
+                x,
+                y,
+                width,
+                height,
+                jpeg,
+                ..
+            } => deck.draw_panel_jpeg(*x, *y, *width, *height, jpeg),
             DeckOp::ClearAll => deck.clear_all(),
             DeckOp::ResetToLogo => deck.reset_to_logo(),
         }
@@ -250,6 +294,32 @@ pub(crate) fn check_lcd_rect(x: u16, y: u16, width: u16, height: u16) -> DeckRes
             Lcd::HEIGHT
         )))
     }
+}
+
+/// The whole addressable panel, not just the info screen.
+///
+/// Width and height must be whole [`galdeck::ids::REGION_MCU`] blocks: the
+/// firmware does not reject an off-block region, it shears it into diagonal
+/// streaks, which is far harder to recognise than an error. The origin may
+/// sit anywhere -- a calibrated zone's left edge routinely does not land on a
+/// block boundary.
+pub(crate) fn check_panel_rect(x: u16, y: u16, width: u16, height: u16) -> DeckResult<()> {
+    let mcu = galdeck::ids::REGION_MCU as u16;
+    if width == 0 || height == 0 || !width.is_multiple_of(mcu) || !height.is_multiple_of(mcu) {
+        return Err(invalid(format!(
+            "panel rect {width}x{height} must be non-zero multiples of {mcu}"
+        )));
+    }
+    if x.saturating_add(width) > galdeck::ids::PANEL_WIDTH
+        || y.saturating_add(height) > galdeck::ids::PANEL_HEIGHT
+    {
+        return Err(invalid(format!(
+            "panel rect {width}x{height}+{x}+{y} does not fit in {}x{}",
+            galdeck::ids::PANEL_WIDTH,
+            galdeck::ids::PANEL_HEIGHT
+        )));
+    }
+    Ok(())
 }
 
 pub(crate) fn invalid(message: String) -> DeckError {

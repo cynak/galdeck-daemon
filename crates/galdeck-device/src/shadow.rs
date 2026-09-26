@@ -26,8 +26,22 @@ pub enum KeyTarget {
     /// feature report, so 2 ms — which is why the renderer prefers a JPEG
     /// even for flat colour.
     Color(Rgb),
-    /// A pre-encoded 160x160 JPEG.
+    /// A pre-encoded 160x160 JPEG, placed by the firmware.
     Jpeg(Arc<[u8]>),
+    /// A JPEG drawn into a measured rectangle on the panel.
+    ///
+    /// What a calibrated deck uses: the firmware's key path blits a fixed
+    /// size and cannot reach the edges of a larger key, so content that has
+    /// to fill the whole keycap goes through the region path instead. The
+    /// rectangle is part of the identity -- the same image at a different
+    /// place is a different thing to have on screen.
+    Region {
+        x: u16,
+        y: u16,
+        width: u16,
+        height: u16,
+        jpeg: Arc<[u8]>,
+    },
 }
 
 /// One requested change, before it has been diffed against the mirror.
@@ -119,6 +133,20 @@ impl DeckShadow {
                         key: *index,
                         jpeg: Arc::clone(jpeg),
                     },
+                    KeyTarget::Region {
+                        x,
+                        y,
+                        width,
+                        height,
+                        jpeg,
+                    } => DeckOp::KeyRegion {
+                        key: *index,
+                        x: *x,
+                        y: *y,
+                        width: *width,
+                        height: *height,
+                        jpeg: Arc::clone(jpeg),
+                    },
                 }]
             }
             Paint::Ring { encoder, colors } => {
@@ -166,6 +194,23 @@ impl DeckShadow {
             }
             DeckOp::KeyColor { key, color } => self.set_key(*key, KeyTarget::Color(*color)),
             DeckOp::KeyClear { key } => self.set_key(*key, KeyTarget::Blank),
+            DeckOp::KeyRegion {
+                key,
+                x,
+                y,
+                width,
+                height,
+                jpeg,
+            } => self.set_key(
+                *key,
+                KeyTarget::Region {
+                    x: *x,
+                    y: *y,
+                    width: *width,
+                    height: *height,
+                    jpeg: Arc::clone(jpeg),
+                },
+            ),
             DeckOp::RingSegment {
                 encoder,
                 segment,

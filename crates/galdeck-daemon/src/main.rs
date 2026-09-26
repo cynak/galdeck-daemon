@@ -35,6 +35,16 @@ struct Args {
     #[arg(long, value_name = "PATH")]
     socket: Option<PathBuf>,
 
+    /// Draw keys through the firmware's key path only.
+    ///
+    /// By default a calibrated deck draws each key at the rectangle the
+    /// calibration measured, so backgrounds, icons and animations fill the
+    /// whole keycap instead of the smaller square the key path can reach.
+    /// Pass this to go back to that square -- the escape hatch if the region
+    /// path turns out not to render on some part of your panel.
+    #[arg(long)]
+    legacy_key_images: bool,
+
     /// Serve the configuration UI on loopback at this port.
     ///
     /// Off unless given, because this surface can set the shell commands the
@@ -130,6 +140,10 @@ fn main() -> Result<()> {
     let (plugin_host, plugin_rx) =
         galdeck_daemon::plugins::PluginHost::discover(&config_dir, waker.clone());
 
+    // Shared with the engine, which sets it to hand the device to another
+    // process -- `galdeck calibrate` is the one that does.
+    let parked = Arc::new(AtomicBool::new(false));
+
     let io = IoThread::new(
         args.device.into(),
         paint_rx,
@@ -138,6 +152,7 @@ fn main() -> Result<()> {
         Arc::clone(&clock),
         waker,
         Arc::clone(&shutdown),
+        Arc::clone(&parked),
     );
     let io_thread = std::thread::Builder::new()
         .name("galdeck-io".into())
@@ -159,6 +174,9 @@ fn main() -> Result<()> {
             widget_host,
             plugin_host,
             plugin_rx,
+            parked,
+            zone_paint: !args.legacy_key_images,
+            calibration_path: None,
         },
     )?;
     engine.run();

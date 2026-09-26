@@ -12,7 +12,9 @@ use std::time::Duration;
 use galdeck::{Buttons, Encoders, Event, Lcd, Rgb, Ring};
 use galdeck_core::{Clock, ManualClock, Tick};
 
-use crate::{check_key, check_lcd_rect, check_ring, invalid, Deck, DeckOp, DeckResult};
+use crate::{
+    check_key, check_lcd_rect, check_panel_rect, check_ring, invalid, Deck, DeckOp, DeckResult,
+};
 
 /// How long the module may go untouched before the firmware drops out of
 /// software mode. Mirrors `galdeck::ids::SOFTWARE_MODE_REENTRY_GAP`.
@@ -84,6 +86,9 @@ pub struct DeckSurface {
     pub rings: Vec<[Rgb; Ring::SEGMENTS as usize]>,
     /// LCD writes since the last full-frame cover, oldest first.
     pub lcd: Vec<LcdPatch>,
+    /// Panel-region writes, oldest first. Kept apart from `lcd` because they
+    /// address the key area, which no full-frame info-screen write covers.
+    pub panel: Vec<LcdPatch>,
     /// Every op applied, in order. This is the stream the P0 refactor proof
     /// compares byte for byte.
     pub ops: Vec<DeckOp>,
@@ -105,6 +110,7 @@ impl Default for DeckSurface {
             keys: vec![KeySurface::Blank; Buttons::COUNT as usize],
             rings: vec![[Rgb::BLACK; Ring::SEGMENTS as usize]; Encoders::COUNT as usize],
             lcd: Vec::new(),
+            panel: Vec::new(),
             ops: Vec::new(),
             feature_writes: 0,
             image_writes: 0,
@@ -455,6 +461,47 @@ impl Deck for FakeDeck {
                     s.lcd.clear();
                 }
                 s.lcd.push(patch);
+                s.image_writes += 1;
+            },
+        );
+        Ok(())
+    }
+
+    fn draw_panel_jpeg(
+        &mut self,
+        x: u16,
+        y: u16,
+        width: u16,
+        height: u16,
+        jpeg: &[u8],
+    ) -> DeckResult<()> {
+        check_panel_rect(x, y, width, height)?;
+        self.check_jpeg(
+            &format!("panel {width}x{height}+{x}+{y}"),
+            jpeg,
+            (u32::from(width), u32::from(height)),
+        );
+        let jpeg: Arc<[u8]> = Arc::from(jpeg);
+        let patch = LcdPatch {
+            x,
+            y,
+            width,
+            height,
+            jpeg: Arc::clone(&jpeg),
+        };
+        // The key index is not carried here: this is the device primitive,
+        // and the firmware has no idea a key is what it is drawing.
+        self.record(
+            DeckOp::KeyRegion {
+                key: u8::MAX,
+                x,
+                y,
+                width,
+                height,
+                jpeg,
+            },
+            |s| {
+                s.panel.push(patch);
                 s.image_writes += 1;
             },
         );

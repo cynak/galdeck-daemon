@@ -12,9 +12,14 @@ storm = "#3b4252"
 frost = "#88c0d0"
 snow = "#eceff4"
 aurora-red = "#bf616a"
+aurora-yellow = "#ebcb8b"
 aurora-green = "#a3be8c"
 # A token pointing at another token: change `frost` and this follows.
 accent = "@frost"
+# What a widget turns past its `warn` and `critical` thresholds, and what a
+# muted key or a finished timer shows.
+warning = "@aurora-yellow"
+critical = "@aurora-red"
 
 [style]
 key_bg = "@storm"

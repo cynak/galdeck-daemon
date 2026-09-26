@@ -218,3 +218,83 @@ fn a_full_frame_write_is_recorded_as_the_whole_panel() {
     });
     assert!(shadow.plan(&Paint::Lcd { jpeg: frame }).is_empty());
 }
+
+#[test]
+fn a_region_key_is_diffed_on_its_rectangle_as_well_as_its_pixels() {
+    // The same image at a different place is a different thing to have on
+    // screen. If the mirror compared only the bytes, moving a zone during
+    // calibration would repaint nothing and the deck would keep showing the
+    // old geometry.
+    let mut shadow = DeckShadow::new();
+    let jpeg: Arc<[u8]> = Arc::from(vec![1u8, 2, 3].as_slice());
+    let at = |x: u16, y: u16| Paint::Key {
+        index: 3,
+        target: KeyTarget::Region {
+            x,
+            y,
+            width: 176,
+            height: 176,
+            jpeg: Arc::clone(&jpeg),
+        },
+    };
+
+    let ops = shadow.plan(&at(52, 440));
+    assert!(matches!(
+        ops.as_slice(),
+        [DeckOp::KeyRegion {
+            key: 3,
+            x: 52,
+            y: 440,
+            width: 176,
+            height: 176,
+            ..
+        }]
+    ));
+    for op in &ops {
+        shadow.record(op);
+    }
+
+    assert!(
+        shadow.plan(&at(52, 440)).is_empty(),
+        "the same image in the same place is not worth writing twice"
+    );
+    assert_eq!(
+        shadow.plan(&at(52, 448)).len(),
+        1,
+        "the same image eight pixels lower has to be written"
+    );
+}
+
+#[test]
+fn switching_a_key_between_the_two_paths_repaints_it() {
+    // Turning zone painting on or off changes how every key is addressed.
+    // A mirror that treated the two as interchangeable would leave the panel
+    // showing whichever one it had already sent.
+    let mut shadow = DeckShadow::new();
+    let jpeg: Arc<[u8]> = Arc::from(vec![9u8, 9, 9].as_slice());
+
+    let ops = shadow.plan(&Paint::Key {
+        index: 0,
+        target: KeyTarget::Jpeg(Arc::clone(&jpeg)),
+    });
+    for op in &ops {
+        shadow.record(op);
+    }
+
+    let ops = shadow.plan(&Paint::Key {
+        index: 0,
+        target: KeyTarget::Region {
+            x: 52,
+            y: 440,
+            width: 176,
+            height: 176,
+            jpeg: Arc::clone(&jpeg),
+        },
+    });
+    assert_eq!(
+        ops.len(),
+        1,
+        "the same bytes through the other path is a write"
+    );
+    assert!(matches!(ops[0], DeckOp::KeyRegion { .. }));
+}

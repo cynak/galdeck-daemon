@@ -183,6 +183,19 @@ fn percent_decode(value: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
+/// What a page served from here may load and run, sent with every response.
+///
+/// The UI is one module script, one stylesheet and same-origin API calls, so
+/// everything else is refused: a string that slips past escaping into the
+/// page's markup cannot run as script, pull in a stylesheet, or send what it
+/// finds anywhere but back to this daemon. The script sets styles through the
+/// CSSOM, which `style-src 'self'` allows, never through `style` attributes,
+/// which it drops. `data:` images are the widget previews the gallery draws,
+/// and the empty favicon that stops the browser asking for one.
+pub const CONTENT_SECURITY_POLICY: &str = "default-src 'none'; script-src 'self'; \
+     style-src 'self'; img-src 'self' data:; connect-src 'self'; base-uri 'none'; \
+     form-action 'none'; frame-ancestors 'none'";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Response {
     pub status: u16,
@@ -226,7 +239,7 @@ impl Response {
 
     /// Serialize head and body for writing to a socket.
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(self.body.len() + 256);
+        let mut out = Vec::with_capacity(self.body.len() + 512);
         out.extend_from_slice(
             format!("HTTP/1.1 {} {}\r\n", self.status, reason(self.status)).as_bytes(),
         );
@@ -241,6 +254,11 @@ impl Response {
         // framed or sniffed.
         out.extend_from_slice(b"x-content-type-options: nosniff\r\n");
         out.extend_from_slice(b"x-frame-options: DENY\r\n");
+        // On every response rather than only the page's: a browser pointed at
+        // an error renders that as a document too.
+        out.extend_from_slice(
+            format!("content-security-policy: {CONTENT_SECURITY_POLICY}\r\n").as_bytes(),
+        );
         out.extend_from_slice(b"connection: close\r\n\r\n");
         out.extend_from_slice(&self.body);
         out

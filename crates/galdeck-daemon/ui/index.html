@@ -6,6 +6,9 @@
 <meta name="referrer" content="no-referrer">
 <title>galdeck</title>
 <link rel="stylesheet" href="/app.css">
+<!-- No icon, said out loud: otherwise the browser asks for /favicon.ico,
+     which carries no token and is answered with a 401 in the console. -->
+<link rel="icon" href="data:,">
 </head>
 <body>
 <header>
@@ -28,14 +31,32 @@
 <nav class="tabs">
   <button data-tab="deck" class="active">Deck</button>
   <button data-tab="theme">Theme</button>
+  <button data-tab="calibration">Calibration</button>
   <button data-tab="raw">Files</button>
 </nav>
 
 <main>
   <section id="tab-deck" class="tab active">
+    <!-- Ready-made widgets. Each is dragged onto the screen or onto a key;
+         the previews are drawn by the daemon in the current theme. -->
+    <aside id="gallery" class="gallery">
+      <h2>Widgets</h2>
+      <p class="hint">Drag onto the screen or a key. Click to add to the screen.</p>
+      <ul id="gallery-list" class="gallery-list"></ul>
+    </aside>
     <div class="deck">
-      <div class="lcd-wrap">
+      <!-- The overlay is where the screen's widgets are laid out: it sits on
+           the preview, cell for cell, so a tile is dragged over the pixels it
+           will cover. -->
+      <div id="lcd-wrap" class="lcd-wrap">
         <img id="lcd" alt="LCD panel" class="lcd">
+        <div id="lcd-tiles" class="lcd-tiles"></div>
+      </div>
+      <div class="deck-bar">
+        <p class="lcd-hint">Click the screen to lay out widgets on it, or drag across it to add one.</p>
+        <button id="page-new" type="button">New page…</button>
+        <button id="background-edit" type="button">Background…</button>
+        <button id="outputs-edit" type="button">Outputs…</button>
       </div>
       <div id="grid" class="grid"></div>
       <div id="encoders" class="encoders"></div>
@@ -47,6 +68,72 @@
 
   <section id="tab-theme" class="tab">
     <div id="theme-editor"></div>
+  </section>
+
+  <section id="tab-calibration" class="tab">
+    <div class="cal">
+      <!-- The panel, to scale. Zones are drawn from what the daemon
+           resolved, not recomputed here: the band and override rules live in
+           the framework, and a drawing that disagrees with the hardware is
+           worse than no drawing. -->
+      <div class="cal-canvas">
+        <svg id="cal-diagram" role="img" aria-label="Panel calibration"></svg>
+        <div id="cal-legend" class="cal-legend"></div>
+      </div>
+      <aside class="cal-side">
+        <div id="cal-source"></div>
+
+        <h2>Grid</h2>
+        <form id="cal-form" class="cal-form">
+          <label>screen x<input name="screen_x" type="number" min="0" step="1"></label>
+          <label>screen y<input name="screen_y" type="number" min="0" step="1"></label>
+          <label>screen w<input name="screen_width" type="number" min="0" step="1"></label>
+          <label>screen h<input name="screen_height" type="number" min="0" step="1"></label>
+          <label>zones x<input name="bounds_x" type="number" min="0" step="1"></label>
+          <label>zones y<input name="bounds_y" type="number" min="0" step="1"></label>
+          <label>zones w<input name="bounds_width" type="number" min="0" step="1"></label>
+          <label>zones h<input name="bounds_height" type="number" min="0" step="1"></label>
+          <label>rows<input name="rows" type="number" min="1" max="16" step="1"></label>
+          <label>columns<input name="columns" type="number" min="1" max="16" step="1"></label>
+          <!-- Signed: zero fills the track exactly, negative exposes bleed,
+               positive overlaps the neighbouring track under the keycap. -->
+          <label>bleed x<input name="bleed_x" type="number" step="1"></label>
+          <label>bleed y<input name="bleed_y" type="number" step="1"></label>
+        </form>
+        <div class="cal-actions">
+          <button id="cal-save" type="button">Save</button>
+          <button id="cal-revert" type="button">Revert</button>
+        </div>
+
+        <h2>The wizard</h2>
+        <p class="cal-note">
+          Measuring the panel needs the physical knobs, so the wizard runs
+          outside the browser. Hand the device over, run the command, and this
+          page updates when it comes back.
+        </p>
+        <div class="cal-actions">
+          <button id="cal-release" type="button">Hand the device over</button>
+          <button id="cal-resume" type="button">Take it back</button>
+        </div>
+        <pre id="cal-command" class="cal-command">galdeck calibrate</pre>
+
+        <h2>Panel probe</h2>
+        <p class="cal-note">
+          Draws a bordered square on every key at a chosen size. If the yellow
+          border sits flush with the physical keycap, that size is right; if
+          anything shows outside it, the image is too small for the panel.
+          This is a diagnostic, so it stays up until you put the page back.
+        </p>
+        <div class="cal-actions">
+          <label class="cal-inline">size
+            <input id="cal-probe-size" type="number" min="32" max="512" step="8" value="160">
+          </label>
+          <button id="cal-probe" type="button">Draw</button>
+          <button id="cal-probe-zones" type="button">Fill zones</button>
+          <button id="cal-restore" type="button">Restore page</button>
+        </div>
+      </aside>
+    </div>
   </section>
 
   <section id="tab-raw" class="tab">

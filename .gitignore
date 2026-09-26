@@ -3,3 +3,8 @@ Cargo.lock.orig
 
 # Backups the daemon writes beside a config when the UI saves.
 *.toml.bak
+
+# Local-only cargo overrides -- the [patch.crates-io] that points `galdeck`
+# at the checkout beside this one. Never committed: CI builds the published
+# framework, and a lockfile carrying the patch fails every --locked job.
+/.cargo/

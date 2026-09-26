@@ -73,6 +73,7 @@ impl Harness {
         let config = v1::Config::parse(CONFIG).expect("test config should parse");
         let workspace = Workspace::from_v1(&config);
         let shutdown = Arc::new(AtomicBool::new(false));
+        let parked = Arc::new(AtomicBool::new(false));
         let clock: Arc<dyn Clock> = Arc::new(SystemClock::new());
         let deadline = Arc::new(DeadlineCell::new());
         let (waker, wake_rx) = wake_channel();
@@ -96,6 +97,7 @@ impl Harness {
             Arc::clone(&clock),
             waker,
             Arc::clone(&shutdown),
+            Arc::clone(&parked),
         );
         let io_thread = std::thread::spawn(move || io.run());
 
@@ -115,6 +117,14 @@ impl Harness {
                 widget_host,
                 plugin_host,
                 plugin_rx,
+                parked: Arc::clone(&parked),
+                zone_paint: true,
+                // Deliberately absent: these tests are not about
+                // calibration, and must not pick up one from the home
+                // directory of whoever is running them.
+                calibration_path: Some(
+                    std::env::temp_dir().join("galdeck-no-such-calibration.conf"),
+                ),
             },
         )
         .expect("engine should build");
@@ -151,6 +161,15 @@ impl Harness {
         // Require sustained quiet, not one quiet sample: a budgeted flush
         // alternates writing with polling, so there are lulls in the middle of
         // a page paint that a single sample would mistake for the end of it.
+        //
+        // The window has to cover the widest gap in the pipeline, which is the
+        // info screen: the core thread spends about ten milliseconds encoding
+        // a 720x384 frame and sends it after every key, so it lands well after
+        // the keys do. Fifty milliseconds was enough only while unconfigured
+        // keys were feature-report fills, whose forced 2 ms each dragged the
+        // key paint out past the encode. Once those became image uploads the
+        // keys finished first, and three tests began to see a first-paint LCD
+        // frame arrive after they had decided the deck was idle.
         let mut last = self.deck.surface().generation;
         let mut quiet = 0;
         for _ in 0..400 {
@@ -158,7 +177,7 @@ impl Harness {
             let now = self.deck.surface().generation;
             quiet = if now == last { quiet + 1 } else { 0 };
             last = now;
-            if quiet >= 5 {
+            if quiet >= 20 {
                 return;
             }
         }
@@ -276,5 +295,31 @@ fn the_deck_is_never_handed_a_malformed_image() {
         harness.deck.violations().is_empty(),
         "{:?}",
         harness.deck.violations()
+    );
+}
+
+#[test]
+fn a_key_with_nothing_on_it_is_drawn_rather_than_filled() {
+    // `Button::clear()` is `set_color(BLACK)`, a `03 06` feature report, and
+    // that fill does not replace what the key's image buffer holds -- so on a
+    // freshly connected module the boot animation shows through underneath it.
+    // Seen on hardware. Every key must be written as an image.
+    let harness = Harness::start();
+    harness.settle();
+
+    let ops = harness.deck.ops();
+    let images = ops
+        .iter()
+        .filter(|op| matches!(op, DeckOp::KeyJpeg { .. }))
+        .count();
+    assert_eq!(
+        images,
+        galdeck::Buttons::COUNT as usize,
+        "every key should be drawn, not filled"
+    );
+    assert!(
+        !ops.iter()
+            .any(|op| matches!(op, DeckOp::KeyClear { .. } | DeckOp::KeyColor { .. })),
+        "no key should be left to a feature-report fill: {ops:#?}"
     );
 }

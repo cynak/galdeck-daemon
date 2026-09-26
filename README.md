@@ -2,8 +2,10 @@
 
 A configurable daemon that turns the Stream Deck module in a **Corsair
 Galleon 100 SD** keyboard into a launcher: label your keys, give them
-icons, bind them to commands, page between sets, and drive volume with the
-knobs.
+icons, bind them to commands, keystrokes or built-in actions, page between
+sets, show clocks, graphs, media, weather and timers, and turn the knobs for
+volume, an app's sound, the output, tracks, pages or anything else -- with a
+browser-based editor to set it all up.
 
 Built on [galdeck](https://github.com/cynak/galdeck), the hardware
 framework — this repository is the user-experience layer, and doubles as
@@ -32,7 +34,7 @@ sudo udevadm control --reload && sudo udevadm trigger
 cargo install --path crates/galdeck-daemon
 cargo install --path ../galdeck-cli/crates/galdeck-cli
 
-mkdir -p ~/.config/galdeck && cp config/galdeck.example.toml ~/.config/galdeck/config.toml
+mkdir -p ~/.config/galdeck && cp -r config/v2/. ~/.config/galdeck/
 mkdir -p ~/.config/systemd/user && cp systemd/galdeck.service ~/.config/systemd/user/
 systemctl --user daemon-reload && systemctl --user enable --now galdeck
 
@@ -41,9 +43,11 @@ galdeck status
 
 ## Configuring
 
-Everything lives in `~/.config/galdeck/config.toml`; see the commented
-[example](config/galdeck.example.toml). `galdeck reload` applies edits
-without restarting.
+Everything lives in `~/.config/galdeck/`: a small `galdeck.toml`, a file per
+profile and one per theme (see [Profiles and themes](#profiles-and-themes)),
+starting from the commented example in [config/v2](config/v2). The
+configuration UI edits the same files. `galdeck reload` applies edits made by
+hand without restarting.
 
 Keys are numbered row-major from the top-left of the 3×4 grid:
 
@@ -106,6 +110,100 @@ so a knob answers even when its command has no visible effect. Fast spins
 run their detents in order through a bounded per-knob queue rather than
 racing; `GALDECK_DELTA` carries the signed step count to your command.
 
+### Actions, knob presets and keystrokes
+
+Every gesture — a key's `exec`, `hold` and `double`, a knob's `press`, `cw`,
+`ccw` and `hold` — takes a shell command, something built in, or keystrokes:
+
+```toml
+exec = "firefox"                              # a shell command, as before
+exec = { action = "play_pause" }              # built in: no scripts, no playerctl
+cw = { action = "volume_up", step = 5 }       # with a step
+exec = { action = "play_pause", target = "spotify" }
+exec = { keys = "ctrl+shift+t" }              # a keystroke
+```
+
+The built-ins are sound (`volume_up`, `volume_down`, `volume_mute`, `mic_up`,
+`mic_down`, `mic_mute`, and `push_to_talk`, which keeps the microphone live
+only while its key is held), outputs (`next_output`, `previous_output`,
+`set_output`), one app's sound (`app_volume_up`, `app_volume_down`,
+`app_mute`, and `next_app` on a knob), media over MPRIS (`play_pause`,
+`next_track`, `previous_track`, `seek_forward`, `seek_backward`), navigation
+(`next_page`, `previous_page`, `home_page`, `next_profile`, `previous_profile`,
+`start_profile`), the deck's own brightness (`deck_brighter`, `deck_dimmer`),
+a knob's modes (`next_mode`, on a knob), timers (`timer_toggle`,
+`timer_reset`, on a key showing a timer or stopwatch), and the pointer
+(`scroll_up`/`down`/`left`/`right`, `zoom_in`, `zoom_out`, `zoom_reset`). Sound goes through `wpctl` (or `pactl`) with no shell, never
+above 100%; turning up unmutes. A spin is one change the size of the spin, not
+eight processes.
+
+A knob can take a **preset** — `volume`, `mic`, `outputs`, `app_volume`,
+`tracks`, `seek`, `pages`, `profiles`, `deck_brightness`, `scroll`, `zoom`,
+`tabs`, `workspaces`, `up_down`, `left_right` — and knobs can be set in
+`galdeck.toml` for every profile, in a profile for all its pages, or on a
+page. The layers combine one gesture at a time, so a volume knob set once is
+on every page, and a page that sets only `press` keeps the turn. A knob with a
+`hold` waits for its release before pressing, and a press that turned into a
+turn counts as neither. While a knob turns, its ring shows the level or the
+page you are on, and a strip along the bottom of the screen says what changed.
+
+A knob can also switch between two to four **modes**, each a preset:
+
+```toml
+[[encoders]]
+encoder = 0
+modes = ["volume", { preset = "app_volume", ring = "#88c0d0" }, "tracks"]
+```
+
+Holding the knob for about two thirds of a second moves to the next mode
+(`next_mode`, which a knob with modes holds unless told otherwise); the
+screen names it and the ring rests in the mode's colour, so you can see which
+mode is on without turning. A knob keeps its mode on every page and profile
+until you switch it or change the list. Setting a `hold` on the knob turns the
+switching off.
+
+`outputs` turns through the sound outputs that are plugged in, one per turn
+however fast the spin, and a press mutes. `outputs = ["Headphones", "Speaker"]`
+in `galdeck.toml` limits and orders them by any part of their name; a key can
+go straight to one with `{ action = "set_output", target = "Headphones" }`.
+`app_volume` turns the volume of the app playing sound and keeps to that app;
+a press moves on to the next app, or mutes the app when the preset has a
+`target`. Keys use `app_volume_up`, `app_volume_down` and `app_mute`, which act
+on whatever is playing unless given a target. Both need PipeWire's `wpctl` and
+`pw-dump`; without them the screen says what is missing. WirePlumber remembers
+each app's volume and mute, so an app comes back at the level the knob left
+it.
+
+Keystroke names are key *positions* on a US keyboard (`ctrl`, `shift`, `alt`,
+`super`, letters, digits, `f1`–`f24`, `kp_0`–`kp_9`, `kp_enter`, `page_up`,
+`left`, `enter`, `escape`, ...), so they are right on every layout; the UI
+records them from a real key press. They go through a virtual keyboard the
+daemon creates with `/dev/uinput`, which needs the logged-in user to be allowed
+to use it:
+
+```sh
+sudo cp udev/71-galdeck-uinput.rules /etc/udev/rules.d/
+sudo udevadm control --reload && sudo udevadm trigger
+```
+
+With that rule, any program the logged-in user runs can create a virtual
+keyboard. Set `virtual_input = false` in `galdeck.toml` to keep the daemon
+from ever opening it. Magic SysRq, power, sleep and similar keys have no names
+and cannot be sent.
+
+A key showing what is playing plays and pauses it when tapped, and one showing
+the output volume mutes it, unless something else is bound. The UI's **New
+page…** makes a numpad, a digits row, media controls or F13–F19 macro keys in
+one go.
+
+A key whose tap mutes something -- `volume_mute`, `mic_mute`, or a volume
+widget's own tap -- turns red with a struck-through speaker or microphone in
+its corner while the sound server says it is muted, and a `push_to_talk` key
+turns amber while the microphone is live. These show only what the sound
+server reported, never a guess, and are read again every two seconds while
+such a key or a level ring is showing, so muting from the desktop or a headset
+shows on the deck too.
+
 ### Widgets and animations
 
 A key can carry a **widget** — something that changes:
@@ -116,20 +214,144 @@ key = 9
 label = "--:--"          # shown until the widget produces text
 
 [pages.keys.widget]
-kind = "clock"           # clock, date, cpu, memory, command
+kind = "clock"           # see the table below
 format = "%H:%M"
 ```
 
-`command` runs a shell command on a worker thread and shows its first line of
-output; it is killed if it takes more than five seconds, so a wedged script
-cannot hold up the deck. A sample that produces the same text as last time
-costs nothing at all.
+| kind          | shows                                   | `source`                                      |
+|---------------|-----------------------------------------|-----------------------------------------------|
+| `clock`/`date`| the time, formatted with `format`; `timezone = "Asia/Tokyo"` for a world clock |          |
+| `uptime`      | time since boot, `3d 4h`                |                                               |
+| `cpu`         | CPU use, %                              |                                               |
+| `memory`      | memory in use, %                        |                                               |
+| `temperature` | a hwmon sensor, °C or `units = "fahrenheit"` | chip or label: `k10temp`, `nvme`, `Tctl`; default the CPU |
+| `gpu`         | GPU use, % (sysfs, else `nvidia-smi`)   | DRM card, `card1`                             |
+| `network`     | throughput down and up                  | interface; default all but `lo`               |
+| `disk`        | space used, %                           | mount point; default `/`                      |
+| `weather`     | conditions and a short forecast         | `latitude` and `longitude`, or a `place` the UI finds by name |
+| `media`       | what an MPRIS player is playing         | player, `spotify`; default whichever plays    |
+| `volume`      | the volume, %, or `muted`               | `mic` for the default input; default output  |
+| `battery`     | charge, %, with `↑` while charging      | power supply, `BAT0`; default the first      |
+| `fan`         | a fan's speed, RPM                      | chip or fan label; default the first fan     |
+| `load`        | the one-minute load average             |                                               |
+| `command`     | the first line of a shell command       |                                               |
+| `timer`       | counts down from `duration`; keys only  |                                               |
+| `stopwatch`   | counts up; keys only                    |                                               |
+
+Anything that measures something can be drawn with `view = "graph"` (recent
+history), `"bar"` or `"gauge"` (a dial) as well as the default `"text"`, and a
+clock with `view = "analog"` (a face with hands) or `view = "nixie"`, with an
+optional `title`, `max` and `color`. `weather` and `media` draw as cards: the
+cover fills a media key, and a wide tile gets the title, artist and progress
+beside it.
+
+A widget that measures something can warn: `warn = 80` and `critical = 90`, in
+the units it shows, turn it amber and then red (the theme's `@warning` and
+`@critical`, if it has them). Whether higher or lower is worse follows from
+the two -- `warn = 20, critical = 10` counts down -- and a battery counts down
+when only one is given. A reading has to come back past the line by a little
+before the colour goes, so a value hovering at a threshold does not flicker.
+
+A nixie clock gives each digit of its `format` a glowing tube -- six, to the
+second, unless the format says otherwise; `%l` leaves the first tube dark
+before ten o'clock. The tubes stand in a dark, warm room lit mostly by
+themselves, their unlit cathodes and anode mesh showing against the glow, with
+haze and dust drifting through the light and now and then a flickering tube.
+It glows orange unless it has a `color`, in that room unless it has a
+`background`, and refreshes ten times a second to animate unless
+`interval_ms` says otherwise.
+
+A `timer`'s `duration` is `25m`, `1h 30m`, `90s`, or `4:30` and `1:30:00`
+(minutes, or hours, then two-digit fields). Tap it to start, pause and resume,
+and hold to reset. A running timer ignores the hold, so a slow tap cannot wipe
+out twenty minutes: pause it first. A stopwatch resets whenever it is held. The
+key shows the time large, under its `title` or else its label, dimmed while
+paused; a timer can also be a `"bar"` or `"gauge"` of what is left. It keeps
+counting while its page is not showing, and through a save that leaves it the
+same length. When a timer finishes the screen says so -- until the deck is
+next touched, if its page is not showing -- its key flashes for ten seconds
+and then stays red until tapped, and its `on_done` action, if it has one,
+runs once:
+
+```toml
+[pages.keys.widget]
+kind = "timer"
+duration = "4m"
+title = "Tea"
+on_done = "pw-play /usr/share/sounds/freedesktop/stereo/alarm-clock-elapsed.oga"
+```
+
+Timers count on the monotonic clock, which stops while the machine is
+suspended, so a suspend pauses them.
+
+Weather comes from [Open-Meteo](https://open-meteo.com), which needs no key.
+It is only asked about the coordinates you give, at most once a minute
+(every fifteen by default), and a failed refresh keeps the last forecast up.
+
+`command`, `gpu`, `weather` and `media` run on worker threads, one per kind of
+slowness, so a hung script or a slow network never delays the deck or each
+other. A command is killed if it takes more than five seconds. A sample that
+produces the same text as last time costs nothing at all.
+
+The info screen can show widgets too, laid out on a 12x6 grid:
+
+```toml
+[[pages.lcd]]
+column = 0               # top-left cell
+row = 0
+columns = 12             # span
+rows = 4
+
+[pages.lcd.widget]
+kind = "media"
+```
+
+A page with tiles ignores its `lcd_text`. The grid is 12 by 6 unless a page
+or profile sets `lcd_columns` (up to 24) and `lcd_rows` (up to 12); a tile
+that leaves out `columns` or `rows` runs to the edge of whichever grid it is
+on. The UI's grid editor carries a page's widgets across when it changes.
+
+Any widget can have a background of its own -- `background` (a colour or
+`@token`), `image` (scaled to cover it) and `opacity` from 0 to 1. On the
+screen that replaces the card behind the tile; at `opacity = 0` whatever is
+behind the page shows straight through.
+
+### Backgrounds
+
+A page, a profile or a theme can put a picture or an animation behind the
+screen, the keys, or both:
+
+```toml
+[pages.background]
+span = "both"            # lcd, keys, or both
+image = "/home/you/Pictures/dusk.gif"  # PNG, JPEG or GIF; a GIF plays
+# animation = "aurora"   # gradient, waves, plasma, starfield, rain, fire, bubbles
+# colors = ["@accent", "#b48ead", "#1a1d24"]
+fps = 10                 # 1-20, for an animation or a GIF
+dim = 0.25               # darken so labels stay readable
+```
+
+`both` is one picture across the whole panel, not the same picture twice:
+the screen and the keys are regions of one display, and the calibration says
+where each sits, so a wallpaper runs continuously from the screen down
+through the keycaps. Unbound keys show their slice too. A key with a
+`key_bg` of its own keeps it.
+
+The nearest background wins: a page's replaces its profile's, which
+replaces its theme's -- so a theme with a background is an animated theme.
+Each animation frame is a JPEG for the screen and for every key it covers,
+so keep `fps` modest; the paint queue drops frames rather than falling
+behind if the USB link cannot keep up.
+
+The configuration UI has all of this: a gallery of ready-made widgets to
+drag onto the screen or a key, a **Background…** editor, and uploads, which
+are kept under `assets/` in the config directory.
 
 A key or a ring can also carry an **animation**:
 
 ```toml
 [pages.keys.animation]
-kind = "breathe"         # pulse, breathe, blink; rings also spin and comet
+kind = "breathe"         # pulse, breathe, blink, heartbeat, rainbow; rings also spin and comet
 period_ms = 3000
 to = "@aurora-green"     # the colour it moves towards
 ```
@@ -187,11 +409,19 @@ edit its label, icon, action and colour. Saving validates the whole
 configuration first and refuses anything that would break it, and your
 comments and formatting are preserved.
 
+A gallery beside the deck holds widgets, timers, knob presets and actions to
+drag onto a key, a knob or the screen, where tiles can be moved and resized on
+the grid. The forms cover every gesture -- recording keystrokes from a real key
+press, trying a built-in on the spot -- a knob's layers and modes, timers,
+thresholds, backgrounds, pages made from templates, the outputs a knob turns
+through, and the panel's calibration.
+
 It is **off unless you ask for it**, binds loopback only, and requires the
 token printed at startup — this surface can set the shell commands the daemon
 runs, so it also refuses any request whose `Host` or `Origin` is not its own,
 which is what stops a page you happen to visit from driving it through your
-browser.
+browser. Its pages carry a strict Content-Security-Policy: no inline script or
+style, and nothing fetched from anywhere but the daemon itself.
 
 ## CLI
 

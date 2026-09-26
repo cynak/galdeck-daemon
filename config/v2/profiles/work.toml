@@ -90,25 +90,83 @@ id = "counter"
 [pages.keys.plugin.options]
 label = "presses"
 
+# The left knob is volume everywhere (see galdeck.toml). This page gives the
+# right one to its pages.
 [[pages.encoders]]
-encoder = 0
-press = "wpctl set-mute @DEFAULT_AUDIO_SINK@ toggle"
-cw = "wpctl set-volume -l 1.0 @DEFAULT_AUDIO_SINK@ 2%+"
-ccw = "wpctl set-volume @DEFAULT_AUDIO_SINK@ 2%-"
+encoder = 1
+preset = "pages"
 
 [[pages]]
 id = "media"
-lcd_text = "media"
 
+# A background behind the screen, the keys, or both. `both` is one picture
+# across the whole panel, placed by the calibration, so it runs from the
+# screen down through the keycaps. A theme can carry one too; the nearest
+# wins. Uncomment to try an animated one:
+#
+# [pages.background]
+# span = "both"
+# animation = "aurora"     # aurora, gradient, waves, plasma -- or `image`
+# fps = 10
+# dim = 0.3
+
+# The info screen can show widgets instead of text. It is a grid of 12
+# columns by 6 rows, each 60x64 pixels; a tile names its top-left cell and
+# how many it spans, and sits on a card a shade off the screen's background.
+#
+# `media` follows whichever MPRIS player is playing -- Spotify, a browser,
+# mpv -- or the one named by `source`. It shows the cover, title, artist and
+# progress; the controls are still ordinary keys below.
+[[pages.lcd]]
+column = 0
+row = 0
+columns = 12
+rows = 4
+
+[pages.lcd.widget]
+kind = "media"
+color = "@accent"
+
+[[pages.lcd]]
+column = 0
+row = 4
+columns = 6
+rows = 2
+
+[pages.lcd.widget]
+kind = "clock"
+
+# Anything that measures something can be a `graph` of recent readings or a
+# `bar`, as well as plain text. `color` is the one colour a widget may pick;
+# everything else comes from the theme.
+[[pages.lcd]]
+column = 6
+row = 4
+columns = 6
+rows = 2
+
+[pages.lcd.widget]
+kind = "cpu"
+view = "graph"
+color = "@aurora-red"
+
+# A media widget on a key shows the cover, with progress along the bottom.
+# With nothing else bound, tapping it plays and pauses what it shows.
 [[pages.keys]]
 key = 0
 label = "Play"
-exec = "playerctl play-pause"
+
+[pages.keys.widget]
+kind = "media"
 
 [[pages.keys]]
 key = 1
 label = "Next"
-exec = "playerctl next"
+# Any gesture can be a shell command, something built in, or keystrokes:
+#   exec = "firefox"
+#   exec = { action = "next_track" }
+#   exec = { keys = "ctrl+shift+t" }
+exec = { action = "next_track" }
 
 [[pages.keys]]
 key = 2
@@ -121,5 +179,5 @@ key_bg = "@aurora-red"
 
 [[pages.encoders]]
 encoder = 1
-cw = "playerctl position 5+"
-ccw = "playerctl position 5-"
+preset = "seek"
+step = 5

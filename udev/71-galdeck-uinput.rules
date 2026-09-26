@@ -1,0 +1,21 @@
+# Lets the logged-in user create virtual keyboards and mice through
+# /dev/uinput, which galdeck's keystroke and scroll actions need.
+#
+# Install:
+#   sudo cp 71-galdeck-uinput.rules /etc/udev/rules.d/
+#   sudo udevadm control --reload && sudo udevadm trigger
+#
+# Understand what it grants: with this rule, any program the person at the
+# seat runs can inject keystrokes and pointer movement, which gets around
+# Wayland's isolation of input between programs, and -- where kernel.sysrq
+# allows it -- could send Magic SysRq combinations. galdeck itself cannot
+# send SysRq or power keys: they are not in the names it knows.
+#
+# uaccess gives the access to the active local session only, not to SSH
+# logins or a session switched away from. It must be numbered below 73 for
+# 73-seat-late.rules to apply it. Prefer this to adding yourself to the
+# `input` group, which also lets every program read every keyboard, and to a
+# GROUP/MODE rule, which ignores who is at the seat.
+#
+# static_node makes it apply even before the uinput module is loaded.
+KERNEL=="uinput", SUBSYSTEM=="misc", TAG+="uaccess", OPTIONS+="static_node=uinput"

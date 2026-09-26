@@ -21,6 +21,16 @@ const SEGMENTS: usize = Ring::SEGMENTS as usize;
 
 /// How long the lit segment stays after the last detent.
 const TURN_HOLD: Duration = Duration::from_millis(350);
+/// How long a level stays on the ring after the last change.
+const LEVEL_HOLD: Duration = Duration::from_millis(1500);
+/// The colour a muted level is shown in.
+const MUTED: Rgb = Rgb::new(191, 97, 106);
+
+/// Where a level ring rests while what it turns is muted: red, but dim
+/// enough that a level shown over it still reads.
+pub fn muted_rest(base: Rgb) -> Rgb {
+    MUTED.lerp(base, 0.55)
+}
 /// How long the whole ring stays lit after a click.
 const CLICK_HOLD: Duration = Duration::from_millis(180);
 /// How far the lit colour is blended towards white. A black ring — the
@@ -100,6 +110,38 @@ impl RingFeedback {
         self.until = Some(now.saturating_add(TURN_HOLD));
     }
 
+    /// Show a level, 0 to 1, as a bar round the ring: whole segments lit,
+    /// and the next one lit in proportion to the remainder, so every step of
+    /// a four-segment ring is visible and not only every quarter.
+    ///
+    /// Muted, the lit part is red and dim, so a muted output is obvious at a
+    /// glance and never mistaken for a quiet one.
+    pub fn level(&mut self, fraction: f32, muted: bool, now: Tick) {
+        let fraction = fraction.clamp(0.0, 1.0);
+        let lit = if muted {
+            MUTED.lerp(self.base, 0.4)
+        } else {
+            self.highlight()
+        };
+        for (segment, want) in self.want.iter_mut().enumerate() {
+            let share = (fraction * SEGMENTS as f32 - segment as f32).clamp(0.0, 1.0);
+            *want = self.base.lerp(lit, share);
+        }
+        // Muted at zero would otherwise be indistinguishable from off.
+        if muted && fraction == 0.0 {
+            self.want = [MUTED.lerp(self.base, 0.7); SEGMENTS];
+        }
+        self.until = Some(now.saturating_add(LEVEL_HOLD));
+    }
+
+    /// Show a position among `count` (a page among the profile's pages): the
+    /// segment for it lit, counting clockwise from the top and wrapping.
+    pub fn position(&mut self, index: usize, now: Tick) {
+        self.want = [self.base; SEGMENTS];
+        self.want[index % SEGMENTS] = self.highlight();
+        self.until = Some(now.saturating_add(LEVEL_HOLD));
+    }
+
     /// A click: light the whole ring.
     pub fn click(&mut self, now: Tick) {
         self.want = [self.highlight(); SEGMENTS];
@@ -165,6 +207,46 @@ impl Default for RingFeedback {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn tick(ms: u64) -> Tick {
+        Tick(ms * 1000)
+    }
+
+    #[test]
+    fn a_level_lights_whole_segments_and_part_of_the_next() {
+        let mut ring = RingFeedback::new();
+        ring.rest(Rgb::BLACK);
+        ring.level(0.375, false, tick(0));
+        let colors = ring.colors();
+        let full = Rgb::BLACK.lerp(Rgb::WHITE, HIGHLIGHT);
+        assert_eq!(colors[0], full);
+        // Half of the second segment: 0.375 * 4 = 1.5.
+        assert_eq!(colors[1], Rgb::BLACK.lerp(full, 0.5));
+        assert_eq!(colors[2], Rgb::BLACK);
+        assert_eq!(colors[3], Rgb::BLACK);
+        assert!(ring.is_active());
+        ring.expire(tick(LEVEL_HOLD.as_millis() as u64 + 1));
+        assert!(!ring.is_active());
+    }
+
+    #[test]
+    fn muted_is_red_even_at_zero() {
+        let mut ring = RingFeedback::new();
+        ring.rest(Rgb::BLACK);
+        ring.level(0.0, true, tick(0));
+        assert!(ring.colors().iter().all(|c| c.r > c.g && c.r > 0));
+    }
+
+    #[test]
+    fn a_position_lights_its_segment() {
+        let mut ring = RingFeedback::new();
+        ring.rest(Rgb::BLACK);
+        ring.position(5, tick(0));
+        let lit: Vec<usize> = (0..SEGMENTS)
+            .filter(|i| ring.colors()[*i] != Rgb::BLACK)
+            .collect();
+        assert_eq!(lit, vec![1]);
+    }
 
     const BASE: Rgb = Rgb::new(0, 200, 150);
 

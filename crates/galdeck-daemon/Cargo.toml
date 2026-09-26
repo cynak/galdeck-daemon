@@ -38,3 +38,5 @@ anyhow = { workspace = true }
 log = { workspace = true }
 env_logger = { workspace = true }
 ctrlc = { workspace = true }
+zbus = { workspace = true }
+ureq = { workspace = true }

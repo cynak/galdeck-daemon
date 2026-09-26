@@ -18,3 +18,22 @@ brightness = 60
 
 # Which profile to start in. `galdeck profile <name>` switches at runtime.
 profile = "work"
+
+# Keystroke and scroll actions type through a virtual keyboard the daemon
+# creates. Set this to false and it never will.
+# virtual_input = false
+
+# Settings like the ones above go before the first [[...]] section: anything
+# after a section header belongs to that section.
+
+# Knobs set here are on every page of every profile, like the volume knob on
+# a keyboard. A profile or a page can change them one gesture at a time: a
+# page that only sets `press` keeps this turn.
+#
+# A preset is a ready-made set of gestures: volume, mic, tracks, seek, pages,
+# profiles, deck_brightness, scroll, zoom, tabs, workspaces, up_down,
+# left_right. `step` is how far each detent goes.
+[[encoders]]
+encoder = 0
+preset = "volume"
+step = 2

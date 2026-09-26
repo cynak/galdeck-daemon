@@ -54,7 +54,7 @@ fn a_theme_colour_reaches_the_rendered_pixels() {
     assert_eq!(style.key_bg, Rgb::new(0x3b, 0x42, 0x52));
     assert_eq!(from.key_bg, StyleSource::Theme);
 
-    let canvas = render::key(&style, None, None, None);
+    let canvas = render::key(galdeck::Button::size(), &style, None, None, None);
     assert_eq!(canvas.pixel(0, 0), Some(Rgb::new(0x3b, 0x42, 0x52)));
 }
 

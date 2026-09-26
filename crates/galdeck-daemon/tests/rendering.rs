@@ -45,7 +45,13 @@ fn a_transparent_icon_does_not_paint_a_black_box() {
     transparent_png(&path, 64);
 
     let background = Rgb::new(0x20, 0x60, 0xa0);
-    let canvas = render::key(&style(background), Some(&path), None, None);
+    let canvas = render::key(
+        galdeck::Button::size(),
+        &style(background),
+        Some(&path),
+        None,
+        None,
+    );
 
     // The corners are where the icon's transparency is, so they must still be
     // the key's background rather than black.
@@ -71,7 +77,13 @@ fn a_small_icon_is_not_blown_up_to_fill_the_key() {
     // Enlarging a 16x16 icon to 160x160 looks worse than leaving it small.
     let path = scratch("small.png");
     transparent_png(&path, 16);
-    let canvas = render::key(&style(Rgb::BLACK), Some(&path), None, None);
+    let canvas = render::key(
+        galdeck::Button::size(),
+        &style(Rgb::BLACK),
+        Some(&path),
+        None,
+        None,
+    );
 
     // Well outside where a 16px icon centred on a 160px key could reach.
     assert_eq!(canvas.pixel(20, 20), Some(Rgb::BLACK));
@@ -82,7 +94,13 @@ fn a_small_icon_is_not_blown_up_to_fill_the_key() {
 fn a_missing_icon_leaves_the_key_alone() {
     let missing = std::path::Path::new("/definitely/not/here.png");
     let background = Rgb::new(9, 9, 9);
-    let canvas = render::key(&style(background), Some(missing), None, None);
+    let canvas = render::key(
+        galdeck::Button::size(),
+        &style(background),
+        Some(missing),
+        None,
+        None,
+    );
     assert_eq!(canvas.pixel(0, 0), Some(background));
 }
 
@@ -93,12 +111,19 @@ fn a_long_label_wraps_rather_than_shrinking_to_nothing() {
     };
     // Two words that will not fit on one line at 26pt across 148 usable pixels.
     let wrapped = render::key(
+        galdeck::Button::size(),
         &style(Rgb::BLACK),
         None,
         Some("Screenshot Region"),
         Some(&font),
     );
-    let single = render::key(&style(Rgb::BLACK), None, Some("Screenshot"), Some(&font));
+    let single = render::key(
+        galdeck::Button::size(),
+        &style(Rgb::BLACK),
+        None,
+        Some("Screenshot"),
+        Some(&font),
+    );
 
     // The wrapped label occupies more vertical space than the single word,
     // which is what "it wrapped" looks like from the outside.
@@ -125,6 +150,7 @@ fn an_unbreakable_label_is_truncated_rather_than_overflowing() {
         return;
     };
     let canvas = render::key(
+        galdeck::Button::size(),
         &style(Rgb::BLACK),
         None,
         Some("Supercalifragilisticexpialidocious"),
@@ -147,7 +173,13 @@ fn a_label_that_fits_is_left_exactly_as_it_was() {
     let Some(font) = font() else {
         return;
     };
-    let canvas = render::key(&style(Rgb::BLACK), None, Some("Play"), Some(&font));
+    let canvas = render::key(
+        galdeck::Button::size(),
+        &style(Rgb::BLACK),
+        None,
+        Some("Play"),
+        Some(&font),
+    );
     let rows: Vec<u32> = (0..canvas.height())
         .filter(|y| {
             (0..canvas.width()).any(|x| {

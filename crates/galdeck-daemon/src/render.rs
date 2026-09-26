@@ -6,14 +6,14 @@
 
 use std::path::Path;
 
-use galdeck::{Align, Button, Canvas, Font, Lcd, TextStyle};
+use galdeck::{Align, Canvas, Font, Lcd, TextStyle};
 use galdeck_model::ResolvedStyle;
 
 /// Most lines a key label may wrap to.
 ///
-/// A key is 160 pixels tall and shares them with an icon. Past two lines the
-/// text is too small to read from across a desk, which is the only distance a
-/// deck is ever read from.
+/// A key is a couple of hundred pixels tall and shares them with an icon.
+/// Past two lines the text is too small to read from across a desk, which is
+/// the only distance a deck is ever read from.
 const MAX_LABEL_LINES: usize = 2;
 /// How much smaller a wrapped line may go before giving up and truncating.
 const MIN_LABEL_SIZE: f32 = 11.0;
@@ -23,14 +23,41 @@ const MIN_LABEL_SIZE: f32 = 11.0;
 ///
 /// The style is already total by the time it gets here -- the cascade decided
 /// every field -- so this function makes no decisions, only pixels.
+///
+/// `size` is given rather than taken from [`galdeck::Button::size`] because a key is
+/// not one size. The firmware's key path blits a fixed square; a calibrated
+/// deck draws the key at the rectangle it was measured at, which is larger,
+/// and content that stopped at the old size would leave a band of bare panel
+/// around every keycap.
 pub fn key(
+    size: (u32, u32),
     style: &ResolvedStyle,
     icon: Option<&Path>,
     label: Option<&str>,
     font: Option<&Font>,
 ) -> Canvas {
-    let (width, height) = Button::size();
-    let mut canvas = Canvas::filled(width, height, style.key_bg);
+    let (width, height) = size;
+    key_over(
+        Canvas::filled(width, height, style.key_bg),
+        style,
+        icon,
+        label,
+        font,
+    )
+}
+
+/// Draw a key's icon and label over something already there: a slice of a
+/// background image, say, rather than the style's flat colour.
+///
+/// The key is the canvas's size.
+pub fn key_over(
+    mut canvas: Canvas,
+    style: &ResolvedStyle,
+    icon: Option<&Path>,
+    label: Option<&str>,
+    font: Option<&Font>,
+) -> Canvas {
+    let (width, height) = (canvas.width(), canvas.height());
 
     let strip = if label.is_some() {
         style.key_label_strip
@@ -77,8 +104,18 @@ pub fn key(
 /// Render the info screen: a flat background with centered text.
 pub fn lcd(style: &ResolvedStyle, text: &str, font: Option<&Font>) -> Canvas {
     let (width, height) = Lcd::size();
-    let (width, height) = (width as u32, height as u32);
-    let mut canvas = Canvas::filled(width, height, style.lcd_bg);
+    let canvas = Canvas::filled(width as u32, height as u32, style.lcd_bg);
+    lcd_over(canvas, style, text, font)
+}
+
+/// The info screen's text over something already there.
+pub fn lcd_over(
+    mut canvas: Canvas,
+    style: &ResolvedStyle,
+    text: &str,
+    font: Option<&Font>,
+) -> Canvas {
+    let (width, height) = (canvas.width(), canvas.height());
     if let Some(font) = font {
         let text_style = TextStyle::new(font, style.lcd_text_size)
             .color(style.lcd_text_color)
@@ -162,7 +199,7 @@ fn break_into(text: &str, fits: impl Fn(&str) -> bool) -> Option<Vec<String>> {
 /// `Canvas::load` flattens alpha to black, so a PNG with a transparent
 /// background arrives as a black square on whatever the key's colour is. This
 /// keeps the alpha channel so it can actually be composited.
-fn load_icon(path: &Path, max_width: u32, max_height: u32) -> Option<image::RgbaImage> {
+pub fn load_icon(path: &Path, max_width: u32, max_height: u32) -> Option<image::RgbaImage> {
     if max_width == 0 || max_height == 0 {
         return None;
     }
@@ -180,7 +217,7 @@ fn load_icon(path: &Path, max_width: u32, max_height: u32) -> Option<image::Rgba
 }
 
 /// Composite an image over a canvas, respecting its alpha.
-fn blend_over(canvas: &mut Canvas, image: &image::RgbaImage, x: i32, y: i32) {
+pub fn blend_over(canvas: &mut Canvas, image: &image::RgbaImage, x: i32, y: i32) {
     for (ix, iy, pixel) in image.enumerate_pixels() {
         let [r, g, b, a] = pixel.0;
         if a == 0 {
@@ -198,7 +235,7 @@ fn blend_over(canvas: &mut Canvas, image: &image::RgbaImage, x: i32, y: i32) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use galdeck::Rgb;
+    use galdeck::{Button, Rgb};
 
     /// A style with a distinctive background, so a fill is unmistakable.
     fn style(bg: Rgb) -> ResolvedStyle {
@@ -210,25 +247,53 @@ mod tests {
 
     #[test]
     fn a_key_is_the_size_and_colour_the_style_asks_for() {
-        let canvas = key(&style(Rgb::new(10, 20, 30)), None, None, None);
         let (width, height) = Button::size();
+        let canvas = key(
+            (width, height),
+            &style(Rgb::new(10, 20, 30)),
+            None,
+            None,
+            None,
+        );
         assert_eq!(canvas.width(), width);
         assert_eq!(canvas.height(), height);
         assert_eq!(canvas.pixel(0, 0), Some(Rgb::new(10, 20, 30)));
     }
 
     #[test]
+    fn a_key_is_drawn_at_whatever_size_it_is_given() {
+        // A calibrated deck draws each key at its measured rectangle, which
+        // is larger than the square the firmware's key path blits. Content
+        // that ignored the size would leave bare panel around every keycap.
+        let canvas = key((176, 176), &style(Rgb::new(7, 7, 7)), None, None, None);
+        assert_eq!((canvas.width(), canvas.height()), (176, 176));
+        assert_eq!(canvas.pixel(175, 175), Some(Rgb::new(7, 7, 7)));
+    }
+
+    #[test]
     fn a_missing_font_leaves_the_background_intact() {
         // Labels are skipped rather than fatal when no font is available, so
         // these tests pass on a runner with no fonts installed.
-        let canvas = key(&style(Rgb::new(1, 2, 3)), None, Some("Label"), None);
+        let canvas = key(
+            Button::size(),
+            &style(Rgb::new(1, 2, 3)),
+            None,
+            Some("Label"),
+            None,
+        );
         assert_eq!(canvas.pixel(0, 0), Some(Rgb::new(1, 2, 3)));
     }
 
     #[test]
     fn a_missing_icon_leaves_the_background_intact() {
         let missing = Path::new("/definitely/not/here.png");
-        let canvas = key(&style(Rgb::new(4, 5, 6)), Some(missing), None, None);
+        let canvas = key(
+            Button::size(),
+            &style(Rgb::new(4, 5, 6)),
+            Some(missing),
+            None,
+            None,
+        );
         assert_eq!(canvas.pixel(0, 0), Some(Rgb::new(4, 5, 6)));
     }
 
@@ -249,8 +314,8 @@ mod tests {
         // minus the strip. Asserted through the style so a theme can change it.
         let mut s = ResolvedStyle::BUILTIN;
         s.key_label_strip = 100;
-        let without = key(&s, None, None, None);
-        let with = key(&s, None, Some("x"), None);
+        let without = key(Button::size(), &s, None, None, None);
+        let with = key(Button::size(), &s, None, Some("x"), None);
         assert_eq!(without.width(), with.width());
     }
 }

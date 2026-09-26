@@ -388,5 +388,10 @@ fn event_name(event: &galdeck_ipc::Event) -> &'static str {
         EncoderTurned { .. } => "encoder_turned",
         EncoderPressed { .. } => "encoder_pressed",
         ConfigChanged => "config_changed",
+        DeviceReleased => "device_released",
+        DeviceResumed => "device_resumed",
+        CalibrationChanged => "calibration_changed",
+        TimerDone { .. } => "timer_done",
+        ModeChanged { .. } => "mode_changed",
     }
 }
