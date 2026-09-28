@@ -32,10 +32,11 @@ use crate::widgets::{draw, Sample, Slot, SlotState, WidgetHost};
 
 use crate::render;
 use crate::ring::RingFeedback;
+use crate::states::{KeyCycle, KeyHome};
 use galdeck_model::v2::{EncoderConfig, KeyConfig, Page, Profile};
 use galdeck_model::{
-    config_file_names, Animation, AnimationKind, ConfigDocument, Diagnostics, ResolvedPalette,
-    ResolvedStyle, StyleLayer, Workspace,
+    config_file_names, Animation, ConfigDocument, Diagnostics, ResolvedPalette, ResolvedStyle,
+    StyleLayer, Workspace,
 };
 
 /// Longest the core loop sleeps with nothing scheduled.
@@ -44,6 +45,19 @@ use galdeck_model::{
 /// with the scheduler and every message rings the waker. It only bounds how
 /// long shutdown takes to notice.
 const CORE_IDLE: Duration = Duration::from_millis(250);
+/// Most often the whole screen is sent, whatever asks for it.
+///
+/// Every repaint is a full frame -- 70 KB over a moving background -- and
+/// turning a knob asks for one per detent, for the level shown over the
+/// screen. The module's firmware drops off the bus under that on top of a
+/// moving background (seen on 3.05.005), so a repaint asked for sooner
+/// waits for this.
+const SCREEN_FRAME_MIN: Duration = Duration::from_millis(50);
+/// A background moving on the screen at least this often sets the pace of
+/// the screen: anything else that changes it waits for the background's
+/// next frame and goes out with that, so moving it costs no frames of its
+/// own, and the screen never falls out of step with the keys.
+const SCREEN_RIDES_BACKGROUND: Duration = Duration::from_millis(100);
 /// How many pages back a `back` key can walk.
 ///
 /// A deck is navigated by hand, so this is far past any real trail; the point
@@ -62,6 +76,9 @@ const ROTATION_QUEUE_DEPTH: usize = 16;
 const TILE_GAP: u32 = 6;
 /// Corner radius of a tile's card.
 const TILE_RADIUS: u32 = 12;
+/// How often a key's answer to a press is drawn again as it fades. Each
+/// step is a JPEG encode, so a fifth of a second is five or six of them.
+const PRESS_STEP: Duration = Duration::from_millis(40);
 
 /// A patch value as the `toml` crate spells it.
 fn toml_value(value: galdeck_model::Value) -> toml::Value {
@@ -86,6 +103,9 @@ enum From {
     /// A timer that has finished, running its `on_done`. Its key may be on
     /// a page that is not showing, so nothing is fed back to a key.
     Timer,
+    /// A key entering one of its states, running what the state runs. Its
+    /// page may not be showing either, and the state is the feedback.
+    State(u8),
 }
 
 /// The knob an action came from, if it came from one: where a report on it
@@ -103,10 +123,15 @@ fn knob(from: From) -> Option<u8> {
 fn misplaced(action: galdeck_model::BuiltIn, from: From) -> Option<String> {
     use galdeck_model::SlotRule;
     match (action.slot_rule(), from) {
+        // What a state runs as the key enters it stepping the key on again
+        // would never stop.
+        (SlotRule::KeyTapOnly | SlotRule::KeyOnly, From::State(_)) => {
+            Some("a state's action cannot change the key's state".into())
+        }
         (SlotRule::KeyTapOnly | SlotRule::KeyOnly, From::Knob(_) | From::Timer) => {
             Some(format!("{} works only on a key", action.name()))
         }
-        (SlotRule::KnobOnly, From::Key(_) | From::Timer) => {
+        (SlotRule::KnobOnly, From::Key(_) | From::Timer | From::State(_)) => {
             Some(format!("{} works only on a knob", action.name()))
         }
         _ => None,
@@ -128,18 +153,8 @@ fn needs_mixer(action: galdeck_model::BuiltIn) -> bool {
         | NextTrack | PreviousTrack | SeekForward | SeekBackward | NextPage | PreviousPage
         | HomePage | NextProfile | PreviousProfile | StartProfile | DeckBrighter | DeckDimmer
         | NextMode | TimerToggle | TimerReset | ScrollUp | ScrollDown | ScrollLeft
-        | ScrollRight | ZoomIn | ZoomOut | ZoomReset => false,
+        | ScrollRight | ZoomIn | ZoomOut | ZoomReset | NextState | PreviousState => false,
     }
-}
-
-/// Which timer is whose: the key it is on, by the names of its page and
-/// profile, so it keeps counting while they are not showing and survives a
-/// reload that moves pages around.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-struct CountdownKey {
-    profile: String,
-    page: String,
-    key: u8,
 }
 
 /// What a key's widget counts, as a countdown's length: `Ok(None)` for a
@@ -255,10 +270,12 @@ struct Overlay {
 
 /// `@warning` and `@critical` for a theme that does not define them.
 const WARNING: Rgb = Rgb::new(235, 203, 139);
-const CRITICAL: Rgb = Rgb::new(191, 97, 106);
+pub(crate) const CRITICAL: Rgb = Rgb::new(191, 97, 106);
 
-/// The key a timer is on, found in whatever profile and page it is in.
-fn countdown_home<'a>(workspace: &'a Workspace, which: &CountdownKey) -> Option<&'a KeyConfig> {
+/// The key at `which`, found in whatever profile and page it is in: a
+/// timer's, or a key with states. The page is the first with its id, the
+/// only one [`Engine::home_page`] names.
+fn key_at_home<'a>(workspace: &'a Workspace, which: &KeyHome) -> Option<&'a KeyConfig> {
     workspace
         .profile(&which.profile)?
         .pages
@@ -374,6 +391,20 @@ const ALARM_SHARE: f32 = 0.6;
 /// How far a mute key showing a muted device, or a push-to-talk key over a
 /// live microphone, is tinted.
 const STATE_SHARE: f32 = 0.45;
+/// How far a key whose state's command has just failed is tinted, for the
+/// moment it says so.
+const FAILED_SHARE: f32 = 0.3;
+/// Most animation frames a page pre-renders. Past it, a key's animation is
+/// left out and the key shows its first frame, still: twelve keys of the
+/// longest animations would otherwise be close to four hundred JPEG encodes
+/// on every page switch.
+const MAX_PAGE_FRAMES: usize = 192;
+/// Most names one `which` asks about, and the longest name looked for.
+const MAX_WHICH: usize = 64;
+const MAX_PROGRAM_NAME: usize = 64;
+/// Most editors left waiting for the icon names while the themes are still
+/// being found.
+const MAX_ICON_NAME_WAITERS: usize = 16;
 /// How often the levels behind mute keys and level rings are read again
 /// while any is showing: muting from the desktop, a headset button or a call
 /// app says nothing to the deck, and a mute key showing "muted" over a live
@@ -466,6 +497,16 @@ struct KnobApp {
     key: String,
     /// Its name to show, for saying when it has stopped playing.
     display: String,
+}
+
+/// Where `save_asset` or `fetch_asset` put a picture, as the protocol says it.
+fn asset_response(stored: Result<std::path::PathBuf, String>) -> Response {
+    match stored {
+        Ok(path) => Response::Asset {
+            path: path.display().to_string(),
+        },
+        Err(message) => Response::Error { message },
+    }
 }
 
 /// What `audio_targets` found, as the protocol says it.
@@ -614,15 +655,19 @@ fn default_label(widget: &galdeck_model::Widget) -> &str {
     widget.placeholder.as_deref().unwrap_or(widget.kind.name())
 }
 
-/// Where a tile's grid cells land on the info screen, less the gap.
+/// Where a tile's grid cells land on a screen of `size`, less the gap.
 ///
 /// Edges are rounded from exact fractions of the screen rather than a cell
 /// size multiplied up: 720 does not divide by 7, and multiplying a rounded
 /// width would leave the last column short by up to a pixel per column.
-fn tile_area(cells: galdeck_model::Cells, grid: galdeck_model::LcdGrid) -> draw::Area {
-    let (width, height) = galdeck::Lcd::size();
-    let edge = |index: u8, count: u8, size: u16| {
-        (u32::from(index) * u32::from(size) + u32::from(count) / 2) / u32::from(count.max(1))
+fn tile_area(
+    cells: galdeck_model::Cells,
+    grid: galdeck_model::LcdGrid,
+    size: (u32, u32),
+) -> draw::Area {
+    let (width, height) = size;
+    let edge = |index: u8, count: u8, size: u32| {
+        (u32::from(index) * size + u32::from(count) / 2) / u32::from(count.max(1))
     };
     let (left, right) = (
         edge(cells.column, grid.columns, width),
@@ -639,6 +684,15 @@ fn tile_area(cells: galdeck_model::Cells, grid: galdeck_model::LcdGrid) -> draw:
         (right - left).saturating_sub(TILE_GAP),
         (bottom - top).saturating_sub(TILE_GAP),
     )
+}
+
+/// How round a tile's card is: as its widget or its look says, else the
+/// usual, and never past half its shorter side.
+fn tile_radius(widget: &galdeck_model::Widget, area: draw::Area) -> u32 {
+    widget
+        .radius()
+        .unwrap_or(TILE_RADIUS)
+        .min(area.width.min(area.height) / 2)
 }
 
 /// A sender that always wakes the core loop.
@@ -752,11 +806,105 @@ impl KeyPlacement {
     }
 }
 
+/// Where the info screen is drawn.
+///
+/// Like a key, the screen has the firmware's fixed segment and the region
+/// path. The segment is 720x384 at the origin whatever the glass shows; a
+/// calibration measures what the glass actually shows, which is the area
+/// tiles have to be laid out on.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ScreenPlacement {
+    /// The firmware's segment.
+    Firmware,
+    /// A measured screen. `visible` is what gets laid out and previewed;
+    /// `frame` is what is written, in whole region blocks, and contains it.
+    Measured {
+        visible: PanelRect,
+        frame: PanelRect,
+    },
+}
+
+impl ScreenPlacement {
+    /// The screen as a calibration describes it.
+    ///
+    /// The frame covers the measured screen by rounding its far edges out to
+    /// whole blocks, so a 396-row screen is written 400 rows tall and the
+    /// extra rows fall under the bezel. Rounding out must not reach the first
+    /// key row, though: the screen repaints every second under a clock, and
+    /// would keep painting over the tops of the keys. Where it would, the
+    /// frame is cut to the block below instead and the screen is laid out on
+    /// what is left.
+    fn from_calibration(calibration: &PanelLayout) -> Self {
+        // A template is arithmetic, as for keys, and its screen is the
+        // segment anyway.
+        if calibration.source == galdeck::layout::Source::Template {
+            return ScreenPlacement::Firmware;
+        }
+        let measured = calibration.screen;
+        if measured == PanelRect::new(0, 0, galdeck::Lcd::WIDTH, galdeck::Lcd::HEIGHT) {
+            return ScreenPlacement::Firmware;
+        }
+        let block = galdeck::ids::REGION_MCU as u16;
+        if measured.width < block || measured.height < block {
+            return ScreenPlacement::Firmware;
+        }
+        let mut frame = measured.to_mcu_covering();
+        let first_key = calibration
+            .zones()
+            .iter()
+            .map(|zone| u32::from(zone.bounds.y))
+            .filter(|&top| top >= u32::from(measured.y))
+            .min();
+        if let Some(first_key) = first_key {
+            if frame.bottom() > first_key {
+                frame.y = measured.y;
+                frame.height = galdeck::Panel::to_mcu_floor(measured.height);
+            }
+        }
+        let visible = PanelRect::new(
+            measured.x,
+            measured.y,
+            measured
+                .width
+                .min((frame.right() - u32::from(measured.x)) as u16),
+            measured
+                .height
+                .min((frame.bottom() - u32::from(measured.y)) as u16),
+        );
+        ScreenPlacement::Measured { visible, frame }
+    }
+
+    /// The size tiles, text and the background are laid out at.
+    fn size(self) -> (u32, u32) {
+        match self {
+            ScreenPlacement::Firmware => {
+                let (width, height) = galdeck::Lcd::size();
+                (u32::from(width), u32::from(height))
+            }
+            ScreenPlacement::Measured { visible, .. } => {
+                (u32::from(visible.width), u32::from(visible.height))
+            }
+        }
+    }
+}
+
 /// Widget pictures by path and the size they were scaled to.
 type WidgetImages = std::collections::HashMap<(PathBuf, u32, u32), Option<Arc<image::RgbaImage>>>;
 
 /// What a prepared background was built from.
 type SceneSource = (galdeck_model::Backdrop, Vec<Rgb>, crate::backdrop::Geometry);
+
+/// The icon themes found for a reload, and the names in them once an editor
+/// has asked for those: listing them reads every directory the themes list,
+/// so it is done once per reload, on a thread, and only when asked.
+#[derive(Clone)]
+struct IconSet {
+    themes: Arc<crate::icons::IconThemes>,
+    names: Arc<std::sync::OnceLock<Vec<String>>>,
+}
+
+/// Themes found off the engine's thread, and the reload they were found for.
+type FoundIcons = (u64, Arc<crate::icons::IconThemes>);
 
 /// Whether a request can be answered where it was handled.
 enum Reply {
@@ -789,6 +937,16 @@ pub struct Engine {
     /// Recomputed only when the profile or the config changes.
     theme: StyleLayer,
     palette: ResolvedPalette,
+    /// The current profile's `[motion]`, with its theme's folded in.
+    motion: galdeck_model::MotionStyle,
+    /// When each key position was pressed, while the theme's answer to the
+    /// press is still fading. Positions, not keys: forgotten when the page
+    /// changes, since a position is another key then.
+    pressed: [Option<Tick>; Buttons::COUNT as usize],
+    /// Whether an alarm frame is due. Kept, rather than asked of the
+    /// scheduler, so a widget sampling faster than the alarm moves cannot
+    /// keep putting its next frame off.
+    alarm_frames: bool,
     brightness: u8,
     /// What the io thread last told us about the device. The engine never
     /// touches it directly.
@@ -872,10 +1030,21 @@ pub struct Engine {
     /// Every timer and stopwatch that has been started, on any page of any
     /// profile, so one keeps counting while its page is not showing. One at
     /// its start is not kept: it has nothing to remember.
-    countdowns: std::collections::HashMap<CountdownKey, Countdown>,
+    countdowns: std::collections::HashMap<KeyHome, Countdown>,
     /// Keys showing a finished timer's flash at the last flash tick, so the
     /// tick after its flash ends paints it at rest.
     flashing: Vec<u8>,
+    /// Every key with states that has been pressed, read or set, on any page
+    /// of any profile: the state it shows and what is under way for it. By
+    /// where the key is, so it keeps its state while its page is not showing
+    /// and through a reload. Not kept on disk: a key that can read its state
+    /// reads it again, and one that cannot would only be guessing.
+    key_states: std::collections::HashMap<KeyHome, KeyCycle>,
+    /// Runs what keys with states run, off this thread.
+    state_runner: crate::states::StateRunner,
+    state_rx: Receiver<crate::states::StateReport>,
+    /// The number the next of those jobs goes by.
+    state_seq: u64,
     /// Which knob last asked about a level, so the answer lands on its ring.
     level_asker: Option<(u8, crate::audio::AudioTarget, Tick)>,
     /// When each knob last changed track, output or app.
@@ -902,6 +1071,27 @@ pub struct Engine {
     /// PNG each time would be most of the work. `None` remembers a picture
     /// that could not be loaded, so it is not retried on every frame.
     widget_images: std::cell::RefCell<WidgetImages>,
+    /// The icon themes a key's icon name is looked up in, once found. Found
+    /// off this thread, since asking the desktop which one it uses can take
+    /// a second; until then a named icon is left out.
+    icons: Option<IconSet>,
+    icons_tx: Sender<FoundIcons>,
+    icons_rx: Receiver<FoundIcons>,
+    /// The reload whose themes are wanted. Ones found for an earlier reload
+    /// that arrive late are not.
+    icons_wanted: u64,
+    /// Whether themes are being found now. One search at a time: the
+    /// desktop is asked which theme it uses at most once at a time, and a
+    /// second ask while the first waits would be told nothing.
+    icons_finding: bool,
+    /// Editors that asked for the icon names before there were themes to
+    /// list them from.
+    icon_names_waiting: Vec<Sender<Response>>,
+    /// Icons drawn to fit their keys, so neither a repaint nor an animation
+    /// frame decodes a file again.
+    icon_cache: std::cell::RefCell<crate::icons::IconCache>,
+    /// Wakes the loop from the threads the engine starts.
+    waker: Waker,
     /// Plugins, and what they have put on their keys.
     plugin_host: PluginHost,
     plugin_rx: Receiver<PluginEvent>,
@@ -926,6 +1116,12 @@ pub struct Engine {
     /// On unless the operator says otherwise, but only takes effect where
     /// there is a measured calibration to draw at -- see `key_placement`.
     zone_paint: bool,
+    /// The keyboard lighting thread, told what the profile showing asks of
+    /// the keyboard whenever that changes. `None` until main attaches one.
+    lighting: Option<crate::lighting::LightingHandle>,
+    /// When the screen was last sent, and which background frame it showed,
+    /// so the next repaint can wait its turn; see `SCREEN_FRAME_MIN`.
+    screen_painted: Option<(Tick, u64)>,
 }
 
 /// What the io thread has told us about the device.
@@ -964,6 +1160,19 @@ enum TimerKind {
     /// The levels behind the mute keys and level rings showing are due to
     /// be read again.
     LevelPoll,
+    /// A key with states on the page is due to have its state read again.
+    StateStatus { key: u8 },
+    /// Something about a key with states is due: the cue that its command
+    /// is still running, the end of the flash saying it failed, a read to
+    /// see it took. One deadline for all of them, on any page, as with
+    /// `CountdownDue`.
+    KeyStates,
+    /// The next step of a key's answer to being pressed, or its end.
+    PressFrame { key: u8 },
+    /// The next step of the pulse on widgets past their threshold.
+    AlarmFrame,
+    /// A repaint of the screen held back by `SCREEN_FRAME_MIN` may go.
+    ScreenFrame,
 }
 
 /// A key animation, with every frame already rendered and encoded.
@@ -978,58 +1187,30 @@ struct KeyAnimation {
 }
 
 /// A ring animation. Not pre-rendered, because a ring frame is four colours
-/// and no encoding at all.
+/// and no encoding at all -- which also frees it from stepping through a
+/// key's few frames: each frame is worked out when it is due, from how far
+/// into the cycle that is, so the colours move instead of jumping.
 struct RingAnimation {
     animation: Animation,
     base: Rgb,
     to: Rgb,
     interval: Duration,
-    next: u8,
+    /// When the cycle began. Every frame's phase and due time are measured
+    /// from it, so a late frame neither shows a stale colour nor pushes the
+    /// ones after it later.
+    start: Tick,
 }
 
 impl RingAnimation {
-    /// The colours for the current frame.
-    fn frame(&self) -> [Rgb; galdeck::Ring::SEGMENTS as usize] {
-        let count = u32::from(self.animation.frames());
-        let phase = f32::from(self.next) / count as f32;
-        match self.animation.kind {
-            // One lit segment travelling round.
-            AnimationKind::Spin => {
-                let lit = (phase * galdeck::Ring::SEGMENTS as f32) as usize
-                    % galdeck::Ring::SEGMENTS as usize;
-                let mut colors = [self.base; galdeck::Ring::SEGMENTS as usize];
-                colors[lit] = self.to;
-                colors
-            }
-            // A lit segment with a tail fading out behind it.
-            AnimationKind::Comet => {
-                let head = (phase * galdeck::Ring::SEGMENTS as f32) as usize
-                    % galdeck::Ring::SEGMENTS as usize;
-                let mut colors = [self.base; galdeck::Ring::SEGMENTS as usize];
-                for behind in 0..galdeck::Ring::SEGMENTS as usize {
-                    let at = (head + galdeck::Ring::SEGMENTS as usize - behind)
-                        % galdeck::Ring::SEGMENTS as usize;
-                    let strength = 1.0 - (behind as f32 / galdeck::Ring::SEGMENTS as f32);
-                    colors[at] = self.base.lerp(self.to, strength);
-                }
-                colors
-            }
-            // Round the wheel, each segment a quarter turn on from the last,
-            // so the colours travel round the knob.
-            AnimationKind::Rainbow => std::array::from_fn(|segment| {
-                let offset = segment as f32 / galdeck::Ring::SEGMENTS as f32;
-                galdeck_model::animation::rainbow_or(
-                    AnimationKind::Rainbow,
-                    phase + offset,
-                    self.base,
-                    self.to,
-                )
-            }),
-            kind => {
-                let mix = kind.mix_at(phase);
-                [self.base.lerp(self.to, mix); galdeck::Ring::SEGMENTS as usize]
-            }
-        }
+    /// The colours at `now`.
+    fn frame(&self, now: Tick) -> [Rgb; galdeck::Ring::SEGMENTS as usize] {
+        let phase = crate::ring::animation_phase(&self.animation, self.start, now);
+        crate::ring::animation_frame(self.animation.kind, phase, self.base, self.to)
+    }
+
+    /// When the frame after `now` is due.
+    fn next_frame(&self, now: Tick) -> Tick {
+        crate::ring::next_animation_frame(self.start, self.interval, now)
     }
 }
 
@@ -1068,6 +1249,9 @@ impl Engine {
         let brightness = workspace.global.brightness;
         let (controls, report_rx) =
             crate::controls::ControlHost::new(widget_host.waker(), workspace.global.virtual_input);
+        let (state_runner, state_rx) = crate::states::StateRunner::new(widget_host.waker());
+        let (icons_tx, icons_rx) = std::sync::mpsc::channel();
+        let waker = widget_host.waker();
         let profile_id = workspace
             .start_profile()
             .map(str::to_string)
@@ -1082,6 +1266,9 @@ impl Engine {
             documents: Default::default(),
             theme: StyleLayer::default(),
             palette: ResolvedPalette::default(),
+            motion: Default::default(),
+            pressed: Default::default(),
+            alarm_frames: false,
             brightness,
             device: DeviceStatus::default(),
             control_rx,
@@ -1121,6 +1308,10 @@ impl Engine {
             unread: Default::default(),
             countdowns: Default::default(),
             flashing: Vec::new(),
+            key_states: Default::default(),
+            state_runner,
+            state_rx,
+            state_seq: 0,
             level_asker: None,
             last_switch: Encoders::indices().map(|_| None).collect(),
             dial_modes: Default::default(),
@@ -1129,6 +1320,14 @@ impl Engine {
             audio_targets: Default::default(),
             geocoder: Arc::new(crate::widgets::weather::Geocoder::default()),
             widget_images: Default::default(),
+            icons: None,
+            icons_tx,
+            icons_rx,
+            icons_wanted: 0,
+            icons_finding: false,
+            icon_names_waiting: Vec::new(),
+            icon_cache: Default::default(),
+            waker,
             plugin_host,
             plugin_rx,
             plugin_text: (0..Buttons::COUNT).map(|_| None).collect(),
@@ -1138,11 +1337,14 @@ impl Engine {
             actions: ActionRunner::new(),
             blank_keys: Default::default(),
             zone_paint,
+            lighting: None,
+            screen_painted: None,
         };
         engine.enter_profile();
         engine.load_documents();
         engine.load_calibration();
         engine.prepare_virtual_input();
+        engine.find_icons();
         Ok(engine)
     }
 
@@ -1201,14 +1403,17 @@ impl Engine {
                     "key",
                     &mut out,
                 );
+                let cycle = self
+                    .home_of(key.key)
+                    .and_then(|home| self.key_states.get(&home));
                 KeyInfo {
                     key: key.key,
                     index,
                     label: key.label.clone(),
-                    text: self.label_for(key),
+                    text: self.label_for(&self.look_of(key)),
                     widget: key.widget.as_ref().map(|w| self.widget_info(w)),
                     animation: key.animation.as_ref().map(|a| self.animation_info(a)),
-                    icon: key.icon.as_ref().map(|p| p.display().to_string()),
+                    icon: key.icon.as_ref().map(ToString::to_string),
                     exec: key.exec.as_ref().and_then(|a| a.shell()).map(String::from),
                     tap: key.exec.as_ref().map(|a| action_info(a, None)).or_else(|| {
                         key.implicit_tap().map(|a| galdeck_ipc::ActionInfo {
@@ -1228,9 +1433,29 @@ impl Engine {
                     back: key.back,
                     background: hex(style.key_bg),
                     background_is_own: from.key_bg == galdeck_model::StyleSource::Cell,
+                    label_color: hex(style.key_label_color),
+                    label_color_is_own: from.key_label_color == galdeck_model::StyleSource::Cell,
                     timer: self
                         .countdown_of(key)
                         .map(|countdown| timer_info(&countdown, self.clock.now())),
+                    states: key.states.iter().map(|s| self.state_info(s)).collect(),
+                    state: self
+                        .home_of(key.key)
+                        .and_then(|home| self.shown_state(&home, key)),
+                    state_known: cycle.is_some_and(|cycle| cycle.known),
+                    status: key.status.clone(),
+                    status_interval_ms: key.status_interval_ms,
+                    status_result: cycle
+                        .and_then(|cycle| cycle.last_read.as_ref())
+                        .map(|read| galdeck_ipc::StatusResultInfo {
+                            output: read.output.clone(),
+                            error: read.error.clone(),
+                            ok: read.ok,
+                            age_ms: u64::try_from(
+                                self.clock.now().duration_since(read.at).as_millis(),
+                            )
+                            .unwrap_or(u64::MAX),
+                        }),
                 }
             })
             .collect();
@@ -1394,11 +1619,14 @@ impl Engine {
                 })
                 .collect(),
             background: self.backdrop_info(profile, page),
-            lcd_grid: Some(LcdGrid {
-                columns: grid.columns,
-                rows: grid.rows,
-                width: galdeck::Lcd::WIDTH,
-                height: galdeck::Lcd::HEIGHT,
+            lcd_grid: Some({
+                let (width, height) = ScreenPlacement::from_calibration(&self.calibration).size();
+                LcdGrid {
+                    columns: grid.columns,
+                    rows: grid.rows,
+                    width: width as u16,
+                    height: height as u16,
+                }
             }),
             lcd_grid_origin: if page.lcd_columns.is_some() || page.lcd_rows.is_some() {
                 Some("page".into())
@@ -1408,7 +1636,31 @@ impl Engine {
                 None
             },
             outputs: self.workspace.global.outputs.clone(),
+            warnings: self.icon_warnings(page),
         })
+    }
+
+    /// One of a key's states, for an editor: as written, with the colours it
+    /// sets of its own resolved.
+    fn state_info(&self, state: &galdeck_model::v2::KeyState) -> galdeck_ipc::KeyStateInfo {
+        let own = |color: Option<&galdeck_model::ColorRef>| {
+            color
+                .and_then(|color| {
+                    self.palette
+                        .resolve(color, "states.style", &mut Diagnostics::new())
+                })
+                .map(hex)
+        };
+        galdeck_ipc::KeyStateInfo {
+            name: state.name.clone(),
+            matches: state.matches.clone(),
+            label: state.label.clone(),
+            icon: state.icon.as_ref().map(ToString::to_string),
+            exec: state.exec.as_ref().map(|a| action_info(a, None)),
+            background: own(state.style.key_bg.as_ref()),
+            label_color: own(state.style.key_label_color.as_ref()),
+            animation: state.animation.as_ref().map(|a| self.animation_info(a)),
+        }
     }
 
     /// The page's background, for an editor, and where it was set.
@@ -1457,6 +1709,12 @@ impl Engine {
             command: widget.command.clone(),
             placeholder: widget.placeholder.clone(),
             view: lower(format!("{:?}", widget.view())),
+            own_view: widget.view.map(|view| lower(format!("{view:?}"))),
+            look_view: widget
+                .look
+                .view
+                .filter(|view| view.suits(widget.kind))
+                .map(|view| lower(format!("{view:?}"))),
             title: widget.title.clone(),
             source: widget.source.clone(),
             units: widget.units.map(|units| lower(format!("{units:?}"))),
@@ -1512,6 +1770,184 @@ impl Engine {
         }
     }
 
+    /// Start a theme file, then load it as any saved edit is loaded.
+    fn create_theme(
+        &mut self,
+        id: &str,
+        name: Option<&str>,
+        extends: Option<&str>,
+        copy: Option<&str>,
+    ) -> Response {
+        match crate::theme_editor::create(
+            &self.config_dir,
+            &self.workspace,
+            id,
+            name,
+            extends,
+            copy,
+        ) {
+            Ok(file) => {
+                log::info!("created {file}");
+                self.reload()
+            }
+            Err(message) => Response::Error { message },
+        }
+    }
+
+    /// Draw a theme with unsaved edits to its file, for the editor.
+    fn preview_theme(&self, id: &str, patches: &[Patch]) -> Response {
+        let file = format!("themes/{id}.toml");
+        let (staged, diagnostics) = match self.stage(&file, patches, None) {
+            Ok(staged) => staged,
+            Err(message) => return Response::Error { message },
+        };
+        let overrides = std::collections::BTreeMap::from([(file, staged.text)]);
+        let (workspace, _) = Workspace::load_with_overrides(&self.config_dir, &overrides);
+        let Some(workspace) = workspace else {
+            return Response::Error {
+                message: "the config does not load with these edits".into(),
+            };
+        };
+        Response::ThemePreview(Box::new(crate::theme_editor::preview(
+            &workspace,
+            id,
+            self.backdrop_geometry(),
+            self.font.as_ref(),
+            diagnostics,
+        )))
+    }
+
+    /// Answer a press on the key itself, as the theme's `[motion] press`
+    /// says: a flash or a dip, drawn again in steps as it fades.
+    fn start_press(&mut self, key: u8, at: Tick) {
+        let answers = self
+            .motion
+            .press
+            .as_ref()
+            .is_some_and(|press| press.kind != galdeck_model::PressKind::None);
+        if !answers || key >= Buttons::COUNT || !self.device.connected {
+            return;
+        }
+        self.pressed[usize::from(key)] = Some(at);
+        self.scheduler.cancel_kind(TimerKind::PressFrame { key });
+        self.repaint_key(key);
+        self.scheduler
+            .after(at, PRESS_STEP, TimerKind::PressFrame { key });
+    }
+
+    /// The next step of a press fading, or, once it has, the key as it is.
+    fn advance_press(&mut self, key: u8) {
+        let now = self.clock.now();
+        let fading = self.press_share(key, now).is_some();
+        if !fading {
+            self.pressed[usize::from(key)] = None;
+        }
+        self.repaint_key(key);
+        if fading {
+            self.scheduler
+                .after(now, PRESS_STEP, TimerKind::PressFrame { key });
+        }
+    }
+
+    /// How far towards the press colour key `key` is at `now`, while its
+    /// press is fading. From the clock, so a repaint for any other reason
+    /// draws the same step rather than hurrying it along.
+    fn press_share(&self, key: u8, now: Tick) -> Option<f32> {
+        let at = (*self.pressed.get(usize::from(key))?)?;
+        let elapsed = u32::try_from(now.duration_since(at).as_millis()).unwrap_or(u32::MAX);
+        self.motion.press.as_ref()?.share_at(elapsed)
+    }
+
+    /// What a press goes towards: black for a dip, else the press's own
+    /// colour, else the theme's `@accent`, else white.
+    fn press_color(&self) -> Rgb {
+        let Some(press) = &self.motion.press else {
+            return Rgb::WHITE;
+        };
+        if press.kind == galdeck_model::PressKind::Dim {
+            return Rgb::BLACK;
+        }
+        press
+            .color
+            .as_ref()
+            .and_then(|color| {
+                self.palette
+                    .resolve(color, "motion.press.color", &mut Diagnostics::new())
+            })
+            .unwrap_or_else(|| self.token_color("@accent", Rgb::WHITE))
+    }
+
+    /// Forget every press still fading, without drawing: the keys are about
+    /// to be drawn anyway, or there is no deck to draw them on.
+    fn forget_presses(&mut self) {
+        for key in Buttons::indices() {
+            self.scheduler.cancel_kind(TimerKind::PressFrame { key });
+        }
+        self.pressed = Default::default();
+    }
+
+    /// How far towards its alarm colour a widget past its threshold is now,
+    /// if the theme's `[motion] alarm` moves it: stepping through that
+    /// animation's frames by the clock. `None` when alarms do not move, as
+    /// for a kind the model warns an alarm cannot be.
+    fn alarm_pulse(&self) -> Option<f32> {
+        let alarm = self.moving_alarm()?;
+        let step = u64::from(alarm.frame_interval_ms()).max(1);
+        let frame = (self.clock.now().0 / 1000 / step) % u64::from(alarm.frames());
+        Some(alarm.mix_for_frame(u8::try_from(frame).unwrap_or(0)))
+    }
+
+    /// The theme's alarm animation, if it is one an alarm can be.
+    fn moving_alarm(&self) -> Option<&Animation> {
+        self.motion.alarm.as_ref().filter(|alarm| {
+            !alarm.kind.is_ring_only() && alarm.kind != galdeck_model::AnimationKind::Rainbow
+        })
+    }
+
+    /// Keep an alarm pulse moving while any widget showing is past its
+    /// threshold and the theme says alarms move.
+    fn watch_alarms(&mut self) {
+        if self.alarm_frames {
+            return;
+        }
+        let Some(interval) = self
+            .moving_alarm()
+            .map(|alarm| Duration::from_millis(u64::from(alarm.frame_interval_ms())))
+        else {
+            return;
+        };
+        let alarming = self
+            .widget_state
+            .values()
+            .any(|state| state.level != galdeck_model::Level::Normal);
+        if alarming {
+            self.alarm_frames = true;
+            let now = self.clock.now();
+            self.scheduler.after(now, interval, TimerKind::AlarmFrame);
+        }
+    }
+
+    /// Draw every widget past its threshold at the pulse's next step.
+    fn advance_alarms(&mut self) {
+        self.alarm_frames = false;
+        if !self.device.connected {
+            return;
+        }
+        let alarming: Vec<Slot> = self
+            .widget_state
+            .iter()
+            .filter(|(_, state)| state.level != galdeck_model::Level::Normal)
+            .map(|(slot, _)| *slot)
+            .collect();
+        for slot in alarming {
+            match slot {
+                Slot::Key(key) => self.repaint_key(key),
+                Slot::Tile(_) => self.screen_dirty = true,
+            }
+        }
+        self.watch_alarms();
+    }
+
     /// Work out what an edit would do, without doing it.
     fn stage(
         &self,
@@ -1557,12 +1993,64 @@ impl Engine {
         }
         self.theme = theme;
         self.palette = palette;
+        self.send_lighting();
+        self.motion = self
+            .workspace
+            .profile(&self.profile_id)
+            .map(|profile| self.workspace.motion_for(profile))
+            .unwrap_or_default();
         self.page_index = self
             .workspace
             .profile(&self.profile_id)
             .map(Profile::home_index)
             .unwrap_or(0);
         self.page_stack.clear();
+    }
+
+    /// Connect the keyboard lighting thread, and tell it what the profile
+    /// showing asks for.
+    pub fn attach_lighting(&mut self, lighting: crate::lighting::LightingHandle) {
+        self.lighting = Some(lighting);
+        self.send_lighting();
+    }
+
+    /// Tell the lighting thread what the profile showing asks of the
+    /// keyboard: `None` leaves it alone. Every profile switch and reload
+    /// comes through `enter_profile`, which calls this; the thread ignores
+    /// lighting it already shows.
+    fn send_lighting(&self) {
+        let Some(handle) = &self.lighting else {
+            return;
+        };
+        let mut out = Diagnostics::new();
+        let lighting = self
+            .workspace
+            .profile(&self.profile_id)
+            .and_then(|profile| self.workspace.lighting_for(profile, &mut out));
+        for diagnostic in out.iter() {
+            log::warn!("{}: {}", diagnostic.path, diagnostic.message);
+        }
+        handle.set(lighting);
+    }
+
+    /// Draw lighting that is not saved, against `theme`'s palette, or the
+    /// profile showing's when there is no `theme`.
+    fn preview_lighting(
+        &self,
+        text: &str,
+        theme: Option<&str>,
+        seconds: Option<f32>,
+        fps: Option<u8>,
+        presses: &[galdeck_ipc::LightPress],
+    ) -> Response {
+        let mut out = Diagnostics::new();
+        let palette = match theme {
+            Some(id) => self.workspace.theme_for(Some(id), &mut out).1,
+            None => self.palette.clone(),
+        };
+        let mut preview = crate::lighting::editor::preview(text, &palette, seconds, fps, presses);
+        preview.diagnostics.splice(0..0, out.iter().cloned());
+        Response::LightingPreview(Box::new(preview))
     }
 
     pub fn run(&mut self) {
@@ -1584,12 +2072,18 @@ impl Engine {
             while let Ok(report) = self.report_rx.try_recv() {
                 self.on_control_report(report);
             }
+            while let Ok(report) = self.state_rx.try_recv() {
+                self.on_state_report(report);
+            }
+            while let Ok((reload, themes)) = self.icons_rx.try_recv() {
+                self.on_icons(reload, themes);
+            }
             // Non-blocking; a plugin that has exited can then be started again
             // the next time one of its keys appears.
             self.plugin_host.reap();
             self.service_control();
-            if std::mem::take(&mut self.screen_dirty) {
-                self.paint_lcd();
+            if self.screen_dirty {
+                self.paint_screen_when_due();
             }
 
             // Publish before sleeping: the io thread sizes its poll from this,
@@ -1642,6 +2136,13 @@ impl Engine {
             TimerKind::CountdownDue => self.finish_countdowns(),
             TimerKind::CountdownFlash => self.flash_timers(),
             TimerKind::LevelPoll => self.poll_levels(),
+            TimerKind::StateStatus { key } => self.poll_state(key),
+            TimerKind::KeyStates => self.key_states_due(),
+            TimerKind::PressFrame { key } => self.advance_press(key),
+            TimerKind::AlarmFrame => self.advance_alarms(),
+            // Nothing to do here: the loop paints a dirty screen once its
+            // turn has come, and this only wakes it for that.
+            TimerKind::ScreenFrame => {}
         }
     }
 
@@ -1735,18 +2236,39 @@ impl Engine {
             }
             return;
         }
-        // Blocking kinds answer through the channel instead of returning here.
-        if let Some(reading) = self
-            .widget_host
-            .sample(slot, self.widget_generation, &widget)
-        {
-            self.on_widget_sample(Sample {
-                slot,
-                generation: self.widget_generation,
-                reading: Some(reading),
-            });
-        }
         let now = self.clock.now();
+        // An animated view is drawn on every tick but read at its own pace:
+        // tubes glowing over a CPU reading must not read the CPU ten times a
+        // second, let alone run a command. Between readings a tick is only
+        // the next frame.
+        let read_every = Duration::from_millis(u64::from(widget.sample_interval_ms()));
+        let read_recently = widget.sample_interval_ms() > widget.interval_ms()
+            && self
+                .widget_state
+                .get(&slot)
+                .and_then(|state| state.sampled_at)
+                .is_some_and(|at| now.duration_since(at) < read_every);
+        if read_recently {
+            match slot {
+                Slot::Key(key) => self.repaint_key(key),
+                Slot::Tile(_) => self.screen_dirty = true,
+            }
+        } else {
+            if let Some(state) = self.widget_state.get_mut(&slot) {
+                state.sampled_at = Some(now);
+            }
+            // Blocking kinds answer through the channel instead of returning here.
+            if let Some(reading) = self
+                .widget_host
+                .sample(slot, self.widget_generation, &widget)
+            {
+                self.on_widget_sample(Sample {
+                    slot,
+                    generation: self.widget_generation,
+                    reading: Some(reading),
+                });
+            }
+        }
         let interval = Duration::from_millis(u64::from(widget.interval_ms()));
         self.scheduler
             .after(now, interval, TimerKind::WidgetTick { slot });
@@ -1909,6 +2431,8 @@ impl Engine {
             Slot::Key(key) => self.repaint_key(key),
             Slot::Tile(_) => self.screen_dirty = true,
         }
+        // It may just have crossed a threshold.
+        self.watch_alarms();
     }
 
     /// Re-render one key, without touching the rest of the page.
@@ -1948,21 +2472,67 @@ impl Engine {
     /// spanning the keys is not full of black holes.
     fn key_picture(&self, index: u8, size: (u32, u32)) -> Option<(galdeck::Canvas, Rgb)> {
         let behind = self.backdrop_key(index, size);
-        let Some(cfg) = self.key_config(index).cloned() else {
+        let Some(cfg) = self.shown_key(index) else {
             return behind.map(|canvas| (canvas, Rgb::BLACK));
         };
+        let overlay = self.key_overlay(&cfg);
+        Some(self.look_picture(&cfg, size, behind, overlay))
+    }
+
+    /// Draw `cfg`, a key as it looks, over its slice of the background if
+    /// there is one, with `overlay` laid over it.
+    fn look_picture(
+        &self,
+        cfg: &KeyConfig,
+        size: (u32, u32),
+        behind: Option<galdeck::Canvas>,
+        overlay: Option<Overlay>,
+    ) -> (galdeck::Canvas, Rgb) {
+        let index = cfg.key;
         let mut style = self.style_for(Some(&cfg.style), &format!("keys[{index}].style"));
-        let plugin = self.plugin_color[index as usize];
+        let plugin = self.plugin_color.get(index as usize).copied().flatten();
         if let Some(color) = plugin {
             style.key_bg = color;
         }
         // A key that asks for a colour of its own gets it, background or
         // not; the theme's key colour gives way to a background.
         let base = match behind {
-            Some(canvas) if !Self::has_own_background(&cfg) && plugin.is_none() => canvas,
+            Some(canvas) if !Self::has_own_background(cfg) && plugin.is_none() => canvas,
             _ => galdeck::Canvas::filled(size.0, size.1, style.key_bg),
         };
-        Some((self.key_canvas(&cfg, &style, base), style.key_bg))
+        (self.key_canvas(cfg, &style, base, overlay), style.key_bg)
+    }
+
+    /// Key `key` of the page showing as it looks now: in the state it shows,
+    /// if it has states, and otherwise as configured.
+    fn shown_key(&self, key: u8) -> Option<KeyConfig> {
+        self.key_config(key).map(|cfg| self.look_of(cfg))
+    }
+
+    /// `cfg`, a key of the page showing, as it looks now. A key with states
+    /// shows the one it is in, or its own look while it does not know which
+    /// that is; either way the look has no states of its own, so is drawn as
+    /// any other key is.
+    fn look_of(&self, cfg: &KeyConfig) -> KeyConfig {
+        if cfg.states.is_empty() {
+            return cfg.clone();
+        }
+        let shown = self
+            .home_of(cfg.key)
+            .and_then(|home| self.shown_state(&home, cfg));
+        match shown {
+            Some(state) => cfg.in_state(&state),
+            None => own_look(cfg),
+        }
+    }
+
+    /// The state the key at `home`, `cfg`, shows: what it last moved to or
+    /// was read as, else, for a key with no way to read it, its first.
+    fn shown_state(&self, home: &KeyHome, cfg: &KeyConfig) -> Option<String> {
+        match self.key_states.get(home) {
+            Some(cycle) => cycle.shown.clone().or_else(|| KeyCycle::new(cfg).shown),
+            None => KeyCycle::new(cfg).shown,
+        }
     }
 
     fn has_own_background(cfg: &KeyConfig) -> bool {
@@ -1976,6 +2546,7 @@ impl Engine {
         cfg: &KeyConfig,
         style: &ResolvedStyle,
         mut canvas: galdeck::Canvas,
+        overlay: Option<Overlay>,
     ) -> galdeck::Canvas {
         let (width, height) = (canvas.width(), canvas.height());
         let area = draw::Area::new(0, 0, width, height);
@@ -1987,7 +2558,6 @@ impl Engine {
         };
         // Over whatever the key sits on, the widget's own background
         // included, and under its text, which is mixed against the result.
-        let overlay = self.key_overlay(cfg);
         if let Some(overlay) = &overlay {
             draw::blend_round_rect(&mut canvas, area, 0, overlay.color, overlay.share);
             surface = surface.lerp(overlay.color, overlay.share);
@@ -2028,10 +2598,12 @@ impl Engine {
                 if let Some(alarm) = self.alarm_color(Slot::Key(cfg.key)) {
                     style.key_label_color = alarm;
                 }
-                render::key_over(
+                let size = (canvas.width(), canvas.height());
+                let icon = self.key_icon(cfg, &style, size, label.is_some());
+                render::key_over_with_icon(
                     canvas,
                     &style,
-                    cfg.icon.as_deref(),
+                    icon.as_deref(),
                     label.as_deref(),
                     self.font.as_ref(),
                 )
@@ -2084,16 +2656,36 @@ impl Engine {
         );
     }
 
-    /// What a key's state lays over it, in order of what matters most: a
-    /// finished timer, then a live microphone, then a muted device.
+    /// What a key's state lays over it. One thing at a time, the one that
+    /// matters most:
     ///
-    /// Only from what the sound server reported, never from a guess. A key
-    /// saying "muted" is a claim about the microphone, and until a report
-    /// says so the key says nothing.
+    /// 0. the theme's answer to a press, while it fades -- the direct answer
+    ///    to what a finger just did, and over in a moment, after which what
+    ///    it covered shows again;
+    /// 1. a finished timer, which is waiting for someone;
+    /// 2. a live microphone, then a muted device -- only from what the sound
+    ///    server reported, never from a guess: a key saying "muted" is a
+    ///    claim about the microphone, and until a report says so the key
+    ///    says nothing;
+    /// 3. what a key with states says about its own: that its command just
+    ///    failed, then that it is still running, then that the state could
+    ///    not be read -- the order [`KeyCycle::badge`] picks in.
+    ///
+    /// A key with states has no timer and taps no mute, so the last never
+    /// meets the first two in a config without errors. A new kind of overlay
+    /// goes into this list where it ranks, as a step of its own below. While
+    /// any shows, the key's animation waits underneath it.
     fn key_overlay(&self, cfg: &KeyConfig) -> Option<Overlay> {
         let now = self.clock.now();
+        if let Some(share) = self.press_share(cfg.key, now) {
+            return Some(Overlay {
+                color: self.press_color(),
+                share,
+                glyph: None,
+            });
+        }
         let alarm = self
-            .countdown_key(cfg.key)
+            .home_of(cfg.key)
             .and_then(|which| self.countdowns.get(&which))
             .and_then(|countdown| alarm_share(countdown, now));
         if let Some(share) = alarm {
@@ -2103,6 +2695,15 @@ impl Engine {
                 glyph: None,
             });
         }
+        if let Some(overlay) = self.device_overlay(cfg) {
+            return Some(overlay);
+        }
+        self.state_badge(cfg.key, now)
+    }
+
+    /// What a mute or push-to-talk key lays over itself: a live microphone
+    /// tinted amber, a muted device red and struck through.
+    fn device_overlay(&self, cfg: &KeyConfig) -> Option<Overlay> {
         let state = state_key(cfg)?;
         let level = self.levels.get(&state.target())?;
         match state {
@@ -2123,6 +2724,32 @@ impl Engine {
         }
     }
 
+    /// What key `key` of the page showing says about its state, if it has
+    /// states: a red tint and a warning in its corner for a moment after its
+    /// command failed, a bar along its bottom while one runs, a "?" while
+    /// its state could not be read.
+    fn state_badge(&self, key: u8, now: Tick) -> Option<Overlay> {
+        let home = self.home_of(key)?;
+        let badge = self.key_states.get(&home)?.badge(now)?;
+        Some(match badge {
+            crate::states::Badge::Failed => Overlay {
+                color: self.token_color("@critical", CRITICAL),
+                share: FAILED_SHARE,
+                glyph: Some(draw::Glyph::Warning),
+            },
+            crate::states::Badge::Pending => Overlay {
+                color: Rgb::BLACK,
+                share: 0.0,
+                glyph: Some(draw::Glyph::Pending),
+            },
+            crate::states::Badge::Unknown => Overlay {
+                color: Rgb::BLACK,
+                share: 0.0,
+                glyph: Some(draw::Glyph::Unknown),
+            },
+        })
+    }
+
     /// Lay a widget's own background -- a colour, a picture, or both -- over
     /// `area`, and say what colour it now sits on, for mixing its text.
     ///
@@ -2139,12 +2766,15 @@ impl Engine {
         radius: u32,
         path: &str,
     ) -> Option<Rgb> {
+        // Its own, or its look's: a theme may give every widget a card.
         let own = widget
-            .background
-            .as_ref()
+            .background()
             .and_then(|color| self.palette.resolve(color, path, &mut Diagnostics::new()));
         let color = own.or(default);
-        let opacity = widget.opacity.map_or(default_opacity, |_| widget.opacity());
+        let opacity = widget
+            .opacity
+            .or(widget.look.opacity)
+            .map_or(default_opacity, |_| widget.opacity());
         if let Some(color) = color {
             draw::blend_round_rect(canvas, area, radius, color, opacity);
         }
@@ -2198,17 +2828,19 @@ impl Engine {
         slot: Option<Slot>,
     ) -> draw::Colors {
         let mut accent = widget
-            .color
-            .as_ref()
+            .color()
             .and_then(|color| self.palette.resolve(color, path, &mut Diagnostics::new()))
             .unwrap_or(foreground);
         let mut foreground = foreground;
         // Past a threshold, what shows the reading turns amber or red: the
         // fill of a graph, bar or dial, or the text itself.
         if let Some(alarm) = slot.and_then(|slot| self.alarm_color(slot)) {
-            accent = alarm;
+            // All the way there, unless the theme says alarms move: then
+            // between its usual colours and the alarm's, as they do.
+            let share = self.alarm_pulse().unwrap_or(1.0);
+            accent = accent.lerp(alarm, share);
             if !widget.is_graphic() {
-                foreground = alarm;
+                foreground = foreground.lerp(alarm, share);
             }
         }
         draw::Colors {
@@ -2276,8 +2908,8 @@ impl Engine {
         // key's state lays over it; while that is up, the key shows it and
         // the animation waits underneath.
         let covered = self
-            .key_config(key)
-            .is_some_and(|cfg| self.key_overlay(cfg).is_some());
+            .shown_key(key)
+            .is_some_and(|cfg| self.key_overlay(&cfg).is_some());
         if !covered {
             self.preview.set_key(key, Some(Arc::clone(&frame)));
             // Resolved per frame rather than captured when the animation was
@@ -2295,13 +2927,19 @@ impl Engine {
     }
 
     fn advance_ring_animation(&mut self, encoder: u8) {
-        let Some(animation) = self.ring_animations[encoder as usize].as_mut() else {
+        let Some(animation) = self.ring_animations[encoder as usize].as_ref() else {
             return;
         };
-        let colors = animation.frame();
-        let count = animation.animation.frames();
-        animation.next = (animation.next + 1) % count;
-        let interval = animation.interval;
+        let now = self.clock.now();
+        let colors = animation.frame(now);
+        // A knob being turned writes LEDs of its own; see
+        // `ANIMATION_FRAME_BUSY`. Timed from the start as ever, so the
+        // animation is where it should be when it speeds up again.
+        let next = if self.rings.iter().any(RingFeedback::is_active) {
+            now.saturating_add(crate::ring::ANIMATION_FRAME_BUSY)
+        } else {
+            animation.next_frame(now)
+        };
 
         // Turn and click feedback wins: an animation must not hide what the
         // knob is doing. The rest colour it returns to is the animation's, so
@@ -2311,9 +2949,7 @@ impl Engine {
             self.preview.set_ring(encoder, colors);
             self.send(Paint::Ring { encoder, colors });
         }
-        let now = self.clock.now();
-        self.scheduler
-            .after(now, interval, TimerKind::RingFrame { encoder });
+        self.scheduler.at(next, TimerKind::RingFrame { encoder });
     }
 
     /// Schedule the widgets on this page, and forget the ones that left.
@@ -2349,8 +2985,10 @@ impl Engine {
     ///
     /// Done once, here, rather than per frame. The cost is real -- eight
     /// frames is eight JPEG encodes -- but it is paid on a page switch instead
-    /// of thirty times a second forever.
-    fn build_animations(&mut self, page: &galdeck_model::v2::Page) {
+    /// of thirty times a second forever. A key with states has only the
+    /// state it shows animated; another state's frames are drawn when the
+    /// key moves to it.
+    fn build_animations(&mut self) {
         for encoder in Encoders::indices() {
             self.scheduler.cancel_kind(TimerKind::RingFrame { encoder });
             self.ring_animations[encoder as usize] = None;
@@ -2362,61 +3000,21 @@ impl Engine {
 
         let now = self.clock.now();
         let mut encoded_frames = 0usize;
-
-        for cfg in &page.keys {
-            let Some(animation) = &cfg.animation else {
-                continue;
-            };
-            if animation.kind.is_ring_only() || cfg.key >= Buttons::COUNT {
-                continue;
-            }
-            let style = self.style_for(Some(&cfg.style), "key");
-            let to = animation
-                .to
-                .as_ref()
-                .and_then(|color| {
-                    self.palette
-                        .resolve(color, "animation.to", &mut Diagnostics::new())
-                })
-                .unwrap_or(Rgb::WHITE);
-
-            let count = animation.frames();
-            let mut frames = Vec::with_capacity(count as usize);
-            for index in 0..count {
-                let mut frame_style = style;
-                frame_style.key_bg = animation.color_for_frame(index, style.key_bg, to);
-                let canvas = render::key(
-                    self.key_placement(cfg.key).size(),
-                    &frame_style,
-                    cfg.icon.as_deref(),
-                    cfg.label.as_deref(),
-                    self.font.as_ref(),
-                );
-                match canvas.to_jpeg(galdeck::ids::DEFAULT_JPEG_QUALITY) {
-                    Ok(jpeg) => frames.push(Arc::from(jpeg)),
-                    Err(e) => {
-                        log::warn!("encoding a frame for key {} failed: {e}", cfg.key);
-                        break;
-                    }
-                }
-            }
-            if frames.len() < 2 {
-                continue;
-            }
-            encoded_frames += frames.len();
-            let interval = Duration::from_millis(u64::from(animation.frame_interval_ms()));
-            self.key_animations[cfg.key as usize] = Some(KeyAnimation {
-                frames,
-                interval,
-                next: 0,
-            });
-            self.scheduler
-                .after(now, interval, TimerKind::KeyFrame { key: cfg.key });
+        for key in Buttons::indices() {
+            encoded_frames += self.build_key_animation(key, MAX_PAGE_FRAMES - encoded_frames);
         }
 
         for encoder in Encoders::indices() {
             let plan = self.encoder_plan(encoder);
-            let Some(animation) = &plan.animation else {
+            // The knob's own, else the theme's for rings at rest -- but never
+            // over a ring that has something to say: a level, a position, or
+            // the colour that is the only sign of which mode a knob is in.
+            let animation = plan.animation.clone().or_else(|| {
+                (plan.ring().is_none() && plan.modes.is_none())
+                    .then(|| self.motion.rings.clone())
+                    .flatten()
+            });
+            let Some(animation) = &animation else {
                 continue;
             };
             let cfg = EncoderConfig {
@@ -2432,13 +3030,13 @@ impl Engine {
                         .resolve(color, "animation.to", &mut Diagnostics::new())
                 })
                 .unwrap_or(Rgb::WHITE);
-            let interval = Duration::from_millis(u64::from(animation.frame_interval_ms()));
+            let interval = crate::ring::animation_interval(animation);
             self.ring_animations[cfg.encoder as usize] = Some(RingAnimation {
                 animation: animation.clone(),
                 base: style.ring,
                 to,
                 interval,
-                next: 0,
+                start: now,
             });
             self.scheduler.after(
                 now,
@@ -2454,6 +3052,123 @@ impl Engine {
                 "this page pre-renders {encoded_frames} animation frames; page switches will be slow"
             );
         }
+    }
+
+    /// Render and encode every frame of key `key`'s animation, as the key
+    /// looks now, and start it, replacing any it had. At most `room` frames:
+    /// an animation that needs more is left out, and the key stays still.
+    /// Returns how many frames it took.
+    fn build_key_animation(&mut self, key: u8, room: usize) -> usize {
+        // Only the deck's own keys are drawn, however many a page names.
+        if key >= Buttons::COUNT {
+            return 0;
+        }
+        self.scheduler.cancel_kind(TimerKind::KeyFrame { key });
+        self.key_animations[key as usize] = None;
+        let Some(cfg) = self.shown_key(key) else {
+            return 0;
+        };
+        let Some(animation) = &cfg.animation else {
+            return 0;
+        };
+        if animation.kind.is_ring_only() {
+            return 0;
+        }
+        let count = animation.frames();
+        if usize::from(count) > room {
+            log::warn!(
+                "key {key}'s animation would take this page past {MAX_PAGE_FRAMES} \
+                 pre-rendered frames; it is left still"
+            );
+            return 0;
+        }
+        let style = self.style_for(Some(&cfg.style), "key");
+        let to = animation
+            .to
+            .as_ref()
+            .and_then(|color| {
+                self.palette
+                    .resolve(color, "animation.to", &mut Diagnostics::new())
+            })
+            .unwrap_or(Rgb::WHITE);
+
+        let size = self.key_placement(key).size();
+        let label = cfg.label.as_deref();
+        // Drawn once for every frame: only the background moves.
+        let icon = self.key_icon(&cfg, &style, size, label.is_some());
+        let mut frames = Vec::with_capacity(count as usize);
+        for index in 0..count {
+            let mut frame_style = style;
+            frame_style.key_bg = animation.color_for_frame(index, style.key_bg, to);
+            let canvas = render::key_with_icon(
+                size,
+                &frame_style,
+                icon.as_deref(),
+                label,
+                self.font.as_ref(),
+            );
+            match canvas.to_jpeg(galdeck::ids::DEFAULT_JPEG_QUALITY) {
+                Ok(jpeg) => frames.push(Arc::from(jpeg)),
+                Err(e) => {
+                    log::warn!("encoding a frame for key {key} failed: {e}");
+                    break;
+                }
+            }
+        }
+        if frames.len() < 2 {
+            return 0;
+        }
+        let taken = frames.len();
+        let interval = Duration::from_millis(u64::from(animation.frame_interval_ms()));
+        self.key_animations[key as usize] = Some(KeyAnimation {
+            frames,
+            interval,
+            next: 0,
+        });
+        let now = self.clock.now();
+        self.scheduler
+            .after(now, interval, TimerKind::KeyFrame { key });
+        taken
+    }
+
+    /// Draw key `key`'s animation again, as it looks now: it has moved to
+    /// another state, or its icon has been found. In the room the rest of
+    /// the page's animations leave.
+    fn rebuild_key_animation(&mut self, key: u8) {
+        let others: usize = self
+            .key_animations
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| *index != usize::from(key))
+            .filter_map(|(_, animation)| animation.as_ref())
+            .map(|animation| animation.frames.len())
+            .sum();
+        self.build_key_animation(key, MAX_PAGE_FRAMES.saturating_sub(others));
+    }
+
+    /// Key `cfg`'s icon, drawn to fit it: a file it names, or a name looked
+    /// up in the icon themes, recoloured with the label's colour when it is
+    /// a symbolic one. `None` for no icon, or one that cannot be found or
+    /// drawn -- said once, in the log -- when the key shows its label alone.
+    fn key_icon(
+        &self,
+        cfg: &KeyConfig,
+        style: &ResolvedStyle,
+        size: (u32, u32),
+        labelled: bool,
+    ) -> Option<Arc<image::RgbaImage>> {
+        use crate::icons::Origin;
+        let icon_box = render::icon_box(size, style, labelled);
+        let (path, origin) = match cfg.icon.as_ref()? {
+            galdeck_model::IconRef::Path(path) => (crate::icons::expand_home(path), Origin::File),
+            galdeck_model::IconRef::Name(name) => (
+                self.icons.as_ref()?.themes.resolve(name, icon_box)?,
+                Origin::Theme,
+            ),
+        };
+        self.icon_cache
+            .borrow_mut()
+            .get(&path, origin, icon_box, style.key_label_color)
     }
 
     fn on_device(&mut self, msg: DeviceMsg) {
@@ -2473,8 +3188,14 @@ impl Engine {
             DeviceMsg::Disconnected => {
                 self.device = DeviceStatus::default();
                 self.end_talk();
+                // Nothing shows them now. The page reads them again when it
+                // is painted on the deck's return.
+                self.stop_state_reads();
                 // The release will never come.
                 self.forget_knobs();
+                // Nor would a press answered before the unplug look like one
+                // when the deck comes back.
+                self.forget_presses();
                 self.preview.publish(galdeck_ipc::Event::DeviceDisconnected);
                 // The handle is gone, which is exactly what a release was
                 // waiting to hear. Answered here whether the device was
@@ -2556,6 +3277,9 @@ impl Engine {
         if !self.device.connected {
             return;
         }
+        // A press still fading belonged to whatever key was at its position.
+        // Forgotten before the keys are drawn, or one would keep its flash.
+        self.forget_presses();
         self.send(Paint::Brightness(self.brightness));
         self.preview.set_brightness(self.brightness);
 
@@ -2597,10 +3321,40 @@ impl Engine {
         for key in Buttons::indices() {
             self.scheduler.cancel_kind(TimerKind::Gesture { key });
         }
-        self.build_animations(&page);
+        self.build_animations();
         self.start_widgets(&page);
+        self.start_state_reads(&page);
         self.update_plugin_visibility(&page);
         self.paint_lcd();
+    }
+
+    /// Paint the marked screen if its turn has come, or else leave it marked
+    /// and make sure the loop comes back when it has. The mark is cleared
+    /// only by painting, so whatever was asked for last is what ends up
+    /// shown.
+    fn paint_screen_when_due(&mut self) {
+        let paced_by_background = self.scene.as_ref().is_some_and(|scene| {
+            scene.is_animated()
+                && scene.span().covers_lcd()
+                && scene.interval() <= SCREEN_RIDES_BACKGROUND
+        });
+        let due = match self.screen_painted {
+            None => true,
+            // The background's next frame is close, and takes this with it.
+            Some((_, frame)) if paced_by_background => frame != self.scene_tick,
+            Some((at, _)) => {
+                let due = at.saturating_add(SCREEN_FRAME_MIN);
+                let now = self.clock.now();
+                if now < due && !self.scheduler.contains_kind(TimerKind::ScreenFrame) {
+                    self.scheduler.at(due, TimerKind::ScreenFrame);
+                }
+                now >= due
+            }
+        };
+        if due {
+            self.screen_dirty = false;
+            self.paint_lcd();
+        }
     }
 
     /// Draw the info screen: its tiles if the page lays any out, otherwise
@@ -2618,8 +3372,8 @@ impl Engine {
             return;
         };
         let style = self.style_for(None, "lcd.style");
-        let (width, height) = galdeck::Lcd::size();
-        let size = (u32::from(width), u32::from(height));
+        let placement = ScreenPlacement::from_calibration(&self.calibration);
+        let size = placement.size();
         let behind = self.backdrop_lcd(size);
         let over_picture = behind.is_some();
         let base = behind.unwrap_or_else(|| galdeck::Canvas::filled(size.0, size.1, style.lcd_bg));
@@ -2642,8 +3396,9 @@ impl Engine {
                 if !tile.fits(grid) {
                     continue;
                 }
-                let area = tile_area(tile.cells(grid), grid);
+                let area = tile_area(tile.cells(grid), grid, size);
                 let path = format!("lcd[{index}].widget");
+                let radius = tile_radius(&tile.widget, area);
                 let surface = self
                     .widget_backing(
                         &mut canvas,
@@ -2651,7 +3406,7 @@ impl Engine {
                         &tile.widget,
                         Some(card),
                         card_opacity,
-                        TILE_RADIUS,
+                        radius,
                         &path,
                     )
                     .unwrap_or(card);
@@ -2671,7 +3426,7 @@ impl Engine {
                     self.font.as_ref(),
                     tile.widget.placeholder.as_deref(),
                 );
-                draw::restore_corners(&mut canvas, area, TILE_RADIUS, &base);
+                draw::restore_corners(&mut canvas, area, radius, &base);
             }
             canvas
         };
@@ -2688,14 +3443,43 @@ impl Engine {
                 self.font.as_ref(),
             );
         }
-        match screen.to_jpeg(galdeck::ids::DEFAULT_JPEG_QUALITY) {
-            Ok(jpeg) => {
-                let jpeg: Arc<[u8]> = jpeg.into();
-                self.preview.set_lcd(Arc::clone(&jpeg));
-                self.send(Paint::Lcd { jpeg });
+        let jpeg = match screen.to_jpeg(galdeck::ids::DEFAULT_JPEG_QUALITY) {
+            Ok(jpeg) => Arc::<[u8]>::from(jpeg),
+            Err(e) => {
+                log::warn!("encoding the lcd failed: {e}");
+                return;
             }
-            Err(e) => log::warn!("encoding the lcd failed: {e}"),
-        }
+        };
+        // The preview is the screen as it is seen, not the rounded frame.
+        self.preview.set_lcd(Arc::clone(&jpeg));
+        let (jpeg, at) = match placement {
+            ScreenPlacement::Firmware => (jpeg, None),
+            ScreenPlacement::Measured { visible, frame } if visible == frame => (jpeg, Some(frame)),
+            // A second encode, but only on a screen whose edges are not whole
+            // blocks. The rows it adds are under the bezel, so the plain
+            // background is all they need.
+            ScreenPlacement::Measured { visible, frame } => {
+                let mut padded = galdeck::Canvas::filled(
+                    u32::from(frame.width),
+                    u32::from(frame.height),
+                    style.lcd_bg,
+                );
+                padded.blit(
+                    &screen,
+                    i32::from(visible.x) - i32::from(frame.x),
+                    i32::from(visible.y) - i32::from(frame.y),
+                );
+                match padded.to_jpeg(galdeck::ids::DEFAULT_JPEG_QUALITY) {
+                    Ok(padded) => (padded.into(), Some(frame)),
+                    Err(e) => {
+                        log::warn!("encoding the lcd failed: {e}");
+                        return;
+                    }
+                }
+            }
+        };
+        self.screen_painted = Some((self.clock.now(), self.scene_tick));
+        self.send(Paint::Lcd { jpeg, at });
     }
 
     /// Where the screen and each key's image sit on the panel.
@@ -2705,7 +3489,10 @@ impl Engine {
     /// that is continuous to within a few pixels is better than none.
     fn backdrop_geometry(&self) -> crate::backdrop::Geometry {
         use crate::backdrop::Rect;
-        let screen = self.calibration.screen;
+        let screen = match ScreenPlacement::from_calibration(&self.calibration) {
+            ScreenPlacement::Measured { visible, .. } => visible,
+            ScreenPlacement::Firmware => self.calibration.screen,
+        };
         let keys = Buttons::indices()
             .map(|index| match self.key_placement(index) {
                 KeyPlacement::Zone {
@@ -2800,53 +3587,8 @@ impl Engine {
     /// The colours an animated background is drawn in: the configured ones,
     /// else a set taken from the theme so it matches without being asked.
     fn backdrop_colors(&self, backdrop: &galdeck_model::Backdrop) -> Vec<Rgb> {
-        let resolve = |color: &galdeck_model::ColorRef| {
-            self.palette
-                .resolve(color, "background.colors", &mut Diagnostics::new())
-        };
-        let mut colors: Vec<Rgb> = backdrop.colors.iter().take(4).filter_map(resolve).collect();
-        // Some animations are their colours: fire in a theme's blues does not
-        // read as fire. Those default to their own; the rest to the theme's.
-        if colors.len() < 2 {
-            let own = match backdrop.animation {
-                Some(galdeck_model::Motion::Fire) => Some(vec![
-                    Rgb::new(255, 236, 150),
-                    Rgb::new(255, 150, 40),
-                    Rgb::new(200, 50, 20),
-                    Rgb::new(70, 12, 8),
-                    Rgb::new(10, 4, 4),
-                ]),
-                Some(galdeck_model::Motion::Rain) => Some(vec![
-                    Rgb::new(70, 255, 120),
-                    Rgb::new(30, 180, 80),
-                    Rgb::new(2, 10, 5),
-                ]),
-                Some(galdeck_model::Motion::Starfield) => Some(vec![
-                    Rgb::new(220, 230, 255),
-                    Rgb::new(180, 200, 255),
-                    Rgb::new(255, 220, 190),
-                    Rgb::new(4, 6, 14),
-                ]),
-                _ => None,
-            };
-            if let Some(own) = own {
-                return own;
-            }
-        }
-        if colors.len() < 2 {
-            let accent = galdeck_model::ColorRef::parse("@accent")
-                .ok()
-                .and_then(|token| resolve(&token))
-                .unwrap_or(Rgb::new(136, 192, 208));
-            let style = self.style_for(None, "background");
-            colors = vec![
-                accent,
-                Rgb::new(180, 142, 173),
-                Rgb::new(94, 129, 172),
-                style.lcd_bg,
-            ];
-        }
-        colors
+        let lcd_bg = self.style_for(None, "background").lcd_bg;
+        crate::backdrop::colors_for(backdrop, &self.palette, lcd_bg)
     }
 
     /// Show the next frame of the background on everything it covers.
@@ -2882,8 +3624,8 @@ impl Engine {
         {
             return false;
         }
-        self.key_config(index)
-            .is_none_or(|cfg| !Self::has_own_background(cfg))
+        self.shown_key(index)
+            .is_none_or(|cfg| !Self::has_own_background(&cfg))
     }
 
     fn backdrop_key(&self, index: u8, size: (u32, u32)) -> Option<galdeck::Canvas> {
@@ -2909,7 +3651,7 @@ impl Engine {
             .into_iter()
             .map(|(key, value)| (key, toml_value(value)))
             .collect();
-        let widget: galdeck_model::Widget = match toml::Value::Table(table).try_into() {
+        let mut widget: galdeck_model::Widget = match toml::Value::Table(table).try_into() {
             Ok(widget) => widget,
             Err(e) => {
                 return Response::Error {
@@ -2917,6 +3659,12 @@ impl Engine {
                 }
             }
         };
+        // In this page's look, as it would be if it were placed here.
+        if let Some(profile) = self.current_profile() {
+            widget.look = self
+                .workspace
+                .widget_look(profile, self.current_page(), widget.kind);
+        }
         let state = crate::widgets::demo::state(&widget);
         let style = self.style_for(None, "preview");
         let area = draw::Area::new(0, 0, width, height);
@@ -2930,7 +3678,11 @@ impl Engine {
         };
         let mut canvas = galdeck::Canvas::filled(width, height, background);
         let card = (!on_key).then(|| style.lcd_bg.lerp(style.lcd_text_color, 0.08));
-        let radius = if on_key { 0 } else { TILE_RADIUS };
+        let radius = if on_key {
+            0
+        } else {
+            tile_radius(&widget, area)
+        };
         let surface = self
             .widget_backing(&mut canvas, area, &widget, card, 1.0, radius, "preview")
             .unwrap_or(background);
@@ -2949,7 +3701,13 @@ impl Engine {
             );
         } else {
             let text = state.reading.as_ref().and_then(|r| r.label());
-            canvas = render::key_over(canvas, &style, None, text.as_deref(), self.font.as_ref());
+            canvas = render::key_over_with_icon(
+                canvas,
+                &style,
+                None,
+                text.as_deref(),
+                self.font.as_ref(),
+            );
         }
         match canvas.to_jpeg(90) {
             Ok(jpeg) => Response::Image {
@@ -2968,73 +3726,11 @@ impl Engine {
                 message: "that is not base64".into(),
             };
         };
-        let format = match image::guess_format(&bytes) {
-            Ok(
-                format @ (image::ImageFormat::Png
-                | image::ImageFormat::Jpeg
-                | image::ImageFormat::Gif),
-            ) => format,
-            _ => {
-                return Response::Error {
-                    message: "only PNG, JPEG and GIF pictures can be used".into(),
-                }
-            }
-        };
-        let extension = format.extensions_str()[0];
-        // A plain name: letters, digits, dashes and underscores, whatever was
-        // sent. Nothing that could climb out of the directory or hide.
-        let stem: String = std::path::Path::new(name)
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("picture")
-            .chars()
-            .map(|c| {
-                if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
-                    c
-                } else {
-                    '-'
-                }
-            })
-            .take(64)
-            .collect();
-        let stem = stem.trim_matches('-');
-        let stem = if stem.is_empty() { "picture" } else { stem };
-        let dir = self.config_dir.join("assets");
-        if let Err(e) = std::fs::create_dir_all(&dir) {
-            return Response::Error {
-                message: format!("creating {}: {e}", dir.display()),
-            };
-        }
-        // Never overwrite: a picture another page uses would change under it.
-        // The same bytes again reuse the file already there.
-        for n in 0..1000 {
-            let file = if n == 0 {
-                format!("{stem}.{extension}")
-            } else {
-                format!("{stem}-{n}.{extension}")
-            };
-            let path = dir.join(file);
-            match std::fs::read(&path) {
-                Ok(existing) if existing == bytes => {
-                    return Response::Asset {
-                        path: path.display().to_string(),
-                    }
-                }
-                Ok(_) => continue,
-                Err(_) => {}
-            }
-            return match std::fs::write(&path, &bytes) {
-                Ok(()) => Response::Asset {
-                    path: path.display().to_string(),
-                },
-                Err(e) => Response::Error {
-                    message: format!("writing {}: {e}", path.display()),
-                },
-            };
-        }
-        Response::Error {
-            message: format!("too many pictures called {stem}"),
-        }
+        asset_response(crate::assets::store(
+            &crate::assets::dir(&self.config_dir),
+            name,
+            &bytes,
+        ))
     }
 
     // ------------------------------------------------------------ actions
@@ -3333,6 +4029,12 @@ impl Engine {
                     }
                 }
             }
+            // Anywhere but a key was turned away above.
+            BuiltIn::NextState | BuiltIn::PreviousState => {
+                if let From::Key(key) = from {
+                    self.step_state(key, invocation.action == BuiltIn::NextState);
+                }
+            }
             // Anywhere but a knob was turned away above.
             BuiltIn::NextMode => {
                 if let From::Knob(encoder) = from {
@@ -3503,45 +4205,73 @@ impl Engine {
 
     // ------------------------------------------------------------ timers
 
-    /// The timer on key `key` of the page showing, by name.
-    fn countdown_key(&self, key: u8) -> Option<CountdownKey> {
-        Some(CountdownKey {
+    /// Key `key` of the page showing, by name: where its timer and its
+    /// state are kept. `None` when no page is showing, or the page showing
+    /// has an id an earlier page of the profile has too.
+    fn home_of(&self, key: u8) -> Option<KeyHome> {
+        Some(KeyHome {
             profile: self.profile_id.clone(),
-            page: self.current_page()?.id.clone(),
+            page: self.home_page()?.to_string(),
             key,
         })
     }
 
+    /// The id of the page showing, unless an earlier page has it too.
+    ///
+    /// The model only warns of two pages with one id (W0103), and
+    /// `next_page` reaches the second by its place in the list. But what is
+    /// kept under a [`KeyHome`] is found again in the first page with its
+    /// id, as a switch by id finds it, so a key of the second must not name
+    /// its home by the same id: a tap on it would run the first page's
+    /// key's command. Its keys have no states or timers instead, and say so.
+    fn home_page(&self) -> Option<&str> {
+        let page = self.current_page()?;
+        let first = self.current_profile()?.page(&page.id)?;
+        std::ptr::eq(first, page).then_some(page.id.as_str())
+    }
+
+    /// Why a key of the page showing has no state or timer of its own: its
+    /// page has an earlier page's id. See [`Engine::home_page`].
+    fn shared_page_text(&self) -> String {
+        let id = self.current_page().map_or("", |page| page.id.as_str());
+        format!("Rename this page: an earlier page is also \"{id}\"")
+    }
+
     /// The countdown behind a key of the page showing: its own if it has
-    /// been started, else a fresh one at its start. `None` for a key with no
-    /// timer, or with a timer that has no length it can run.
+    /// been started, else a fresh one at its start -- as it always is on a
+    /// page with an earlier page's id, where it cannot be started. `None`
+    /// for a key with no timer, or with a timer that has no length it can
+    /// run.
     fn countdown_of(&self, cfg: &KeyConfig) -> Option<Countdown> {
         let length = countdown_length(cfg.widget.as_ref()).ok()?;
         let started = self
-            .countdown_key(cfg.key)
+            .home_of(cfg.key)
             .and_then(|which| self.countdowns.get(&which));
         Some(started.cloned().unwrap_or_else(|| Countdown::new(length)))
     }
 
-    /// Whether a timer's key is on the page showing.
-    fn is_showing(&self, which: &CountdownKey) -> bool {
-        which.profile == self.profile_id
-            && self
-                .current_page()
-                .is_some_and(|page| page.id == which.page)
+    /// Whether a key kept by name -- a timer's, or one with states -- is on
+    /// the page showing: not while a later page with the same id shows.
+    fn is_showing(&self, which: &KeyHome) -> bool {
+        which.profile == self.profile_id && self.home_page() == Some(which.page.as_str())
     }
 
     /// The timer on a key of the page showing, and its length; or, when it
     /// has none, say so and give nothing.
-    fn timer_at(&mut self, key: u8) -> Option<(CountdownKey, Option<Duration>)> {
+    fn timer_at(&mut self, key: u8) -> Option<(KeyHome, Option<Duration>)> {
         let length = countdown_length(self.key_config(key).and_then(|cfg| cfg.widget.as_ref()));
-        match (length, self.countdown_key(key)) {
+        match (length, self.home_of(key)) {
             (Ok(length), Some(which)) => Some((which, length)),
             (Err(why), _) => {
                 self.show_osd(why.into(), None);
                 None
             }
-            (Ok(_), None) => None,
+            // The key has a timer, so a page is showing: one with an
+            // earlier page's id.
+            (Ok(_), None) => {
+                self.show_osd(self.shared_page_text(), None);
+                None
+            }
         }
     }
 
@@ -3601,7 +4331,7 @@ impl Engine {
     /// Finish every timer that has run out, on any page.
     fn finish_countdowns(&mut self) {
         let now = self.clock.now();
-        let mut finished: Vec<CountdownKey> = self
+        let mut finished: Vec<KeyHome> = self
             .countdowns
             .iter_mut()
             .filter_map(|(which, countdown)| countdown.finish_if_due(now).then(|| which.clone()))
@@ -3615,8 +4345,8 @@ impl Engine {
 
     /// A timer has run out: say so, flash its key if it is showing, and do
     /// what it was set to do.
-    fn timer_done(&mut self, which: &CountdownKey) {
-        let Some(cfg) = countdown_home(&self.workspace, which).cloned() else {
+    fn timer_done(&mut self, which: &KeyHome) {
+        let Some(cfg) = key_at_home(&self.workspace, which).cloned() else {
             return;
         };
         let Some(widget) = cfg.widget.as_ref() else {
@@ -3659,7 +4389,7 @@ impl Engine {
     /// Show a timer's key as it is now, if its page is showing. Painted
     /// whether or not the time changed: pausing dims it, and finishing or
     /// resetting changes what lies over it.
-    fn show_countdown(&mut self, which: &CountdownKey) {
+    fn show_countdown(&mut self, which: &KeyHome) {
         if !self.is_showing(which) {
             return;
         }
@@ -3679,7 +4409,7 @@ impl Engine {
             .iter()
             .filter(|cfg| cfg.key < Buttons::COUNT)
             .filter(|cfg| {
-                self.countdown_key(cfg.key)
+                self.home_of(cfg.key)
                     .and_then(|which| self.countdowns.get(&which))
                     .is_some_and(|countdown| countdown.flashing(now))
             })
@@ -3727,10 +4457,587 @@ impl Engine {
     fn keep_countdowns(&mut self) {
         let workspace = &self.workspace;
         self.countdowns.retain(|which, countdown| {
-            let widget = countdown_home(workspace, which).and_then(|cfg| cfg.widget.as_ref());
+            let widget = key_at_home(workspace, which).and_then(|cfg| cfg.widget.as_ref());
             countdown_length(widget) == Ok(countdown.length())
         });
         self.arm_countdowns();
+    }
+
+    // ------------------------------------------------------------ states
+
+    /// What a key with states is showing, as far as anyone watching it can
+    /// tell: to see what a change changed.
+    fn state_seen(&self, home: &KeyHome) -> StateSeen {
+        let shown = key_at_home(&self.workspace, home).and_then(|cfg| self.shown_state(home, cfg));
+        let cycle = self.key_states.get(home);
+        StateSeen {
+            shown,
+            known: cycle.is_some_and(|cycle| cycle.known),
+            badge: cycle.and_then(|cycle| cycle.badge(self.clock.now())),
+        }
+    }
+
+    /// What is kept of the key at `home`, `cfg`, from now on if not before.
+    fn cycle_mut(&mut self, home: &KeyHome, cfg: &KeyConfig) -> &mut KeyCycle {
+        self.key_states
+            .entry(home.clone())
+            .or_insert_with(|| KeyCycle::new(cfg))
+    }
+
+    /// Show what has changed about the key at `home` since `before`: draw
+    /// it again if its page is showing -- its animation too, when it is in
+    /// another state -- and tell anyone watching when its state changed.
+    fn state_changed(&mut self, home: &KeyHome, before: StateSeen) {
+        let after = self.state_seen(home);
+        if after == before {
+            return;
+        }
+        if after.shown != before.shown || after.known != before.known {
+            self.preview.publish(galdeck_ipc::Event::KeyStateChanged {
+                profile: home.profile.clone(),
+                page: home.page.clone(),
+                key: home.key,
+                state: after.shown.clone(),
+                known: after.known,
+            });
+        }
+        if !self.is_showing(home) {
+            return;
+        }
+        if after.shown != before.shown {
+            self.rebuild_key_animation(home.key);
+        }
+        self.repaint_key(home.key);
+    }
+
+    /// A tap, or `next_state` or `previous_state`, on key `key` of the page
+    /// showing: on to its next state, going round, or back to the one
+    /// before.
+    fn step_state(&mut self, key: u8, forward: bool) {
+        let Some(cfg) = self.key_config(key).cloned() else {
+            return;
+        };
+        if cfg.states.is_empty() {
+            self.show_osd("No states on this key".into(), None);
+            return;
+        }
+        let Some(home) = self.home_of(key) else {
+            self.show_osd(self.shared_page_text(), None);
+            return;
+        };
+        let from = self.shown_state(&home, &cfg);
+        if let Some(to) = crate::states::neighbour(&cfg, from.as_deref(), forward) {
+            self.enter_state(&home, &cfg, to);
+        }
+    }
+
+    /// Move the key at `home`, `cfg`, to state `to` because someone asked:
+    /// show it at once and say so, then run what entering it runs -- or,
+    /// while the key's last command is still running, once that is done.
+    fn enter_state(&mut self, home: &KeyHome, cfg: &KeyConfig, to: String) {
+        let before = self.state_seen(home);
+        let start = self.cycle_mut(home, cfg).press(to.clone());
+        self.show_osd(crate::states::state_text(cfg, &to), None);
+        self.state_changed(home, before);
+        if start {
+            self.start_enter(home, &to);
+        }
+        self.arm_key_states();
+    }
+
+    /// Run what the key at `home` runs as it enters `state`.
+    ///
+    /// A shell command goes to the state runner, and the key waits for it.
+    /// Anything else is done here and counts as done at once: a keystroke or
+    /// a built-in has no exit status to wait for.
+    fn start_enter(&mut self, home: &KeyHome, state: &str) {
+        use crate::states::{Outcome, StateJob, StateKind};
+        let action = key_at_home(&self.workspace, home)
+            .and_then(|cfg| cfg.state(state))
+            .and_then(|state| state.exec.clone());
+        let now = self.clock.now();
+        self.state_seq += 1;
+        let seq = self.state_seq;
+        let Some(cycle) = self.key_states.get_mut(home) else {
+            return;
+        };
+        cycle.begin(seq, state.to_string(), now);
+        let done = Outcome::Exited {
+            code: 0,
+            stdout_first_line: None,
+            stderr_first_line: None,
+        };
+        let outcome = match action {
+            Some(galdeck_model::Action::Shell(command)) => {
+                log::info!("exec: {command}");
+                let job = StateJob {
+                    home: home.clone(),
+                    seq,
+                    kind: StateKind::Enter { command },
+                };
+                if self.state_runner.spawn(job) {
+                    self.arm_key_states();
+                    return;
+                }
+                // The runner still has a command for this key that the key
+                // itself has forgotten, as it does after a reload took the
+                // key's states away while one ran and another put them back.
+                Outcome::Failed("its last command is still running".into())
+            }
+            Some(action) => {
+                self.perform(&action, From::State(home.key), 1);
+                done
+            }
+            None => done,
+        };
+        self.on_entered(home, seq, &outcome);
+    }
+
+    /// What the key at `home` ran as it entered a state has finished, or
+    /// has been running long enough to count as launched.
+    fn on_entered(&mut self, home: &KeyHome, seq: u64, outcome: &crate::states::Outcome) {
+        use crate::states::{Entered, Outcome};
+        let Some(cfg) = key_at_home(&self.workspace, home)
+            .filter(|cfg| !cfg.states.is_empty())
+            .cloned()
+        else {
+            // It has lost its states since, and there is nothing to show.
+            self.key_states.remove(home);
+            return;
+        };
+        let succeeded = matches!(outcome, Outcome::Exited { code: 0, .. } | Outcome::Launched);
+        let before = self.state_seen(home);
+        let now = self.clock.now();
+        let Some(cycle) = self.key_states.get_mut(home) else {
+            return;
+        };
+        match cycle.entered(seq, succeeded, now) {
+            Entered::Stale => return,
+            Entered::Next(state) => {
+                self.state_changed(home, before);
+                self.start_enter(home, &state);
+            }
+            Entered::Settled => {
+                if cfg.status.is_some() {
+                    cycle.expect_reads(now);
+                }
+                if *outcome == Outcome::Launched {
+                    log::info!(
+                        "key {} on {}/{}: its command is still running, and is taken as done",
+                        home.key,
+                        home.profile,
+                        home.page
+                    );
+                }
+                self.state_changed(home, before);
+            }
+            Entered::Reverted => {
+                let text = crate::states::failure_text(&cfg, home.key, outcome);
+                log::warn!("key {} on {}/{}: {text}", home.key, home.profile, home.page);
+                self.show_osd(text, None);
+                self.state_changed(home, before);
+            }
+        }
+        self.arm_key_states();
+    }
+
+    /// Something a key with states ran has reported.
+    fn on_state_report(&mut self, report: crate::states::StateReport) {
+        match report.kind {
+            crate::states::StateKind::Enter { .. } => {
+                self.on_entered(&report.home, report.seq, &report.outcome);
+            }
+            crate::states::StateKind::Status { .. } => {
+                self.on_state_read(&report.home, report.seq, &report.outcome);
+            }
+        }
+    }
+
+    /// Read which state the key at `home` is in, unless it is being read
+    /// already or has a command running or waiting, whose change a read
+    /// would only race.
+    fn read_state(&mut self, home: &KeyHome) {
+        use crate::states::{StateJob, StateKind};
+        let Some(cfg) = key_at_home(&self.workspace, home)
+            .filter(|cfg| !cfg.states.is_empty())
+            .cloned()
+        else {
+            return;
+        };
+        let Some(command) = cfg.status.clone().filter(|c| !c.trim().is_empty()) else {
+            return;
+        };
+        if !self.cycle_mut(home, &cfg).may_read() {
+            return;
+        }
+        self.state_seq += 1;
+        let seq = self.state_seq;
+        let job = StateJob {
+            home: home.clone(),
+            seq,
+            kind: StateKind::Status { command },
+        };
+        if self.state_runner.spawn(job) {
+            self.cycle_mut(home, &cfg).reading(seq);
+        }
+    }
+
+    /// A read of the key at `home` has answered.
+    ///
+    /// Taken only if nobody has changed the key since it began and no
+    /// command of the key's is running or waiting; see [`KeyCycle::read`].
+    /// A change it finds is shown and told, but not put on the screen: the
+    /// key changing is the news, and nobody at the deck asked for it.
+    fn on_state_read(&mut self, home: &KeyHome, seq: u64, outcome: &crate::states::Outcome) {
+        let cfg = key_at_home(&self.workspace, home)
+            .filter(|cfg| !cfg.states.is_empty() && cfg.status.is_some())
+            .cloned();
+        let now = self.clock.now();
+        let before = self.state_seen(home);
+        let Some(cycle) = self.key_states.get_mut(home) else {
+            return;
+        };
+        let Some(cfg) = cfg else {
+            // It cannot be read any more; only the read is forgotten.
+            if cycle.reading.is_some_and(|(reading, _)| reading == seq) {
+                cycle.reading = None;
+            }
+            return;
+        };
+        let (found, last) = crate::states::judge(&cfg, outcome, now);
+        let failing = cycle.failures > 0;
+        let why = last.error.clone().or_else(|| {
+            last.output
+                .as_ref()
+                .map(|output| format!("it printed {output:?}, which is none of its states"))
+        });
+        if !cycle.read(seq, found, last, now) {
+            return;
+        }
+        // Once a run of failures, not at every read: the key's "?" says the
+        // rest, and a read that keeps failing is spaced out anyway.
+        if cycle.failures > 0 && !failing {
+            log::warn!(
+                "key {} on {}/{}: its state could not be read: {}",
+                home.key,
+                home.profile,
+                home.page,
+                why.unwrap_or_default()
+            );
+        }
+        self.state_changed(home, before);
+    }
+
+    /// Key `key`'s read is due: read it, and come back after its interval,
+    /// or longer while its reads keep finding nothing.
+    fn poll_state(&mut self, key: u8) {
+        if !self.device.connected {
+            return;
+        }
+        let Some(cfg) = self
+            .key_config(key)
+            .filter(|cfg| !cfg.states.is_empty() && cfg.status.is_some())
+            .cloned()
+        else {
+            return;
+        };
+        let Some(home) = self.home_of(key) else {
+            return;
+        };
+        self.read_state(&home);
+        let every = Duration::from_millis(u64::from(cfg.status_interval_ms()));
+        let interval = self
+            .key_states
+            .get(&home)
+            .map_or(every, |cycle| cycle.read_interval(every));
+        let now = self.clock.now();
+        self.scheduler
+            .after(now, interval, TimerKind::StateStatus { key });
+    }
+
+    /// Read the state of every key on this page that can read it, now and
+    /// every so often while the page shows; stop reading the page before's.
+    fn start_state_reads(&mut self, page: &Page) {
+        self.stop_state_reads();
+        let now = self.clock.now();
+        for cfg in &page.keys {
+            if cfg.key < Buttons::COUNT && !cfg.states.is_empty() && cfg.status.is_some() {
+                self.scheduler
+                    .at(now, TimerKind::StateStatus { key: cfg.key });
+            }
+        }
+    }
+
+    /// Stop reading the states of the keys on the page: the page or the deck
+    /// is going.
+    fn stop_state_reads(&mut self) {
+        for key in Buttons::indices() {
+            self.scheduler.cancel_kind(TimerKind::StateStatus { key });
+        }
+    }
+
+    /// Act on whatever about a key with states has come due, on any page.
+    fn key_states_due(&mut self) {
+        let now = self.clock.now();
+        let mut repaint = Vec::new();
+        let mut read = Vec::new();
+        for (home, cycle) in &mut self.key_states {
+            let due = cycle.due(now);
+            if due.repaint {
+                repaint.push(home.clone());
+            }
+            if due.read {
+                read.push(home.clone());
+            }
+        }
+        for home in read {
+            self.read_state(&home);
+        }
+        for home in repaint {
+            if self.is_showing(&home) {
+                self.repaint_key(home.key);
+            }
+        }
+        self.arm_key_states();
+    }
+
+    /// Wake when the first thing about a key with states is due.
+    fn arm_key_states(&mut self) {
+        self.scheduler.cancel_kind(TimerKind::KeyStates);
+        if let Some(at) = self
+            .key_states
+            .values()
+            .filter_map(KeyCycle::next_deadline)
+            .min()
+        {
+            self.scheduler.at(at, TimerKind::KeyStates);
+        }
+    }
+
+    /// Keep through a reload only the keys that still have states, each as
+    /// far as it still makes sense; see [`KeyCycle::keep`]. Nothing is run:
+    /// a key showing a state again is not entering it.
+    fn keep_key_states(&mut self) {
+        let workspace = &self.workspace;
+        self.key_states.retain(|home, cycle| {
+            match key_at_home(workspace, home).filter(|cfg| !cfg.states.is_empty()) {
+                Some(cfg) => {
+                    cycle.keep(cfg);
+                    true
+                }
+                None => false,
+            }
+        });
+        self.arm_key_states();
+    }
+
+    /// Put key `key` of the page showing in state `state`, for an editor:
+    /// with `run`, as a tap to it would, running what the state runs;
+    /// without, on the key and nowhere else.
+    fn set_key_state(&mut self, key: u8, state: &str, run: bool) -> Response {
+        let error = |message: String| Response::Error { message };
+        // A key past the deck's last loads, with an error, and is never
+        // drawn: nor is it put in a state, which would draw it.
+        let Some(cfg) = self
+            .key_config(key)
+            .filter(|_| key < Buttons::COUNT)
+            .cloned()
+        else {
+            return error(format!("there is no key {key} on this page"));
+        };
+        if cfg.states.is_empty() {
+            return error(format!("key {key} has no states"));
+        }
+        let Some(name) = cfg.state(state).map(|state| state.name.clone()) else {
+            return error(format!("key {key} has no state called {state:?}"));
+        };
+        // The key was found, so a page is showing: one with an earlier
+        // page's id.
+        let Some(home) = self.home_of(key) else {
+            return error(self.shared_page_text());
+        };
+        if run {
+            self.enter_state(&home, &cfg, name);
+        } else {
+            let before = self.state_seen(&home);
+            self.cycle_mut(&home, &cfg).show(name);
+            self.state_changed(&home, before);
+            self.arm_key_states();
+        }
+        Response::Ok
+    }
+
+    /// Draw key `key` of the page showing as it looks in `state`, or in none,
+    /// for an editor's preview of each. Without what its state lays over it:
+    /// the preview is of the look.
+    fn render_key_state(&self, key: u8, state: Option<&str>) -> Response {
+        let error = |message: String| Response::Error { message };
+        let Some(cfg) = self.key_config(key).filter(|_| key < Buttons::COUNT) else {
+            return error(format!("there is no key {key} on this page"));
+        };
+        let look = match state {
+            Some(name) if cfg.state(name).is_none() => {
+                return error(format!("key {key} has no state called {name:?}"));
+            }
+            Some(name) => cfg.in_state(name),
+            None => own_look(cfg),
+        };
+        let size = self.key_placement(key).size();
+        let (canvas, _) = self.look_picture(&look, size, self.backdrop_key(key, size), None);
+        match canvas.to_jpeg(90) {
+            Ok(jpeg) => Response::Image {
+                url: format!("data:image/jpeg;base64,{}", crate::base64::encode(&jpeg)),
+            },
+            Err(e) => error(format!("encoding the preview: {e}")),
+        }
+    }
+
+    // ------------------------------------------------------------ icons
+
+    /// Find the icon themes for the config as it is now, on a thread of
+    /// their own: asking the desktop which theme it uses can take a second.
+    /// The themes found before stay in use until these arrive. While a
+    /// search is under way this only asks for another once it is done.
+    fn find_icons(&mut self) {
+        self.icons_wanted += 1;
+        if !self.icons_finding {
+            self.search_icons();
+        }
+    }
+
+    /// Start the search for the themes of the reload that wants them.
+    fn search_icons(&mut self) {
+        let wanted = self.icons_wanted;
+        let configured = self.workspace.global.icon_theme.clone();
+        let tx = self.icons_tx.clone();
+        let waker = self.waker.clone();
+        let spawned = std::thread::Builder::new()
+            .name("galdeck-icons".into())
+            .spawn(move || {
+                let themes = crate::icons::IconThemes::discover(configured.as_deref());
+                if tx.send((wanted, Arc::new(themes))).is_ok() {
+                    waker.notify();
+                }
+            });
+        match spawned {
+            Ok(_) => self.icons_finding = true,
+            Err(e) => {
+                log::warn!("looking for icon themes on a thread: {e}; looking here");
+                let configured = self.workspace.global.icon_theme.as_deref();
+                let themes = crate::icons::IconThemes::discover(configured);
+                self.on_icons(wanted, Arc::new(themes));
+            }
+        }
+    }
+
+    /// The icon themes have been found: draw the keys that name an icon
+    /// again, and answer the editors waiting for the icon names. Themes
+    /// found for a config that has been reloaded since are not the ones
+    /// wanted, and the search starts again.
+    fn on_icons(&mut self, found_for: u64, themes: Arc<crate::icons::IconThemes>) {
+        self.icons_finding = false;
+        if found_for != self.icons_wanted {
+            self.search_icons();
+            return;
+        }
+        let icons = IconSet {
+            themes,
+            names: Default::default(),
+        };
+        for reply in self.icon_names_waiting.drain(..) {
+            answer_icon_names(&icons, reply);
+        }
+        self.icons = Some(icons);
+        for key in Buttons::indices() {
+            let named = self
+                .shown_key(key)
+                .is_some_and(|cfg| matches!(cfg.icon, Some(galdeck_model::IconRef::Name(_))));
+            if named {
+                if self.key_animations[key as usize].is_some() {
+                    self.rebuild_key_animation(key);
+                }
+                self.repaint_key(key);
+            }
+        }
+    }
+
+    /// Warnings about the icons the keys on the page name that cannot be
+    /// drawn, each at its place in the config: a name no icon theme has, and
+    /// a file, named or found for a name, that is refused or fails to load.
+    /// Nothing about names until the themes are found.
+    fn icon_warnings(&self, page: &Page) -> Vec<galdeck_ipc::Diagnostic> {
+        use crate::icons::{Missing, Origin};
+        use galdeck_model::IconRef;
+        let mut warnings = Vec::new();
+        for (index, cfg) in page.keys.iter().enumerate() {
+            let at = format!("pages[{}].keys[{index}]", self.page_index);
+            // Where each name is written, and the look it is drawn in: a
+            // state that names none draws the key's, which is warned about
+            // once, at the key.
+            let own = std::iter::once((format!("{at}.icon"), &cfg.icon, own_look(cfg)));
+            let states = cfg.states.iter().enumerate().map(|(s, state)| {
+                let look = cfg.in_state(&state.name);
+                (format!("{at}.states[{s}].icon"), &state.icon, look)
+            });
+            for (path, written, look) in own.chain(states) {
+                let Some(written) = written else {
+                    continue;
+                };
+                // A name that cannot be one is the config's own error.
+                if written
+                    .name()
+                    .is_some_and(|name| !IconRef::is_valid_name(name))
+                {
+                    continue;
+                }
+                let style = self.style_for(Some(&look.style), "key");
+                let size = self.key_placement(cfg.key).size();
+                let icon_box = render::icon_box(size, &style, self.label_for(&look).is_some());
+                let (file, origin, what) = match written {
+                    IconRef::Path(file) => (
+                        crate::icons::expand_home(file),
+                        Origin::File,
+                        format!("the picture {}", file.display()),
+                    ),
+                    IconRef::Name(name) => {
+                        let Some(icons) = &self.icons else {
+                            continue;
+                        };
+                        let what = |file: &std::path::Path| {
+                            format!("the icon {name:?} ({})", file.display())
+                        };
+                        match icons.themes.lookup(name, icon_box) {
+                            Ok(file) => {
+                                let what = what(&file);
+                                (file, Origin::Theme, what)
+                            }
+                            Err(Missing::NotFound) => {
+                                let themes = icons.themes.theme_names().join(", ");
+                                warnings.push(IconRef::not_found(name, &path, &themes));
+                                continue;
+                            }
+                            Err(Missing::Refused { path: file, reason }) => {
+                                warnings.push(IconRef::cannot_draw(&what(&file), &path, &reason));
+                                continue;
+                            }
+                        }
+                    }
+                };
+                // Drawn as the key draws it, into the cache the key draws
+                // from, so an icon looked at here is not drawn again when
+                // its state is shown.
+                let drawn = self.icon_cache.borrow_mut().draw(
+                    &file,
+                    origin,
+                    icon_box,
+                    style.key_label_color,
+                );
+                if let Err(reason) = drawn {
+                    warnings.push(IconRef::cannot_draw(&what, &path, &reason));
+                }
+            }
+        }
+        warnings
     }
 
     // ------------------------------------------------------------ levels
@@ -4351,6 +5658,9 @@ impl Engine {
                 Ok(()) => "ok".into(),
                 Err(why) => format!("unavailable: {why}"),
             },
+            desktop: std::env::var("XDG_CURRENT_DESKTOP")
+                .map(|desktop| crate::pipewire::display_name(&desktop, 64))
+                .unwrap_or_default(),
         }
     }
 
@@ -4380,7 +5690,7 @@ impl Engine {
                     Some("push-to-talk needs a key held down; try it on the deck".to_string())
                 }
                 SlotRule::KeyOnly => Some(format!(
-                    "{} acts on the timer of the key it is on; try it on the deck",
+                    "{} acts on the key it is bound to; try it on the deck",
                     built_in.name()
                 )),
                 SlotRule::KnobOnly => Some(format!(
@@ -4675,6 +5985,8 @@ impl Engine {
         match event {
             Event::KeyDown(key) => {
                 self.preview.publish(galdeck_ipc::Event::KeyPressed { key });
+                // Before anything the press does, so the key answers at once.
+                self.start_press(key, at);
                 // Push-to-talk works on the key's own edges: the microphone
                 // is live exactly while the key is down.
                 if self.is_push_to_talk(key) {
@@ -4957,6 +6269,8 @@ impl Engine {
         self.workspace = workspace;
         self.keep_countdowns();
         self.keep_dial_modes();
+        self.keep_key_states();
+        self.find_icons();
         self.enter_profile();
         self.load_documents();
         self.controls
@@ -4987,6 +6301,22 @@ impl Engine {
                         let _ = msg.reply.send(*response);
                     }
                     Reply::WhenReleased => self.pending_release.push(msg.reply),
+                }
+                continue;
+            }
+            // A download waits on someone else's server, for up to
+            // `assets::DOWNLOAD_TIMEOUT`, so it goes to a thread of its own.
+            if let Request::FetchAsset { url } = &msg.request {
+                let url = url.clone();
+                let dir = crate::assets::dir(&self.config_dir);
+                let reply = msg.reply;
+                let spawned = std::thread::Builder::new()
+                    .name("galdeck-download".into())
+                    .spawn(move || {
+                        let _ = reply.send(asset_response(crate::assets::download(&url, &dir)));
+                    });
+                if let Err(e) = spawned {
+                    log::warn!("downloading a picture: {e}");
                 }
                 continue;
             }
@@ -5031,6 +6361,22 @@ impl Engine {
                 self.audio_targets.ask(move |found| {
                     let _ = reply.send(targets_response(found));
                 });
+                continue;
+            }
+            // Listing the icon names reads every directory the themes list;
+            // it waits for the themes, which are found on a thread too.
+            if matches!(msg.request, Request::IconNames) {
+                match &self.icons {
+                    Some(icons) => answer_icon_names(icons, msg.reply),
+                    None if self.icon_names_waiting.len() < MAX_ICON_NAME_WAITERS => {
+                        self.icon_names_waiting.push(msg.reply);
+                    }
+                    None => {
+                        let _ = msg.reply.send(Response::Error {
+                            message: "still looking for the icon themes".into(),
+                        });
+                    }
+                }
                 continue;
             }
             if matches!(msg.request, Request::WidgetSources) {
@@ -5194,6 +6540,9 @@ impl Engine {
         }
         self.calibration = candidate;
         self.calibration_problem = None;
+        // Keys and the screen move with it, so the edit is seen on the deck
+        // as it is saved rather than at the next page switch.
+        self.paint_page();
         self.preview.publish(galdeck_ipc::Event::CalibrationChanged);
         Response::Ok
     }
@@ -5218,12 +6567,56 @@ impl Engine {
             Request::Geocode { .. } => Response::Error {
                 message: "busy".into(),
             },
+            Request::GetThemes => Response::Themes {
+                themes: crate::theme_editor::describe(&self.workspace),
+            },
+            Request::CreateTheme {
+                id,
+                name,
+                extends,
+                copy,
+            } => self.create_theme(&id, name.as_deref(), extends.as_deref(), copy.as_deref()),
+            Request::PreviewTheme { theme, patches } => self.preview_theme(&theme, &patches),
+            Request::KeyboardLayout => Response::KeyboardLayout {
+                leds: crate::lighting::editor::places(),
+            },
+            Request::KeyboardFrame => Response::KeyboardFrame {
+                frame: self
+                    .preview
+                    .keyboard()
+                    .map(|frame| crate::lighting::editor::frame_text(&frame)),
+            },
+            Request::PreviewLighting {
+                lighting,
+                theme,
+                seconds,
+                fps,
+                presses,
+            } => self.preview_lighting(&lighting, theme.as_deref(), seconds, fps, &presses),
+            // The control socket answers these itself, and the UI's
+            // /api/call refuses them: the engine holds neither the codes nor
+            // the token, and a request that reaches it here came by a way
+            // that must not be able to mint a sign-in.
+            Request::UiLogin { .. } | Request::UiRotateToken => Response::Error {
+                message: "only answered on the control socket".into(),
+            },
             Request::RenderWidget {
                 fields,
                 width,
                 height,
             } => self.render_widget_preview(fields, width, height),
+            // Answered on its own thread in service_control, like Geocode.
+            Request::FetchAsset { .. } => Response::Error {
+                message: "busy".into(),
+            },
             Request::SaveAsset { name, data } => self.save_asset(&name, &data),
+            Request::SetKeyState { key, state, run } => self.set_key_state(key, &state, run),
+            // Answered on a thread of its own in service_control.
+            Request::IconNames => Response::Error {
+                message: "busy".into(),
+            },
+            Request::RenderKeyState { key, state } => self.render_key_state(key, state.as_deref()),
+            Request::Which { names } => which(&names),
             Request::ResumeDevice => self.resume_device(),
             Request::GetCalibration => Response::Calibration(self.calibration_snapshot()),
             Request::SetCalibration {
@@ -5236,6 +6629,7 @@ impl Engine {
             } => self.set_calibration(screen, bounds, rows, columns, bleed_x, bleed_y),
             Request::ReloadCalibration => {
                 self.load_calibration();
+                self.paint_page();
                 self.preview.publish(galdeck_ipc::Event::CalibrationChanged);
                 Response::Ok
             }
@@ -5402,7 +6796,74 @@ fn run_action(cmd: &str, delta: Option<i8>) {
     }
 }
 
-fn hex(color: galdeck::Rgb) -> String {
+/// What anyone watching a key with states can see of it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct StateSeen {
+    shown: Option<String>,
+    known: bool,
+    badge: Option<crate::states::Badge>,
+}
+
+/// A key with states as it looks in none of them: its own look.
+fn own_look(cfg: &KeyConfig) -> KeyConfig {
+    KeyConfig {
+        states: Vec::new(),
+        status: None,
+        status_interval_ms: None,
+        ..cfg.clone()
+    }
+}
+
+/// Send the icon names in `icons` to `reply`, listing them first on a
+/// thread of their own if nobody has asked for them yet.
+fn answer_icon_names(icons: &IconSet, reply: Sender<Response>) {
+    if let Some(names) = icons.names.get() {
+        let _ = reply.send(Response::IconNames {
+            names: names.clone(),
+        });
+        return;
+    }
+    let icons = icons.clone();
+    let spawned = std::thread::Builder::new()
+        .name("galdeck-icon-names".into())
+        .spawn(move || {
+            // Once, however many ask at the same time.
+            let names = icons.names.get_or_init(|| icons.themes.symbolic_names());
+            let _ = reply.send(Response::IconNames {
+                names: names.clone(),
+            });
+        });
+    if let Err(e) = spawned {
+        log::warn!("listing icon names: {e}");
+    }
+}
+
+/// Which of `names` are programs on the daemon's `PATH`, for an editor to
+/// say what a ready-made key needs. Only looked for, never run; only plain
+/// names, since a path is not a question about `PATH`; and only in the
+/// absolute directories on it, where `audio`'s own tools are looked for.
+fn which(names: &[String]) -> Response {
+    let path = crate::audio::search_path();
+    let found = names
+        .iter()
+        .take(MAX_WHICH)
+        .filter(|name| is_program_name(name))
+        .filter(|name| crate::audio::find(name, &path).is_some())
+        .cloned()
+        .collect();
+    Response::Which { found }
+}
+
+/// Whether `name` could be a program's name rather than a path to one.
+fn is_program_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= MAX_PROGRAM_NAME
+        && name != "."
+        && name != ".."
+        && !name.contains(['/', '\0'])
+}
+
+pub(crate) fn hex(color: galdeck::Rgb) -> String {
     format!("#{:02x}{:02x}{:02x}", color.r, color.g, color.b)
 }
 
@@ -5423,6 +6884,80 @@ fn from_cal_rect(rect: CalRect) -> PanelRect {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A measured calibration with this screen and the template's keys.
+    fn measured_screen(screen: PanelRect) -> PanelLayout {
+        let mut layout = PanelLayout::TEMPLATE;
+        layout.screen = screen;
+        layout.source = galdeck::layout::Source::File;
+        layout
+    }
+
+    #[test]
+    fn the_screen_is_laid_out_on_its_measured_height() {
+        // What a unit whose glass shows 396 rows calibrates to. Before, the
+        // tiles stopped at 384 and the last twelve rows kept whatever the
+        // firmware had put there.
+        let layout = measured_screen(PanelRect::new(0, 0, 720, 396));
+        let placement = ScreenPlacement::from_calibration(&layout);
+        assert_eq!(
+            placement,
+            ScreenPlacement::Measured {
+                visible: PanelRect::new(0, 0, 720, 396),
+                frame: PanelRect::new(0, 0, 720, 400),
+            }
+        );
+        assert_eq!(placement.size(), (720, 396));
+
+        // The bottom row of a 6-row grid reaches the measured bottom.
+        let grid = galdeck_model::LcdGrid {
+            columns: 12,
+            rows: 6,
+        };
+        let cells = galdeck_model::Cells {
+            column: 0,
+            row: 5,
+            columns: 12,
+            rows: 1,
+        };
+        let area = tile_area(cells, grid, placement.size());
+        assert_eq!(area.y as u32 + area.height + TILE_GAP / 2, 396);
+    }
+
+    #[test]
+    fn the_screen_uses_the_segment_when_nothing_was_measured() {
+        let mut template = measured_screen(PanelRect::new(0, 0, 720, 396));
+        template.source = galdeck::layout::Source::Template;
+        assert_eq!(
+            ScreenPlacement::from_calibration(&template),
+            ScreenPlacement::Firmware
+        );
+        // Measured, and exactly the segment: nothing to gain from the
+        // region path.
+        let segment = measured_screen(PanelRect::new(0, 0, 720, 384));
+        assert_eq!(
+            ScreenPlacement::from_calibration(&segment),
+            ScreenPlacement::Firmware
+        );
+    }
+
+    #[test]
+    fn a_screen_frame_never_reaches_the_keys() {
+        // Rounding 396 out to 400 would cover the top two rows of keys that
+        // start at 398, and the screen repaints every second.
+        let mut layout = measured_screen(PanelRect::new(0, 0, 720, 396));
+        layout.set_grid(PanelGrid {
+            bounds: PanelRect::new(0, 398, 720, 848),
+            ..layout.grid
+        });
+        assert_eq!(
+            ScreenPlacement::from_calibration(&layout),
+            ScreenPlacement::Measured {
+                visible: PanelRect::new(0, 0, 720, 384),
+                frame: PanelRect::new(0, 0, 720, 384),
+            }
+        );
+    }
 
     #[test]
     fn no_two_modes_rest_at_the_same_colour() {
@@ -5579,6 +7114,10 @@ mod tests {
             std::env::temp_dir().join(format!("galdeck-engine-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("profiles")).unwrap();
+        // With the icon theme named, building the engine does not ask the
+        // desktop which one it uses: that ask is one at a time across the
+        // process, and the icons tests time theirs.
+        let global = format!("icon_theme = \"Adwaita\"\n{global}");
         std::fs::write(dir.join("galdeck.toml"), global).unwrap();
         std::fs::write(dir.join("profiles/p.toml"), "[[pages]]\nid = \"one\"\n").unwrap();
         let (workspace, diagnostics) = Workspace::load(&dir);
@@ -5855,6 +7394,75 @@ mod tests {
     }
 
     #[test]
+    fn what_a_state_runs_cannot_step_its_key_or_hold_it_down() {
+        use galdeck_model::BuiltIn;
+        assert!(misplaced(BuiltIn::NextState, From::Key(3)).is_none());
+        assert!(misplaced(BuiltIn::PreviousState, From::Key(3)).is_none());
+        for action in [
+            BuiltIn::NextState,
+            BuiltIn::PreviousState,
+            BuiltIn::TimerToggle,
+            BuiltIn::PushToTalk,
+        ] {
+            assert_eq!(
+                misplaced(action, From::State(3)).as_deref(),
+                Some("a state's action cannot change the key's state"),
+                "{action:?}"
+            );
+        }
+        assert!(misplaced(BuiltIn::VolumeMute, From::State(3)).is_none());
+        assert!(misplaced(BuiltIn::NextPage, From::State(3)).is_none());
+        assert!(misplaced(BuiltIn::NextMode, From::State(3)).is_some());
+    }
+
+    #[test]
+    fn which_looks_for_plain_names_on_the_path_and_runs_nothing() {
+        // `sh` is on every PATH a daemon runs with; the rest are not
+        // programs' names, or not anyone's.
+        let names = [
+            "sh",
+            "galdeck-no-such-program",
+            "/bin/sh",
+            "../sh",
+            "",
+            "..",
+        ]
+        .map(String::from);
+        let Response::Which { found } = which(&names) else {
+            panic!("not an answer to which");
+        };
+        assert_eq!(found, ["sh"]);
+        assert!(is_program_name("gnome-session-inhibit"));
+        assert!(!is_program_name(&"x".repeat(MAX_PROGRAM_NAME + 1)));
+        assert!(!is_program_name("a\0b"));
+    }
+
+    #[test]
+    fn a_key_past_the_deck_s_last_is_neither_put_in_a_state_nor_drawn_in_one() {
+        // It loads, with an error, so an editor can still name it.
+        let (mut engine, dir) = engine_with("far-key", "version = 2\nprofile = \"p\"\n");
+        std::fs::write(
+            dir.join("profiles/p.toml"),
+            "[[pages]]\nid = \"one\"\n[[pages.keys]]\nkey = 15\n\
+             [[pages.keys.states]]\nname = \"off\"\n[[pages.keys.states]]\nname = \"on\"\n",
+        )
+        .unwrap();
+        assert!(matches!(engine.reload(), Response::Ok));
+        for run in [false, true] {
+            assert!(matches!(
+                engine.set_key_state(15, "on", run),
+                Response::Error { .. }
+            ));
+        }
+        assert!(matches!(
+            engine.render_key_state(15, Some("on")),
+            Response::Error { .. }
+        ));
+        assert!(engine.key_states.is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn a_key_s_widget_says_what_its_countdown_counts() {
         let stopwatch = galdeck_model::Widget::of(galdeck_model::WidgetKind::Stopwatch);
         assert_eq!(countdown_length(Some(&stopwatch)), Ok(None));
@@ -6029,5 +7637,96 @@ mod tests {
             "8",
             "detents raced instead of running in order"
         );
+    }
+
+    /// An engine from `engine_with` that paints: a deck connected, a clock
+    /// the test moves, and what it sends kept for the test to count.
+    fn painting_engine(
+        name: &str,
+    ) -> (
+        Engine,
+        Arc<galdeck_core::ManualClock>,
+        std::sync::mpsc::Receiver<Paint>,
+        PathBuf,
+    ) {
+        let (mut engine, dir) = engine_with(name, "version = 2\nprofile = \"p\"\n");
+        let clock = Arc::new(galdeck_core::ManualClock::starting_at(Tick(1_000_000)));
+        engine.clock = clock.clone();
+        let (paint_tx, paint_rx) = std::sync::mpsc::sync_channel(64);
+        engine.paint_tx = paint_tx;
+        engine.device.connected = true;
+        (engine, clock, paint_rx, dir)
+    }
+
+    fn screens_sent(paints: &std::sync::mpsc::Receiver<Paint>) -> usize {
+        paints
+            .try_iter()
+            .filter(|paint| matches!(paint, Paint::Lcd { .. }))
+            .count()
+    }
+
+    #[test]
+    fn a_knob_turned_fast_sends_the_screen_once_a_frame_and_always_its_last_state() {
+        // Each detent of a volume knob redraws the level over the screen, a
+        // full frame each. Fifty a second on top of a moving background took
+        // the module's firmware off the bus.
+        let (mut engine, clock, paints, dir) = painting_engine("screen-pace");
+        engine.show_osd("Volume · 40%".into(), Some((0.4, false)));
+        engine.paint_screen_when_due();
+        assert_eq!(
+            screens_sent(&paints),
+            1,
+            "the first change goes straight out"
+        );
+
+        // Detents inside the next 50 ms are held back, all together.
+        for percent in [42, 44, 46] {
+            clock.advance(Duration::from_millis(10));
+            engine.show_osd(format!("Volume · {percent}%"), None);
+            engine.paint_screen_when_due();
+        }
+        assert_eq!(screens_sent(&paints), 0);
+        assert!(engine.scheduler.contains_kind(TimerKind::ScreenFrame));
+
+        // When the window ends, the last of them goes out, once.
+        clock.advance(Duration::from_millis(20));
+        engine.paint_screen_when_due();
+        assert_eq!(screens_sent(&paints), 1);
+        assert!(!engine.screen_dirty);
+        assert_eq!(osd_text(&engine), Some("Volume · 46%"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn over_a_moving_background_the_screen_goes_only_with_its_frames() {
+        let (mut engine, clock, paints, dir) = painting_engine("screen-rides");
+        let backdrop: galdeck_model::Backdrop =
+            toml::from_str("animation = \"aurora\"\nfps = 20\nspan = \"both\"").unwrap();
+        let geometry = engine.backdrop_geometry();
+        let scene = crate::backdrop::Scene::load(&backdrop, vec![Rgb::BLACK, Rgb::WHITE], geometry)
+            .unwrap();
+        engine.scene = Some(scene);
+        engine.scene_tick = 0;
+        engine.screen_dirty = true;
+        engine.paint_screen_when_due();
+        assert_eq!(screens_sent(&paints), 1);
+
+        // A turn between two of its frames waits for the next, even past the
+        // 50 ms a screen without one would wait: a frame of its own would
+        // be one more than the background sends, and would put the screen a
+        // frame out of step with the keys from then on.
+        clock.advance(Duration::from_millis(10));
+        engine.show_osd("Volume · 42%".into(), None);
+        engine.paint_screen_when_due();
+        clock.advance(Duration::from_millis(60));
+        engine.paint_screen_when_due();
+        assert_eq!(screens_sent(&paints), 0, "no frame of its own");
+
+        // The background's next frame takes it.
+        engine.scene_tick += 1;
+        engine.paint_screen_when_due();
+        assert_eq!(screens_sent(&paints), 1);
+        assert!(!engine.screen_dirty);
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

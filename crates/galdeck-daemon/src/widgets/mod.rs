@@ -103,6 +103,9 @@ pub struct SlotState {
     pub peak: f64,
     /// How alarming the latest reading is against the widget's thresholds.
     pub level: galdeck_model::Level,
+    /// When the widget's data was last read. An animated view is drawn more
+    /// often than it is read: see `Widget::sample_interval_ms`.
+    pub sampled_at: Option<galdeck_core::Tick>,
 }
 
 impl SlotState {

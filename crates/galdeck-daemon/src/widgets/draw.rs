@@ -10,7 +10,7 @@
 //! scale to any tile without an asset pipeline or a licence to track.
 
 use galdeck::{Align, Canvas, Font, Rgb, TextStyle};
-use galdeck_model::{Widget, WidgetKind, WidgetView};
+use galdeck_model::{BarStyle, GraphStyle, Widget, WidgetKind, WidgetView};
 
 use super::media::{self, Media, Status};
 use super::weather::{Condition, Weather};
@@ -142,13 +142,19 @@ pub fn widget(
                 let seconds = reading.and_then(Reading::value);
                 analog(canvas, area, widget.title.as_deref(), seconds, colors, font)
             }
-            WidgetView::Nixie if widget.kind == WidgetKind::Clock => {
-                // A tube for each digit of the formatted time, so `format`
-                // decides how many there are.
+            view @ WidgetView::Nixie if view.suits(widget.kind) => {
+                // A tube for each digit: of the formatted time for a clock, so
+                // `format` decides how many there are, and of the reading for
+                // anything else, its unit on a symbol tube. Before the first
+                // reading there is only the title, lit.
                 let text = reading.and_then(Reading::label).unwrap_or_else(|| {
-                    super::now_in(widget.timezone())
-                        .strftime(widget.format())
-                        .to_string()
+                    if widget.kind == WidgetKind::Clock {
+                        super::now_in(widget.timezone())
+                            .strftime(widget.format())
+                            .to_string()
+                    } else {
+                        String::new()
+                    }
                 });
                 let t = super::nixie::now();
                 super::nixie::draw(canvas, area, widget, &text, colors, font, t)
@@ -234,7 +240,7 @@ fn graph(
             widget.history(),
             state.scale(widget),
             colors.accent,
-            colors.background,
+            widget.graph_style(),
         );
     }
     captioned_value(
@@ -260,18 +266,26 @@ fn bar(
         area.width.saturating_sub(pad * 2),
         thickness,
     );
-    // Translucent rather than a mixed colour, so the track reads the same
-    // over a picture as over a flat background.
-    blend_round_rect(canvas, track, thickness / 2, colors.foreground, 0.2);
     let value = state.and_then(|s| s.reading.as_ref()?.value().map(|v| (v, s.scale(widget))));
-    if let Some((value, scale)) = value {
-        let share = (value / scale).clamp(0.0, 1.0);
-        let filled = Area {
-            width: ((track.width as f64 * share).round() as u32).max(thickness),
-            ..track
-        };
-        if share > 0.0 {
-            fill_round_rect(canvas, filled, thickness / 2, colors.accent);
+    let share = value.map(|(value, scale)| (value / scale).clamp(0.0, 1.0));
+    match widget.bar_style() {
+        BarStyle::Segmented => segmented_bar(canvas, track, share, widget.segments(), colors),
+        style => {
+            let radius = if style == BarStyle::Rounded {
+                thickness / 2
+            } else {
+                0
+            };
+            // Translucent rather than a mixed colour, so the track reads the
+            // same over a picture as over a flat background.
+            blend_round_rect(canvas, track, radius, colors.foreground, 0.2);
+            if let Some(share) = share.filter(|share| *share > 0.0) {
+                let filled = Area {
+                    width: ((track.width as f64 * share).round() as u32).max(thickness),
+                    ..track
+                };
+                fill_round_rect(canvas, filled, radius, colors.accent);
+            }
         }
     }
     let above = Area {
@@ -281,6 +295,39 @@ fn bar(
     captioned_value(
         canvas, above, widget, state, colors, font, fallback, 0.24, 0.5,
     );
+}
+
+/// A bar lit a step at a time, like a level meter: `segments` blocks with a
+/// gap between, as many lit as the reading reaches, to the nearest.
+fn segmented_bar(
+    canvas: &mut Canvas,
+    track: Area,
+    share: Option<f64>,
+    segments: u8,
+    colors: Colors,
+) {
+    let count = u32::from(segments.max(1));
+    let gap = (track.height / 3).clamp(1, 4);
+    let width = track.width.saturating_sub(gap * (count - 1)) / count;
+    if width == 0 {
+        return;
+    }
+    // What the blocks leave over goes at the ends, so the meter is centred.
+    let spare = track.width - (width * count + gap * (count - 1));
+    let lit = share.map_or(0, |share| (share * f64::from(count)).round() as u32);
+    for index in 0..count {
+        let block = Area::new(
+            track.x + (spare / 2 + index * (width + gap)) as i32,
+            track.y,
+            width,
+            track.height,
+        );
+        if index < lit {
+            fill_round_rect(canvas, block, 1, colors.accent);
+        } else {
+            blend_round_rect(canvas, block, 1, colors.foreground, 0.2);
+        }
+    }
 }
 
 /// The caption at the top and the reading's text below it.
@@ -351,8 +398,9 @@ fn default_title(kind: WidgetKind) -> &'static str {
     }
 }
 
-/// Newest reading at the right edge, older ones trailing off to the left,
-/// with the area under the line filled in a faded accent.
+/// Newest reading at the right edge, older ones trailing off to the left:
+/// a line with the area under it filled in a faded accent, the line alone,
+/// or columns, as `style` says.
 fn plot_history(
     canvas: &mut Canvas,
     plot: Area,
@@ -360,8 +408,13 @@ fn plot_history(
     capacity: usize,
     scale: f64,
     accent: Rgb,
-    background: Rgb,
+    style: GraphStyle,
 ) {
+    if style == GraphStyle::Bars {
+        plot_columns(canvas, plot, history, capacity, scale, accent);
+        return;
+    }
+    let filled = style == GraphStyle::Area;
     let thickness = (plot.height / 40).clamp(2, 4);
     // The line's brush is a square centred on it, so the line itself keeps a
     // brush's width inside the plot; otherwise a full graph paints a pixel
@@ -386,7 +439,6 @@ fn plot_history(
     };
     // Blended rather than mixed with the background colour, so the area
     // under the line is a tint over whatever is there -- a picture included.
-    let _ = background;
     let fill = |canvas: &mut Canvas, x: i32, from: f64| {
         for y in from.max(0.0) as i32..bottom {
             canvas.blend_pixel(x, y, accent, 0.35);
@@ -395,14 +447,20 @@ fn plot_history(
 
     if history.len() == 1 {
         let (x, y) = point(0);
-        fill(canvas, x as i32, y);
+        if filled {
+            fill(canvas, x as i32, y);
+        } else {
+            // One reading is a point, and a point needs some width to see.
+            let from = (x as i32 - thickness as i32 * 2).max(plot.x);
+            canvas.draw_line_thick((from, y as i32), (x as i32, y as i32), accent, thickness);
+        }
         return;
     }
     // Column by column: the line's height at each pixel, interpolated between
     // the two readings either side of it.
     let first = point(0).0.max(plot.x as f64).ceil() as i32;
     let mut segment = 0;
-    for px in first..plot.right() {
+    for px in (first..plot.right()).filter(|_| filled) {
         let x = px as f64;
         while segment + 1 < newest && point(segment + 1).0 < x {
             segment += 1;
@@ -432,8 +490,57 @@ fn plot_history(
     }
 }
 
-/// A dial: a 270-degree arc, open at the bottom, filled to the reading, with
-/// the reading written inside and the caption in the gap.
+/// Readings as columns with a gap between, newest on the right. There are
+/// fewer columns than readings on anything but a wide tile, so each stands
+/// for a stretch of them and shows its highest: a spike is not averaged
+/// away. The stretches are fixed across the whole history, so a column does
+/// not change what it stands for as the history fills.
+fn plot_columns(
+    canvas: &mut Canvas,
+    plot: Area,
+    history: &std::collections::VecDeque<f64>,
+    capacity: usize,
+    scale: f64,
+    accent: Rgb,
+) {
+    let capacity = capacity.max(history.len()).max(1);
+    let gap = (plot.width / 48).max(1);
+    let columns = (plot.width / (3 + gap)).clamp(1, capacity as u32);
+    let width = plot.width.saturating_sub(gap * (columns - 1)) / columns;
+    if width == 0 || plot.height == 0 {
+        return;
+    }
+    let spare = plot.width - (width * columns + gap * (columns - 1));
+    // Readings missing from the start of a history that is not full yet.
+    let missing = capacity - history.len();
+    let per = capacity as f64 / f64::from(columns);
+    for column in 0..columns {
+        let from = (f64::from(column) * per).floor() as usize;
+        let to = ((f64::from(column + 1) * per).ceil() as usize).clamp(from + 1, capacity);
+        let highest = (from..to)
+            .filter_map(|index| history.get(index.checked_sub(missing)?))
+            .copied()
+            .reduce(f64::max);
+        let Some(value) = highest else {
+            continue;
+        };
+        let height = ((value / scale).clamp(0.0, 1.0) * f64::from(plot.height)).round() as u32;
+        if height == 0 {
+            continue;
+        }
+        let bar = Area::new(
+            plot.x + (spare + column * (width + gap)) as i32,
+            plot.bottom() - height as i32,
+            width,
+            height,
+        );
+        fill_round_rect(canvas, bar, (width / 3).min(2), accent);
+    }
+}
+
+/// A dial: an arc open at the bottom -- 270 degrees unless the widget or its
+/// look says otherwise -- filled to the reading, with the reading written
+/// inside and the caption below.
 fn gauge(
     canvas: &mut Canvas,
     area: Area,
@@ -443,18 +550,30 @@ fn gauge(
     font: Option<&Font>,
     fallback: Option<&str>,
 ) {
-    const START: f32 = 135.0;
-    const SWEEP: f32 = 270.0;
+    let sweep = widget.sweep();
+    // Whatever the dial leaves open is at the bottom, centred.
+    let open = 360.0 - sweep;
+    let start = 90.0 + open / 2.0;
     let inner = area.inset((area.height / 14).max(3));
     let radius = inner.width.min(inner.height) as f32 * 0.5;
-    let thickness = (radius * 0.16).max(3.0);
+    let thickness = (radius * widget.thickness()).max(3.0);
     let middle = radius - thickness / 2.0;
     let (cx, cy) = (
         inner.centre_x() as f32,
-        // Nudged down: the open bottom of the arc has nothing in it, and
-        // centring the circle would leave the top looking crowded.
-        inner.centre_y() as f32 + radius * 0.06,
+        // Nudged down by part of what the open bottom leaves empty, so the
+        // top does not look crowded: none for a full ring, a sixteenth of the
+        // radius for the usual three-quarters.
+        inner.centre_y() as f32 + radius * (1.0 - (open / 2.0).to_radians().cos()) * 0.205,
     );
+    // Where the reading and the caption go: in the gap at the bottom, or
+    // inside a ring that has none, or under an arch.
+    let (value_y, title_y) = if open < 60.0 {
+        (cy - radius * 0.08, cy + radius * 0.34)
+    } else if open > 120.0 {
+        (cy - radius * 0.18, cy + radius * 0.36)
+    } else {
+        (cy, cy + radius * 0.62)
+    };
     let share = state
         .and_then(|s| Some((s.reading.as_ref()?.value()?, s.scale(widget))))
         .map_or(0.0, |(value, scale)| (value / scale).clamp(0.0, 1.0) as f32);
@@ -470,12 +589,12 @@ fn gauge(
                 continue;
             }
             // Clockwise from the start, in screen coordinates.
-            let angle = (y.atan2(x).to_degrees() - START).rem_euclid(360.0);
-            if angle > SWEEP {
+            let angle = (y.atan2(x).to_degrees() - start).rem_euclid(360.0);
+            if angle > sweep {
                 continue;
             }
             let (px, py) = (cx as i32 + dx, cy as i32 + dy);
-            if angle <= SWEEP * share {
+            if angle <= sweep * share {
                 canvas.blend_pixel(px, py, colors.accent, coverage);
             } else {
                 canvas.blend_pixel(px, py, colors.foreground, coverage * 0.18);
@@ -496,7 +615,7 @@ fn gauge(
         font,
         &text,
         cx as i32,
-        cy as i32,
+        value_y as i32,
         size,
         colors.foreground,
         Align::Center,
@@ -512,7 +631,7 @@ fn gauge(
         font,
         &title,
         cx as i32,
-        (cy + radius * 0.62) as i32,
+        title_y as i32,
         size,
         colors.muted(),
         Align::Center,
@@ -990,15 +1109,26 @@ fn state_glyph(
     }
 }
 
-/// What a muted device looks like, for the corner of a mute key.
+/// What a key says about the state of what it stands for, besides its
+/// look: a muted device, for the corner of a mute key, or, for a key with
+/// states, how its state stands.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Glyph {
     Speaker,
     Microphone,
+    /// A "?": which state the key is in could not be read.
+    Unknown,
+    /// A "!": the key's command failed.
+    Warning,
+    /// Not in the corner but a short bar along the bottom edge: the key's
+    /// command is still running.
+    Pending,
 }
 
 /// A small struck-through speaker or microphone in the top-right corner of
-/// `area`, saying the device is muted.
+/// `area`, saying the device is muted. For a key with states, a "?" or a
+/// "!" there instead, knocked out of a disc or a triangle and struck through
+/// by nothing, or for [`Glyph::Pending`] a bar along the bottom edge.
 ///
 /// A glyph rather than a word, because the key's own label is already there
 /// and the corner has room for about one character. `background` edges the
@@ -1045,12 +1175,60 @@ pub fn muted_glyph(canvas: &mut Canvas, area: Area, glyph: Glyph, color: Rgb, ba
             canvas.draw_line_thick(at(0.5, 0.74), at(0.5, 0.94), color, thickness);
             canvas.draw_line_thick(at(0.3, 0.95), at(0.7, 0.95), color, thickness);
         }
+        // Nothing here is muted, so nothing is struck through.
+        Glyph::Unknown => {
+            blend_disc(canvas, at(0.5, 0.5), size / 2, color, 1.0);
+            // The hook, then the dot, in whatever the disc sits on.
+            let hook = [
+                (0.33, 0.37),
+                (0.36, 0.27),
+                (0.43, 0.2),
+                (0.53, 0.19),
+                (0.62, 0.23),
+                (0.66, 0.31),
+                (0.64, 0.39),
+                (0.57, 0.45),
+                (0.51, 0.51),
+                (0.5, 0.6),
+            ];
+            for pair in hook.windows(2) {
+                let ((x1, y1), (x2, y2)) = (pair[0], pair[1]);
+                canvas.draw_line_thick(at(x1, y1), at(x2, y2), background, thickness);
+            }
+            blend_disc(canvas, at(0.5, 0.76), thickness, background, 1.0);
+            return;
+        }
+        Glyph::Warning => {
+            fill_triangle(canvas, at(0.5, 0.03), at(0.02, 0.93), at(0.98, 0.93), color);
+            canvas.draw_line_thick(at(0.5, 0.35), at(0.5, 0.62), background, thickness);
+            blend_disc(canvas, at(0.5, 0.78), thickness, background, 1.0);
+            return;
+        }
+        Glyph::Pending => {
+            pending_bar(canvas, area, color);
+            return;
+        }
     }
     // Edged in the background first, so the strike stays a line of its own
     // where it crosses the shape.
     let (from, to) = (at(0.0, 0.0), at(1.0, 1.0));
     canvas.draw_line_thick(from, to, background, thickness * 2 + 2);
     canvas.draw_line_thick(from, to, color, thickness);
+}
+
+/// A short bar centred along the bottom edge of `area`, saying something is
+/// under way: still, because it is drawn once rather than per frame, and
+/// short, so it does not read as a border.
+fn pending_bar(canvas: &mut Canvas, area: Area, color: Rgb) {
+    let height = (area.height / 24).max(3);
+    let width = area.width * 2 / 5;
+    let bar = Area::new(
+        area.centre_x() - width as i32 / 2,
+        area.bottom() - 3 - height as i32,
+        width,
+        height,
+    );
+    fill_round_rect(canvas, bar, height / 2, color);
 }
 
 /// A weather icon `size` pixels across, centred on `centre`.
@@ -1472,6 +1650,29 @@ mod tests {
     }
 
     #[test]
+    fn a_reading_can_be_drawn_as_nixie_tubes() {
+        let cpu = Widget {
+            view: Some(WidgetView::Nixie),
+            ..Widget::of(WidgetKind::Cpu)
+        };
+        let mut state = SlotState::default();
+        let reading = Reading::Value {
+            text: "42%".to_string(),
+            value: Some(42.0),
+        };
+        state.update(Some(reading), &cpu);
+        let mut canvas = Canvas::filled(160, 160, BG);
+        let area = Area::new(0, 0, 160, 160);
+        widget(&mut canvas, area, &cpu, Some(&state), colors(), None, None);
+        // Neon, warm and bright, where text would have been white.
+        let neon = canvas
+            .as_rgb()
+            .chunks(3)
+            .any(|p| p[0] > 200 && p[0] > p[1] && p[1] > p[2]);
+        assert!(neon);
+    }
+
+    #[test]
     fn a_full_graph_reaches_the_bottom_right_in_the_accent() {
         let widget = Widget {
             view: Some(WidgetView::Graph),
@@ -1664,6 +1865,101 @@ mod tests {
         );
     }
 
+    /// Draw `widget` on a 100-pixel key with these readings.
+    fn drawn(widget: &Widget, values: &[f64]) -> Canvas {
+        let mut canvas = Canvas::filled(100, 100, BG);
+        let readings = state(widget, values);
+        super::widget(
+            &mut canvas,
+            Area::new(0, 0, 100, 100),
+            widget,
+            Some(&readings),
+            colors(),
+            None,
+            None,
+        );
+        canvas
+    }
+
+    /// How many separate stretches of the accent a row crosses.
+    fn runs(canvas: &Canvas, y: i32) -> usize {
+        let lit: Vec<bool> = (0..100)
+            .map(|x| canvas.pixel(x, y).is_some_and(|p| p.r > 150 && p.g < 80))
+            .collect();
+        lit.windows(2).filter(|pair| !pair[0] && pair[1]).count() + usize::from(lit[0])
+    }
+
+    #[test]
+    fn a_line_graph_leaves_what_is_under_the_line_alone() {
+        // Said by its look, as a theme would.
+        let widget = Widget {
+            view: Some(WidgetView::Graph),
+            look: galdeck_model::WidgetLook {
+                graph: Some(GraphStyle::Line),
+                ..Default::default()
+            },
+            ..Widget::of(WidgetKind::Cpu)
+        };
+        let canvas = drawn(&widget, &[100.0; 60]);
+        assert_eq!(canvas.pixel(50, 95), Some(BG));
+    }
+
+    #[test]
+    fn a_column_graph_draws_columns_with_gaps() {
+        let widget = Widget {
+            view: Some(WidgetView::Graph),
+            graph: Some(GraphStyle::Bars),
+            ..Widget::of(WidgetKind::Cpu)
+        };
+        let canvas = drawn(&widget, &[100.0; 60]);
+        assert!(runs(&canvas, 95) > 10, "{} columns", runs(&canvas, 95));
+    }
+
+    #[test]
+    fn a_segmented_bar_lights_whole_steps() {
+        let widget = Widget {
+            view: Some(WidgetView::Bar),
+            bar: Some(BarStyle::Segmented),
+            segments: Some(10),
+            ..Widget::of(WidgetKind::Memory)
+        };
+        let canvas = drawn(&widget, &[50.0]);
+        assert_eq!(runs(&canvas, 100 - 10 - 6), 5);
+    }
+
+    #[test]
+    fn a_flat_bar_has_square_ends() {
+        let flat = Widget {
+            view: Some(WidgetView::Bar),
+            bar: Some(BarStyle::Flat),
+            ..Widget::of(WidgetKind::Memory)
+        };
+        let rounded = Widget {
+            bar: None,
+            ..flat.clone()
+        };
+        // The track's top-left corner: 10 in and 22 up from the bottom.
+        assert_eq!(drawn(&flat, &[100.0]).pixel(10, 78), Some(ACCENT));
+        assert_ne!(drawn(&rounded, &[100.0]).pixel(10, 78), Some(ACCENT));
+    }
+
+    #[test]
+    fn a_ring_that_goes_all_the_way_round_is_lit_at_the_bottom() {
+        let lit = |canvas: &Canvas, y| canvas.pixel(50, y).is_some_and(|p| p.r > 150 && p.g < 80);
+        let ring = Widget {
+            view: Some(WidgetView::Gauge),
+            sweep: Some(360),
+            ..Widget::of(WidgetKind::Memory)
+        };
+        assert!(lit(&drawn(&ring, &[100.0]), 89));
+        // The usual dial is open there.
+        let dial = Widget {
+            sweep: None,
+            ..ring.clone()
+        };
+        assert!(!lit(&drawn(&dial, &[100.0]), 92));
+    }
+
     #[test]
     fn a_clock_face_points_its_hands_at_the_time() {
         let widget = Widget {
@@ -1789,7 +2085,12 @@ mod tests {
 
     #[test]
     fn a_muted_glyph_keeps_to_the_top_right_corner() {
-        for glyph in [Glyph::Speaker, Glyph::Microphone] {
+        for glyph in [
+            Glyph::Speaker,
+            Glyph::Microphone,
+            Glyph::Unknown,
+            Glyph::Warning,
+        ] {
             let mut canvas = Canvas::filled(160, 160, BG);
             muted_glyph(&mut canvas, Area::new(0, 0, 160, 160), glyph, FG, BG);
             let drawn: Vec<(u32, u32)> = (0..160)
@@ -1802,5 +2103,32 @@ mod tests {
                 "{glyph:?} strayed out of its corner"
             );
         }
+    }
+
+    #[test]
+    fn a_state_s_glyphs_are_knocked_out_and_a_pending_bar_keeps_to_the_bottom() {
+        let key = Area::new(0, 0, 160, 160);
+        // The "?" is drawn in the background's colour inside its disc, so
+        // the middle of the disc is not all one colour.
+        let mut canvas = Canvas::filled(160, 160, BG);
+        muted_glyph(&mut canvas, key, Glyph::Unknown, FG, BG);
+        let disc: Vec<Option<Rgb>> = (12..48)
+            .flat_map(|y| (112..148).map(move |x| (x, y)))
+            .map(|(x, y)| canvas.pixel(x, y))
+            .collect();
+        assert!(disc.contains(&Some(FG)) && disc.contains(&Some(BG)));
+
+        let mut canvas = Canvas::filled(160, 160, BG);
+        muted_glyph(&mut canvas, key, Glyph::Pending, FG, BG);
+        let drawn: Vec<(u32, u32)> = (0..160)
+            .flat_map(|y| (0..160).map(move |x| (x, y)))
+            .filter(|&(x, y)| canvas.pixel(x as i32, y as i32) != Some(BG))
+            .collect();
+        assert!(!drawn.is_empty(), "the bar drew nothing");
+        let in_place = |&(x, y): &(u32, u32)| y >= 140 && (40..120).contains(&x);
+        assert!(
+            drawn.iter().all(in_place),
+            "the bar strayed from the bottom's middle"
+        );
     }
 }

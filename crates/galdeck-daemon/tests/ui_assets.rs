@@ -5,6 +5,10 @@ use galdeck_http::CONTENT_SECURITY_POLICY;
 
 const INDEX: &str = include_str!("../ui/index.html");
 const APP_JS: &str = include_str!("../ui/app.js");
+const KEYBOARD_JS: &str = include_str!("../ui/keyboard.js");
+/// Every script the page runs: app.js, and the modules it imports. Each is
+/// held to what app.js is.
+const SCRIPTS: [(&str, &str); 2] = [("app.js", APP_JS), ("keyboard.js", KEYBOARD_JS)];
 const APP_CSS: &str = include_str!("../ui/app.css");
 
 /// The sources one directive of the page's Content-Security-Policy allows.
@@ -22,6 +26,68 @@ fn line_of(text: &str, at: usize) -> usize {
     text[..at].matches('\n').count() + 1
 }
 
+/// The values of a `const NAME = [["value", "label"], ...];` list in app.js.
+fn offered(list: &str) -> Vec<String> {
+    let start = APP_JS
+        .find(&format!("const {list} = ["))
+        .unwrap_or_else(|| panic!("app.js has no {list}"));
+    let body = &APP_JS[start..start + APP_JS[start..].find("];").expect("the list ends")];
+    body.match_indices("[\"")
+        .map(|(at, _)| body[at + 2..].chars().take_while(|c| *c != '"').collect())
+        .collect()
+}
+
+#[test]
+fn every_effect_the_theme_editor_offers_is_one_the_model_takes() {
+    // Offered by name and parsed by the model, so a misspelt one is a save
+    // the daemon refuses with an error nobody can do anything about.
+    let effects = offered("LIGHTING_EFFECTS");
+    assert!(effects.len() >= 5, "{effects:?}");
+    for effect in effects {
+        let parsed: Result<galdeck_model::Lighting, _> =
+            toml::from_str(&format!("effect = \"{effect}\""));
+        assert!(parsed.is_ok(), "the UI offers lighting effect {effect:?}");
+    }
+    let motions = offered("MOTIONS");
+    assert!(motions.len() >= 5, "{motions:?}");
+    for motion in motions {
+        let parsed: Result<galdeck_model::Backdrop, _> =
+            toml::from_str(&format!("animation = \"{motion}\""));
+        assert!(
+            parsed.is_ok(),
+            "the UI offers background animation {motion:?}"
+        );
+    }
+    // Widget looks: each list names one field of `[widgets]`.
+    for (list, field) in [
+        ("LOOK_VIEWS", "view"),
+        ("GRAPH_STYLES", "graph"),
+        ("BAR_STYLES", "bar"),
+    ] {
+        let names = offered(list);
+        assert!(names.len() >= 3, "{list}: {names:?}");
+        for name in names {
+            let parsed: Result<galdeck_model::WidgetLooks, _> =
+                toml::from_str(&format!("{field} = \"{name}\""));
+            assert!(parsed.is_ok(), "the UI offers {field} {name:?}");
+        }
+    }
+    // Motion: each list names the kinds of one setting of `[motion]`.
+    for (list, field) in [
+        ("PRESS_KINDS", "press"),
+        ("ALARM_MOTIONS", "alarm"),
+        ("RING_MOTIONS", "rings"),
+    ] {
+        let names = offered(list);
+        assert!(names.len() >= 2, "{list}: {names:?}");
+        for name in names {
+            let parsed: Result<galdeck_model::MotionStyle, _> =
+                toml::from_str(&format!("{field} = {{ kind = \"{name}\" }}"));
+            assert!(parsed.is_ok(), "the UI offers {field} {name:?}");
+        }
+    }
+}
+
 #[test]
 fn the_page_references_the_assets_that_are_served() {
     assert!(INDEX.contains("/app.js"));
@@ -36,19 +102,23 @@ fn every_api_path_the_ui_fetches_is_one_the_router_answers() {
     let known = [
         "/api/call",
         "/api/events",
+        "/api/login",
         "/api/preview",
         "/api/preview/key/",
         "/api/preview/lcd.jpg",
+        "/api/logos",
     ];
-    for (index, _) in APP_JS.match_indices("/api/") {
-        let tail: String = APP_JS[index..]
-            .chars()
-            .take_while(|c| !"\"'`?$ \n".contains(*c))
-            .collect();
-        assert!(
-            known.iter().any(|k| tail.starts_with(k)),
-            "app.js fetches {tail:?}, which the router does not answer"
-        );
+    for (name, script) in SCRIPTS {
+        for (index, _) in script.match_indices("/api/") {
+            let tail: String = script[index..]
+                .chars()
+                .take_while(|c| !"\"'`?$ \n".contains(*c))
+                .collect();
+            assert!(
+                known.iter().any(|k| tail.starts_with(k)),
+                "{name} fetches {tail:?}, which the router does not answer"
+            );
+        }
     }
 }
 
@@ -76,21 +146,34 @@ fn every_command_the_ui_sends_is_one_the_protocol_has() {
         "zone_pattern",
         "widget_sources",
         "render_widget",
+        "get_themes",
+        "create_theme",
+        "preview_theme",
         "save_asset",
+        "set_key_state",
+        "icon_names",
+        "render_key_state",
+        "which",
+        "fetch_asset",
         "catalog",
         "run_action",
         "geocode",
         "audio_targets",
+        "keyboard_layout",
+        "keyboard_frame",
+        "preview_lighting",
     ];
-    for (index, _) in APP_JS.match_indices("cmd: \"") {
-        let name: String = APP_JS[index + 6..]
-            .chars()
-            .take_while(|c| *c != '"')
-            .collect();
-        assert!(
-            known.contains(&name.as_str()),
-            "app.js sends unknown cmd {name:?}"
-        );
+    for (script_name, script) in SCRIPTS {
+        for (index, _) in script.match_indices("cmd: \"") {
+            let name: String = script[index + 6..]
+                .chars()
+                .take_while(|c| *c != '"')
+                .collect();
+            assert!(
+                known.contains(&name.as_str()),
+                "{script_name} sends unknown cmd {name:?}"
+            );
+        }
     }
 }
 
@@ -104,22 +187,24 @@ fn every_element_the_script_looks_up_exists_in_the_page() {
     // inspector creates is named `f-something`, which is a convention worth
     // holding to on its own -- so those are checked against the script, and
     // everything else against the page.
-    for (index, _) in APP_JS.match_indices("el(\"") {
-        let id: String = APP_JS[index + 4..]
-            .chars()
-            .take_while(|c| *c != '"')
-            .collect();
-        if id.starts_with("f-") {
+    for (name, script) in SCRIPTS {
+        for (index, _) in script.match_indices("el(\"") {
+            let id: String = script[index + 4..]
+                .chars()
+                .take_while(|c| *c != '"')
+                .collect();
+            if id.starts_with("f-") {
+                assert!(
+                    script.contains(&format!("id=\"{id}\"")),
+                    "{name} looks up #{id} but never builds it either"
+                );
+                continue;
+            }
             assert!(
-                APP_JS.contains(&format!("id=\"{id}\"")),
-                "app.js looks up #{id} but never builds it either"
+                INDEX.contains(&format!("id=\"{id}\"")),
+                "{name} looks up #{id}, which index.html does not define"
             );
-            continue;
         }
-        assert!(
-            INDEX.contains(&format!("id=\"{id}\"")),
-            "app.js looks up #{id}, which index.html does not define"
-        );
     }
 }
 
@@ -130,6 +215,7 @@ fn the_assets_are_plain_ascii_text_with_unix_line_endings() {
     for (name, text) in [
         ("index.html", INDEX),
         ("app.js", APP_JS),
+        ("keyboard.js", KEYBOARD_JS),
         ("app.css", APP_CSS),
     ] {
         assert!(!text.contains('\r'), "{name} has CRLF line endings");
@@ -141,12 +227,30 @@ fn the_assets_are_plain_ascii_text_with_unix_line_endings() {
 }
 
 #[test]
-fn the_token_is_taken_out_of_the_address_bar() {
-    // It arrives in the URL because that is the only way to hand it to a
-    // browser, but leaving it there puts it in history and in every referrer.
-    assert!(APP_JS.contains("searchParams.delete(\"token\")"));
-    assert!(APP_JS.contains("history.replaceState"));
+fn the_sign_in_code_leaves_the_address_bar_before_it_is_used() {
+    // It arrives in the URL because that is the only way to hand anything
+    // to a browser, but leaving it there puts it in history and in every
+    // referrer. Taken out first, so a reload never retries a spent code.
+    assert!(APP_JS.contains("searchParams.delete(\"code\")"));
+    let stripped = APP_JS
+        .find("history.replaceState")
+        .expect("the page rewrites its address");
+    let exchanged = APP_JS
+        .find("fetch(\"/api/login\"")
+        .expect("the page signs in");
+    assert!(
+        stripped < exchanged,
+        "the code must leave the address before it is posted"
+    );
     assert!(INDEX.contains(r#"name="referrer" content="no-referrer""#));
+}
+
+#[test]
+fn a_token_in_the_address_is_no_longer_taken() {
+    // Addresses from before sign-in links carried the token itself, and
+    // those are in browser histories. The page only clears them away.
+    assert!(!APP_JS.contains("searchParams.get(\"token\")"));
+    assert!(APP_JS.contains("searchParams.delete(\"token\")"));
 }
 
 #[test]
@@ -156,7 +260,7 @@ fn everything_the_page_loads_by_itself_is_served_without_a_token() {
     // to be public or the page loads with no script and no styling -- which is
     // exactly what happened, and looked like the daemon being unreachable
     // rather than like a 401.
-    let public = ["/", "/index.html", "/app.js", "/app.css"];
+    let public = ["/", "/index.html", "/app.js", "/keyboard.js", "/app.css"];
     let source = include_str!("../src/http.rs");
 
     let mut referenced = Vec::new();
@@ -172,6 +276,12 @@ fn everything_the_page_loads_by_itself_is_served_without_a_token() {
         !referenced.is_empty(),
         "the page should reference its assets"
     );
+    // A module app.js imports is fetched the same way, with no token.
+    for (index, _) in APP_JS.match_indices("import \"./") {
+        let start = index + "import \"./".len();
+        let file: String = APP_JS[start..].chars().take_while(|c| *c != '"').collect();
+        referenced.push(format!("/{file}"));
+    }
 
     for path in &referenced {
         assert!(
@@ -198,8 +308,112 @@ fn the_ui_clears_a_token_the_daemon_rejected() {
 #[test]
 fn a_rejected_token_says_what_to_do_about_it() {
     // "401: a valid token is required" is true and useless.
-    assert!(APP_JS.contains("galdeck ui"));
-    assert!(APP_JS.contains("restarted"));
+    assert!(APP_JS.contains("Run <code>galdeck ui</code> to open it."));
+    assert!(APP_JS.contains("This link has expired: run <code>galdeck ui</code> again."));
+    // A link someone else used first is worth a different answer.
+    assert!(APP_JS.contains(
+        "This link was already used. If that wasn't you, run <code>galdeck ui --new-token</code>."
+    ));
+}
+
+/// Whether `replacement`, a `replace` or `replaceAll` call from its second
+/// argument on, goes in as it is: a function, whose answer does, or a
+/// literal alone with no `$` in it. Any other string is read for `$$`, `$&`,
+/// `` $` `` and `$'`, and a template may put one there.
+fn goes_in_as_it_is(replacement: &str) -> bool {
+    let identifier = |c: char| c.is_ascii_alphanumeric() || c == '_' || c == '$';
+    let mut chars = replacement.chars();
+    match chars.next() {
+        Some(quote @ ('"' | '\'')) => {
+            let body = chars.as_str();
+            let mut escaped = false;
+            for (at, c) in body.char_indices() {
+                if c == '$' {
+                    return false;
+                }
+                if escaped {
+                    escaped = false;
+                } else if c == '\\' {
+                    escaped = true;
+                } else if c == quote {
+                    // The literal alone: `"x" + name` is a string built
+                    // with whatever `name` holds.
+                    return body[at + 1..].trim_start().starts_with(')');
+                }
+            }
+            false
+        }
+        // An arrow function's parameters, then its arrow.
+        Some('(') => {
+            let rest = chars.as_str();
+            let mut depth = 1;
+            for (at, c) in rest.char_indices() {
+                depth += match c {
+                    '(' => 1,
+                    ')' => -1,
+                    _ => 0,
+                };
+                if depth == 0 {
+                    return rest[at + 1..].trim_start().starts_with("=>");
+                }
+            }
+            false
+        }
+        _ => {
+            let name = replacement.trim_start_matches(identifier);
+            replacement.starts_with("function") || name.trim_start().starts_with("=>")
+        }
+    }
+}
+
+#[test]
+fn every_replacement_in_the_script_goes_in_as_it_is() {
+    // A VPN toggle put the connection name someone typed, shell-quoted, in
+    // as a string, and "Corp $$ VPN" came out "Corp $ VPN": a name nobody
+    // has, so the key read and toggled nothing. Read one line at a time, so
+    // a call whose first argument runs past its line says so.
+    assert!(!goes_in_as_it_is("shellQuote(name));"));
+    assert!(!goes_in_as_it_is("\"$&!\");"));
+    assert!(!goes_in_as_it_is("`'${name}'`);"));
+    assert!(!goes_in_as_it_is("(prefix + name));"));
+    assert!(!goes_in_as_it_is("\"'\" + name);"));
+    assert!(goes_in_as_it_is("\"'\\\\''\")}'`;"));
+    assert!(goes_in_as_it_is("() => quoted);"));
+    assert!(goes_in_as_it_is("(c) =>"));
+    assert!(goes_in_as_it_is("c => c.toUpperCase());"));
+
+    let mut calls = 0;
+    for (name, script) in SCRIPTS {
+        for opener in [".replace(", ".replaceAll("] {
+            for (at, _) in script.match_indices(opener) {
+                calls += 1;
+                let line = script[at..].lines().next().unwrap_or_default();
+                let replacement = line.split_once(", ").map(|(_, rest)| rest.trim_start());
+                assert!(
+                    replacement.is_some_and(goes_in_as_it_is),
+                    "{name} line {}: {line} hands replace a string it reads `$` in; pass `() => text`",
+                    line_of(script, at)
+                );
+            }
+        }
+    }
+    assert!(calls > 0, "app.js should replace something");
+}
+
+#[test]
+fn a_finished_timer_is_named_only_on_the_first_page_with_its_id() {
+    // Two pages may share an id, and a timer is kept by it: it ran on the
+    // first. Shown the second, the toast named the key there, some other
+    // timer, as the one that was done.
+    let at = APP_JS
+        .find("addEventListener(\"timer_done\"")
+        .expect("app.js listens for finished timers");
+    let handler = &APP_JS[at..];
+    let handler = &handler[..handler.find("});").expect("the handler ends")];
+    assert!(
+        handler.contains("state.layout.pages.indexOf(page) === state.layout.page_index"),
+        "{handler}"
+    );
 }
 
 // The page is served under a Content-Security-Policy, and a browser enforces
@@ -219,7 +433,11 @@ fn the_ui_builds_no_style_attributes_for_the_policy_to_drop() {
     assert!(style_src.contains(&"'self'"), "app.css would not load");
     assert!(!style_src.contains(&"'unsafe-inline'"));
 
-    for (name, text) in [("index.html", INDEX), ("app.js", APP_JS)] {
+    for (name, text) in [
+        ("index.html", INDEX),
+        ("app.js", APP_JS),
+        ("keyboard.js", KEYBOARD_JS),
+    ] {
         for needle in ["style=\"", "style='", "<style", "setAttribute(\"style\""] {
             if let Some(at) = text.find(needle) {
                 panic!(
@@ -239,14 +457,16 @@ fn the_ui_builds_no_style_attributes_for_the_policy_to_drop() {
     // In the script, an unquoted `style=${vars}` in a template is an
     // attribute all the same. It sits where markup puts one, after whitespace
     // or the quote closing the attribute before it; script spaces its `=`.
-    for (at, _) in APP_JS.match_indices("style=") {
-        let before = APP_JS[..at].chars().next_back().unwrap_or(' ');
-        let markup = before.is_whitespace() || "/\"'".contains(before);
-        if markup && !APP_JS[at + "style=".len()..].starts_with('=') {
-            panic!(
-                "app.js line {} builds a style attribute, which the policy drops",
-                line_of(APP_JS, at)
-            );
+    for (name, script) in SCRIPTS {
+        for (at, _) in script.match_indices("style=") {
+            let before = script[..at].chars().next_back().unwrap_or(' ');
+            let markup = before.is_whitespace() || "/\"'".contains(before);
+            if markup && !script[at + "style=".len()..].starts_with('=') {
+                panic!(
+                    "{name} line {} builds a style attribute, which the policy drops",
+                    line_of(script, at)
+                );
+            }
         }
     }
 }
@@ -262,10 +482,15 @@ fn the_page_runs_one_script_and_it_is_the_module_served_beside_it() {
         "index.html should load app.js and nothing else"
     );
     assert!(INDEX.contains(r#"<script type="module" src="/app.js"></script>"#));
-    assert!(
-        !APP_JS.to_ascii_lowercase().contains("<script"),
-        "app.js builds a script element"
-    );
+    for (name, script) in SCRIPTS {
+        assert!(
+            !script.to_ascii_lowercase().contains("<script"),
+            "{name} builds a script element"
+        );
+    }
+    // The only other script is a module app.js imports, which is fetched
+    // from here like app.js itself.
+    assert!(APP_JS.contains("import \"./keyboard.js\";"));
 }
 
 /// Every `on...=` sitting where markup puts an attribute: after whitespace, a
@@ -298,7 +523,11 @@ fn no_markup_carries_an_inline_event_handler() {
     // An `onclick="..."` attribute or a `javascript:` URL is inline script,
     // which the policy refuses to run; handlers are attached with
     // addEventListener instead.
-    for (name, text) in [("index.html", INDEX), ("app.js", APP_JS)] {
+    for (name, text) in [
+        ("index.html", INDEX),
+        ("app.js", APP_JS),
+        ("keyboard.js", KEYBOARD_JS),
+    ] {
         let handlers = inline_handlers(text);
         assert!(
             handlers.is_empty(),
@@ -334,37 +563,41 @@ fn the_script_talks_only_to_the_daemon_that_served_it() {
     assert!(allowed("connect-src").contains(&"'self'"));
     let identifier = |c: char| c.is_ascii_alphanumeric() || c == '_' || c == '$';
     let mut calls = 0;
-    for opener in ["fetch(", "new EventSource("] {
-        for (at, _) in APP_JS.match_indices(opener) {
-            if APP_JS[..at].ends_with(identifier) {
-                continue; // `refetch(` and the like are someone's own function
+    for (name, script) in SCRIPTS {
+        for opener in ["fetch(", "new EventSource("] {
+            for (at, _) in script.match_indices(opener) {
+                if script[..at].ends_with(identifier) {
+                    continue; // `refetch(` and the like are someone's own function
+                }
+                calls += 1;
+                let mut argument = script[at + opener.len()..].trim_start().chars();
+                let quoted = matches!(argument.next(), Some('"' | '`'));
+                let rooted = argument.next() == Some('/');
+                let local = !matches!(argument.next(), Some('/' | '\\'));
+                assert!(
+                    quoted && rooted && local,
+                    "{name} line {}: {opener}...) is not a same-origin path",
+                    line_of(script, at)
+                );
             }
-            calls += 1;
-            let mut argument = APP_JS[at + opener.len()..].trim_start().chars();
-            let quoted = matches!(argument.next(), Some('"' | '`'));
-            let rooted = argument.next() == Some('/');
-            let local = !matches!(argument.next(), Some('/' | '\\'));
+        }
+        for other in ["XMLHttpRequest", "WebSocket", "sendBeacon"] {
             assert!(
-                quoted && rooted && local,
-                "app.js line {}: {opener}...) is not a same-origin path",
-                line_of(APP_JS, at)
+                !script.contains(other),
+                "{name} uses {other}, which this test does not check"
             );
         }
     }
-    assert!(calls > 0, "app.js should call the daemon");
-    for other in ["XMLHttpRequest", "WebSocket", "sendBeacon"] {
-        assert!(
-            !APP_JS.contains(other),
-            "app.js uses {other}, which this test does not check"
-        );
-    }
+    assert!(calls > 0, "the scripts should call the daemon");
 }
 
 #[test]
 fn the_script_makes_no_object_urls() {
     // The policy allows no `blob:` source anywhere, so an object URL would
     // load nothing. Nothing needs one: previews come back as data: URLs.
-    assert!(!APP_JS.contains("createObjectURL"));
+    for (name, script) in SCRIPTS {
+        assert!(!script.contains("createObjectURL"), "{name} makes one");
+    }
 }
 
 #[test]

@@ -31,6 +31,7 @@
 <nav class="tabs">
   <button data-tab="deck" class="active">Deck</button>
   <button data-tab="theme">Theme</button>
+  <button data-tab="keyboard">Keyboard</button>
   <button data-tab="calibration">Calibration</button>
   <button data-tab="raw">Files</button>
 </nav>
@@ -41,25 +42,31 @@
          the previews are drawn by the daemon in the current theme. -->
     <aside id="gallery" class="gallery">
       <h2>Widgets</h2>
-      <p class="hint">Drag onto the screen or a key. Click to add to the screen.</p>
+      <p class="hint">Drag onto the screen or a key. Click to add to the screen, or a toggle to the
+        key that is selected.</p>
       <ul id="gallery-list" class="gallery-list"></ul>
     </aside>
     <div class="deck">
-      <!-- The overlay is where the screen's widgets are laid out: it sits on
-           the preview, cell for cell, so a tile is dragged over the pixels it
-           will cover. -->
-      <div id="lcd-wrap" class="lcd-wrap">
-        <img id="lcd" alt="LCD panel" class="lcd">
-        <div id="lcd-tiles" class="lcd-tiles"></div>
-      </div>
       <div class="deck-bar">
         <p class="lcd-hint">Click the screen to lay out widgets on it, or drag across it to add one.</p>
         <button id="page-new" type="button">New page…</button>
         <button id="background-edit" type="button">Background…</button>
         <button id="outputs-edit" type="button">Outputs…</button>
       </div>
-      <div id="grid" class="grid"></div>
-      <div id="encoders" class="encoders"></div>
+      <!-- The module as it sits on the keyboard: the two knobs along the
+           top, the screen under them, and the keys centred under the
+           screen. -->
+      <div class="deck-module">
+        <div id="encoders" class="encoders"></div>
+        <!-- The overlay is where the screen's widgets are laid out: it sits
+             on the preview, cell for cell, so a tile is dragged over the
+             pixels it will cover. -->
+        <div id="lcd-wrap" class="lcd-wrap">
+          <img id="lcd" alt="LCD panel" class="lcd">
+          <div id="lcd-tiles" class="lcd-tiles"></div>
+        </div>
+        <div id="grid" class="grid"></div>
+      </div>
     </div>
     <aside id="inspector" class="inspector">
       <p class="empty">Select a key or an encoder.</p>
@@ -67,7 +74,85 @@
   </section>
 
   <section id="tab-theme" class="tab">
-    <div id="theme-editor"></div>
+    <aside class="theme-list">
+      <h2>Themes</h2>
+      <ul id="theme-list"></ul>
+      <button id="theme-new" type="button">New theme…</button>
+    </aside>
+    <div id="theme-editor" class="theme-form"></div>
+    <!-- Drawn by the daemon with the form's edits applied, before they are
+         saved: the real renderer's output, not a mock-up in CSS. -->
+    <aside class="theme-preview">
+      <h2>Preview</h2>
+      <img id="theme-preview-lcd" class="theme-preview-lcd" alt="The screen in this theme" hidden>
+      <div id="theme-preview-keys" class="theme-preview-keys"></div>
+      <div id="theme-preview-extras" class="theme-preview-extras"></div>
+      <ul id="theme-preview-problems" class="theme-preview-problems"></ul>
+    </aside>
+  </section>
+
+  <section id="tab-keyboard" class="tab">
+    <!-- The keyboard's own lighting, drawn from its LED layout: what it shows
+         right now, or a design drawn before it is saved, by the same renderer
+         that lights the keyboard. Run by keyboard.js. -->
+    <div class="kb">
+      <div class="kb-bar">
+        <div class="kb-modes">
+          <button id="kb-mode-live" type="button" class="active">Live</button>
+          <button id="kb-mode-design" type="button">Design</button>
+        </div>
+        <span id="kb-status" class="kb-status"></span>
+      </div>
+      <svg id="kb-board" class="kb-board" role="img" aria-label="The keyboard's lighting"></svg>
+      <p id="kb-hover" class="kb-hover"></p>
+      <div id="kb-design" class="kb-design" hidden>
+        <details class="kb-help">
+          <summary>How designing works</summary>
+          <ol>
+            <li>Drag an <b>effect</b> onto the keyboard above to light every key with it.</li>
+            <li>Drag a <b>reaction</b> onto the keyboard to choose how a key answers when it is pressed.
+              Click a key above to try it.</li>
+            <li>Drag a <b>colour</b> onto a key to paint just that key, or hold Shift as you drop to paint
+              its whole group. Drop one on a group's name below, on the light bar along the top, or on
+              the keyboard's background to light every key that colour.</li>
+            <li>Set the pace and brightness with the sliders. Everything you do is written into the text
+              below, which you can also edit by hand.</li>
+            <li>Pick where to save it and press Save. Saved to this profile, it shows only on this
+              profile; saved to its theme, on every profile that uses the theme.</li>
+          </ol>
+          <p>Pressed keys only light up once key reports are turned on; see
+            <code>docs/keyboard-lighting.md</code> in the daemon's repository.</p>
+        </details>
+        <div class="kb-gallery">
+          <h3>Effects</h3>
+          <div id="kb-effects" class="kb-tiles"></div>
+          <h3>Reactions</h3>
+          <div id="kb-reactions" class="kb-tiles"></div>
+          <h3>Colours</h3>
+          <div id="kb-colours" class="kb-tiles"></div>
+          <h3>Groups <span class="kb-hint">drop a colour on one to paint it</span></h3>
+          <div id="kb-groups" class="kb-chips"></div>
+        </div>
+        <div class="kb-controls">
+          <label for="kb-speed">Speed</label>
+          <input id="kb-speed" type="range" min="0" max="100" step="any">
+          <span id="kb-speed-shown" class="kb-hint"></span>
+          <label for="kb-brightness">Brightness</label>
+          <input id="kb-brightness" type="range" min="0" max="100" step="1">
+          <span id="kb-brightness-shown" class="kb-hint"></span>
+          <button id="kb-clear-keys" type="button">Clear painted keys</button>
+        </div>
+        <label for="kb-lighting">The design, written as a theme's <code>[lighting]</code></label>
+        <textarea id="kb-lighting" rows="12" spellcheck="false"></textarea>
+        <p class="kb-hint">Click a key on the keyboard to see how it answers a press.</p>
+        <ul id="kb-problems" class="kb-problems"></ul>
+        <div class="kb-save">
+          <label for="kb-target">Save to</label>
+          <select id="kb-target"></select>
+          <button id="kb-save" type="button">Save</button>
+        </div>
+      </div>
+    </div>
   </section>
 
   <section id="tab-calibration" class="tab">
@@ -100,6 +185,7 @@
           <label>bleed x<input name="bleed_x" type="number" step="1"></label>
           <label>bleed y<input name="bleed_y" type="number" step="1"></label>
         </form>
+        <div id="cal-form-note"></div>
         <div class="cal-actions">
           <button id="cal-save" type="button">Save</button>
           <button id="cal-revert" type="button">Revert</button>
@@ -146,6 +232,23 @@
 
 <div id="diagnostics" class="diagnostics" hidden></div>
 <div id="toast" class="toast" hidden></div>
+
+<dialog id="logo-picker" class="logo-picker" aria-labelledby="logo-picker-title">
+  <div class="logo-bar">
+    <h2 id="logo-picker-title">App logos</h2>
+    <input id="logo-search" type="search" placeholder="Search" aria-label="Search the logos">
+    <div class="logo-styles" role="radiogroup" aria-label="How the logo is drawn">
+      <label title="The logo in white on its brand's colour: logo-name">
+        <input type="radio" name="logo-style" id="logo-style-tile" checked> Brand tile</label>
+      <label title="The logo alone, in the key's label colour: logo-name-symbolic">
+        <input type="radio" name="logo-style" id="logo-style-symbolic"> Label colour</label>
+    </div>
+    <button id="logo-close" type="button">Close</button>
+  </div>
+  <div id="logo-grid" class="logo-grid"></div>
+  <p id="logo-none" class="hint" hidden>No logo matches that.</p>
+  <p class="hint logo-credit">Logos from Simple Icons, under CC0. They are their owners' trademarks.</p>
+</dialog>
 
 <script type="module" src="/app.js"></script>
 </body>

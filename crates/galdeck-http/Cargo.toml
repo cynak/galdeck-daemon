@@ -14,3 +14,7 @@ description = "A small HTTP/1.1 subset and server-sent events, for serving the g
 # device.
 [dependencies]
 log.workspace = true
+
+# Only for comparing a real connection's owner with our own uid.
+[dev-dependencies]
+libc.workspace = true

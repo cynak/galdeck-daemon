@@ -20,12 +20,13 @@ fn example() -> Workspace {
 }
 
 #[test]
-fn the_shipped_example_has_two_profiles_and_two_themes() {
+fn the_shipped_example_has_two_profiles_and_three_themes() {
     let workspace = example();
     assert_eq!(workspace.start_profile(), Some("work"));
     assert!(workspace.profile("work").is_some());
     assert!(workspace.profile("play").is_some());
-    assert_eq!(workspace.themes.len(), 2);
+    assert_eq!(workspace.themes.len(), 3);
+    assert!(workspace.themes.contains_key("nixie"));
 }
 
 #[test]
@@ -120,4 +121,28 @@ fn extending_a_theme_moves_everything_that_referenced_the_changed_token() {
     assert_eq!(style.key_bg, Rgb::new(0x4c, 0x56, 0x6a));
     assert_eq!(from.key_bg, StyleSource::Theme);
     assert_eq!(style.key_label_size, 30.0, "the child overrides the size");
+}
+
+#[test]
+fn the_nixie_theme_is_clean_and_lights_the_keyboard_like_its_tubes() {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../config/v2");
+    let (workspace, diagnostics) = Workspace::load(&dir);
+    let about: Vec<_> = diagnostics
+        .iter()
+        .filter(|d| d.path.contains("nixie"))
+        .collect();
+    assert!(
+        about.is_empty(),
+        "nothing about it is worth saying: {about:#?}"
+    );
+
+    let workspace = workspace.expect("the shipped example must load");
+    let mut profile = workspace.profile("play").expect("play").clone();
+    profile.theme = Some("nixie".to_string());
+    profile.lighting = None;
+    let lighting = workspace
+        .lighting_for(&profile, &mut Diagnostics::new())
+        .expect("the nixie theme lights the keyboard");
+    assert_eq!(lighting.effect, galdeck_model::LightingEffect::Breathe);
+    assert_eq!(lighting.colors, [Rgb::from_hex("#ff7a22").unwrap()]);
 }

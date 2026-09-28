@@ -1,0 +1,37 @@
+# Nixie: a dark workshop lit by glowing tubes.
+#
+# Every widget that shows a number draws it as nixie tubes -- its digits, and
+# its unit on a symbol tube as on real IN-19s: `42%`, `63°C`, `12M` -- under
+# a title that glows like the neon inside them. Clocks, timers and
+# stopwatches count in tubes too. Weather and what is playing keep their
+# cards: a tube has nothing to show for them.
+#
+# Use it from a profile with `theme = "nixie"`.
+name = "Nixie"
+
+[palette]
+room = "#0d0a08"
+brass = "#8a6a4a"
+# What a lit cathode glows, and the same turned down low.
+neon = "#ff7a22"
+ember = "#7a2e10"
+accent = "@neon"
+
+[style]
+key_bg = "@room"
+key_label_color = "@brass"
+lcd_bg = "@room"
+lcd_text_color = "@neon"
+ring = "@accent"
+
+# Every widget, whatever its kind, that tubes can draw.
+[widgets]
+view = "nixie"
+
+# The keyboard glows along with the tubes: slowly, and not too bright.
+[lighting]
+effect = "breathe"
+colors = ["@neon"]
+speed = 0.08
+brightness = 35
+bar = "@ember"

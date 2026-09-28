@@ -11,6 +11,7 @@
 use std::sync::mpsc::{SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 
+use galdeck::keyboard::LightFrame;
 use galdeck::{Buttons, Encoders, Rgb, Ring};
 use galdeck_ipc::Event;
 
@@ -42,6 +43,8 @@ impl Frame {
 pub struct Preview {
     frame: Arc<Mutex<Frame>>,
     subscribers: Arc<Mutex<Vec<SyncSender<Event>>>>,
+    /// What the keyboard's lighting was last sent, while the daemon lights it.
+    keyboard: Arc<Mutex<Option<LightFrame>>>,
 }
 
 impl Default for Preview {
@@ -55,7 +58,18 @@ impl Preview {
         Self {
             frame: Arc::new(Mutex::new(Frame::new())),
             subscribers: Arc::new(Mutex::new(Vec::new())),
+            keyboard: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// What the keyboard's lighting shows, or `None` while the daemon is not
+    /// lighting it.
+    pub fn keyboard(&self) -> Option<LightFrame> {
+        self.keyboard.lock().expect("preview poisoned").clone()
+    }
+
+    pub fn set_keyboard(&self, frame: Option<LightFrame>) {
+        *self.keyboard.lock().expect("preview poisoned") = frame;
     }
 
     pub fn frame(&self) -> Frame {

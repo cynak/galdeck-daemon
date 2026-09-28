@@ -1,5 +1,6 @@
 //! Unix-socket control server: line-delimited JSON requests, answered by
-//! the engine thread.
+//! the engine thread -- all but the configuration UI's sign-in, which is
+//! answered here.
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
@@ -12,6 +13,11 @@ use anyhow::{bail, Context, Result};
 use galdeck_ipc::{Request, Response};
 
 use crate::engine::{ControlMsg, ControlSender};
+use crate::http::{UiLogins, LOGIN_TTL};
+
+/// What `ui_login` and `ui_rotate_token` answer when the daemon was started
+/// without `--http`. The CLI recognises it by its start and says what to do.
+pub const UI_OFF: &str = "the UI is off: start the daemon with --http <port> to serve it";
 
 const REPLY_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -95,13 +101,16 @@ fn ensure_private_dir(dir: &Path) -> Result<()> {
 }
 
 /// Accept connections forever, forwarding requests to the engine.
-pub fn serve(listener: UnixListener, control_tx: ControlSender) {
+///
+/// `logins` is the configuration UI's, when it is being served.
+pub fn serve(listener: UnixListener, control_tx: ControlSender, logins: Option<UiLogins>) {
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
                 let tx = control_tx.clone();
+                let logins = logins.clone();
                 std::thread::spawn(move || {
-                    if let Err(e) = handle_client(stream, tx) {
+                    if let Err(e) = handle_client(stream, tx, logins) {
                         log::debug!("client connection ended: {e:#}");
                     }
                 });
@@ -118,7 +127,11 @@ pub fn serve(listener: UnixListener, control_tx: ControlSender) {
 
 const CLIENT_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 
-fn handle_client(stream: UnixStream, control_tx: ControlSender) -> Result<()> {
+fn handle_client(
+    stream: UnixStream,
+    control_tx: ControlSender,
+    logins: Option<UiLogins>,
+) -> Result<()> {
     // Don't let an idle client pin its handler thread forever.
     stream.set_read_timeout(Some(CLIENT_IDLE_TIMEOUT))?;
     let mut writer = stream.try_clone()?;
@@ -130,6 +143,13 @@ fn handle_client(stream: UnixStream, control_tx: ControlSender) -> Result<()> {
             continue;
         }
         let response = match serde_json::from_str::<Request>(&line) {
+            // Answered here rather than by the engine, which knows neither
+            // the codes nor the token. This socket is 0600 and this user's,
+            // which is what makes a code it hands out safe to trust; the
+            // engine refuses both, and so does the UI's /api/call, so a
+            // browser can never mint itself one.
+            Ok(Request::UiLogin { ttl_s }) => ui_login(logins.as_ref(), ttl_s),
+            Ok(Request::UiRotateToken) => ui_rotate_token(logins.as_ref()),
             Ok(request) => {
                 let (reply_tx, reply_rx) = channel();
                 if control_tx
@@ -159,4 +179,45 @@ fn handle_client(stream: UnixStream, control_tx: ControlSender) -> Result<()> {
         writer.write_all(payload.as_bytes())?;
     }
     Ok(())
+}
+
+/// A one-time code for the configuration UI.
+fn ui_login(logins: Option<&UiLogins>, ttl_s: Option<u32>) -> Response {
+    let Some(logins) = logins else {
+        return Response::Error {
+            message: UI_OFF.into(),
+        };
+    };
+    // At least a second, so a code is never born dead; the store caps the
+    // other end.
+    let ttl = ttl_s.map_or(LOGIN_TTL, |seconds| {
+        Duration::from_secs(u64::from(seconds.max(1)))
+    });
+    match logins.mint(ttl) {
+        Ok(code) => Response::UiLogin {
+            port: logins.port(),
+            code,
+        },
+        Err(e) => Response::Error {
+            message: format!("{e:#}"),
+        },
+    }
+}
+
+/// A new UI token, signing every open tab out.
+fn ui_rotate_token(logins: Option<&UiLogins>) -> Response {
+    let Some(logins) = logins else {
+        return Response::Error {
+            message: UI_OFF.into(),
+        };
+    };
+    match logins.rotate_token() {
+        Ok(()) => {
+            log::info!("the UI token was replaced; open tabs need `galdeck ui` again");
+            Response::Ok
+        }
+        Err(e) => Response::Error {
+            message: format!("{e:#}"),
+        },
+    }
 }

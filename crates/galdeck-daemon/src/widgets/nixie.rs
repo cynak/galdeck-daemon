@@ -1,5 +1,5 @@
-//! A nixie tube clock: a glowing tube for each digit of the time, standing
-//! in a dark room that is lit mostly by the tubes themselves.
+//! Nixie tubes: a glowing tube for each digit of the time or of a reading,
+//! standing in a dark room that is lit mostly by the tubes themselves.
 //!
 //! Everything that moves -- the glow's shimmer, the odd tube flickering, the
 //! haze and the dust drifting through the light -- is a pure function of the
@@ -18,6 +18,11 @@
 //! The tubes come from the formatted time rather than from the clock itself,
 //! so `format` decides how many there are: `%H:%M:%S` is six, `%H:%M` four,
 //! and `%l:%M` leaves the first tube dark before ten o'clock.
+//!
+//! A reading's unit goes on a symbol tube, as it did on real IN-19s: `42%`
+//! is three tubes, `63°C` three, and the `12M` of a network rate three. A
+//! symbol tube stacks its symbols as a digit tube stacks its digits. The
+//! title is lit as well: its letters glow as neon, as the wires do.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -44,8 +49,6 @@ const SHEEN: Rgb = Rgb::new(160, 136, 116);
 /// The cathodes nobody lit, and the wires of the anode mesh in front.
 const CAGE_METAL: Rgb = Rgb::new(72, 58, 48);
 const MESH_WIRE: Rgb = Rgb::new(4, 3, 3);
-/// A caption in the room: engraved, not lit.
-const ENGRAVING: Rgb = Rgb::new(128, 106, 88);
 /// Smoke and dust, where the tubes light them.
 const HAZE: Rgb = Rgb::new(255, 176, 120);
 const DUST: Rgb = Rgb::new(255, 204, 156);
@@ -81,20 +84,48 @@ pub fn now() -> f64 {
 /// What a character of the formatted time becomes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Glyph {
-    /// A tube, lit with a digit or left dark.
+    /// A tube, lit with a cathode -- a digit, or past nine a symbol -- or
+    /// left dark.
     Tube(Option<u8>),
     /// The space between groups of tubes, with this many lamps in it: two
     /// for a `:`, one low down for a `.`, none for anything else.
     Separator(u8),
 }
 
+/// The symbol cathodes, numbered on from the ten digits. Real IN-19 tubes
+/// carried symbols like these for readings rather than the time: a percent
+/// sign, `k` and `M`, a sign, and on one model `°C`.
+const PERCENT: u8 = 10;
+const DEGREE: u8 = 11;
+const CELSIUS: u8 = 12;
+const FAHRENHEIT: u8 = 13;
+const KILO: u8 = 14;
+const MEGA: u8 = 15;
+const GIGA: u8 = 16;
+const PLUS: u8 = 17;
+const MINUS: u8 = 18;
+/// Every symbol, stacked in a symbol tube as the digits are in a digit tube.
+const SYMBOLS: std::ops::RangeInclusive<u8> = PERCENT..=MINUS;
+
+fn is_symbol(cathode: u8) -> bool {
+    cathode >= PERCENT
+}
+
 /// The tubes and separators for `text`.
 fn glyphs(text: &str) -> Vec<Glyph> {
     let chars: Vec<char> = text.chars().collect();
     let mut out: Vec<Glyph> = Vec::new();
+    // Set when a symbol has taken the character after it too: the `C` of `°C`.
+    let mut taken = false;
     for (i, &c) in chars.iter().enumerate() {
+        if std::mem::take(&mut taken) {
+            continue;
+        }
         let before = i.checked_sub(1).map(|j| chars[j]);
         let after = chars.get(i + 1);
+        // A unit's letter is a tube only straight after a number: the `M` of
+        // `12M` is, the `M` of `PM` is not.
+        let after_number = before.is_some_and(|b| b.is_ascii_digit());
         let glyph = match c {
             '0'..='9' => Glyph::Tube(c.to_digit(10).map(|d| d as u8)),
             // The padding `%k` and `%l` put before a single digit: the tube
@@ -106,6 +137,25 @@ fn glyphs(text: &str) -> Vec<Glyph> {
             }
             ':' => Glyph::Separator(2),
             '.' => Glyph::Separator(1),
+            '%' => Glyph::Tube(Some(PERCENT)),
+            '°' => Glyph::Tube(Some(match after {
+                Some('C' | 'c') => {
+                    taken = true;
+                    CELSIUS
+                }
+                Some('F' | 'f') => {
+                    taken = true;
+                    FAHRENHEIT
+                }
+                _ => DEGREE,
+            })),
+            'K' | 'k' if after_number => Glyph::Tube(Some(KILO)),
+            'M' if after_number => Glyph::Tube(Some(MEGA)),
+            'G' if after_number => Glyph::Tube(Some(GIGA)),
+            // A sign before a number, not the dash between two a date has.
+            '+' | '-' | '−' if !after_number && after.is_some_and(char::is_ascii_digit) => {
+                Glyph::Tube(Some(if c == '+' { PLUS } else { MINUS }))
+            }
             // A weekday, AM or PM: there is no tube that shows letters.
             c if c.is_alphabetic() => continue,
             _ => Glyph::Separator(0),
@@ -123,7 +173,8 @@ fn glyphs(text: &str) -> Vec<Glyph> {
     out
 }
 
-/// Draw `text` -- the time, already formatted -- at animation time `t`.
+/// Draw `text` -- the time or a reading, already formatted -- at animation
+/// time `t`.
 ///
 /// The neon is orange unless the widget has a `color`, and the tubes stand
 /// in a dark room unless it has a background or an image of its own.
@@ -155,25 +206,10 @@ pub fn draw(
     };
     still(&mut s, &layout, look, t);
     light_up(&mut s, &layout, look, t);
-    *canvas = Canvas::from_rgb(width, height, pixels).expect("a canvas's own pixels fit it");
-    if let (Some((title, font)), Some((y, size))) = (caption, layout.caption) {
-        let color = if look.room >= 0.5 {
-            ENGRAVING
-        } else {
-            colors.foreground.lerp(colors.background, 0.4)
-        };
-        draw::label(
-            canvas,
-            font,
-            title,
-            area.x + area.width as i32 / 2,
-            area.y + y.round() as i32,
-            size,
-            color,
-            Align::Center,
-            layout.inner_width,
-        );
+    if let (Some((title, font)), Some(at)) = (caption, layout.caption) {
+        caption_light(&mut s, font, title, at, layout.inner_width, look, t);
     }
+    *canvas = Canvas::from_rgb(width, height, pixels).expect("a canvas's own pixels fit it");
 }
 
 /// The colours a clock is drawn in.
@@ -188,7 +224,8 @@ struct Look {
 
 impl Look {
     fn of(widget: &Widget, colors: Colors) -> Self {
-        let own = widget.color.is_some();
+        // Its own colour, or its theme's for clocks: either way, asked for.
+        let own = widget.color().is_some();
         let neon = if own { colors.accent } else { NEON };
         Self {
             neon,
@@ -197,7 +234,7 @@ impl Look {
             } else {
                 HOT
             },
-            room: if widget.background.is_none() && widget.image.is_none() {
+            room: if widget.background().is_none() && widget.image.is_none() {
                 widget.opacity()
             } else {
                 0.0
@@ -279,6 +316,7 @@ impl Layout {
                         y: self.top.round() as i32,
                         w: self.tube_w.round() as u32,
                         h: self.tube_h.round() as u32,
+                        symbols: digit.is_some_and(is_symbol),
                     },
                     digit,
                 )),
@@ -340,6 +378,7 @@ impl Layout {
         self.placed
             .iter()
             .map(|(glyph, _)| match *glyph {
+                Glyph::Tube(Some(c)) if is_symbol(c) => b'S',
                 Glyph::Tube(Some(_)) => b'T',
                 Glyph::Tube(None) => b'D',
                 Glyph::Separator(count) => b'0' + count,
@@ -614,12 +653,142 @@ fn light_up(s: &mut Surface, layout: &Layout, look: Look, t: f64) {
     dust(s, &layout.lights(), t, look);
 }
 
+/// The title, lit as the tubes are: its letters glowing neon, their light
+/// spilling into the room around them, shimmering a little on its own.
+fn caption_light(
+    s: &mut Surface,
+    font: &Font,
+    title: &str,
+    at: (f32, f32),
+    width: u32,
+    look: Look,
+    t: f64,
+) {
+    let key = CaptionKey {
+        title: title.to_string(),
+        font: font_print(font),
+        area: (s.area.width, s.area.height),
+        at: (at.0.to_bits(), at.1.to_bits()),
+        width,
+    };
+    let glow = kept(
+        |kept| &mut kept.captions,
+        key,
+        32,
+        || build_caption(font, title, (s.area.width, s.area.height), at, width),
+    );
+    let lit = 0.9 + 0.1 * noise(0x6361_7074, (t * 6.0) as u64);
+    for &(x, y, core, halo) in glow.iter() {
+        s.add(
+            x,
+            y,
+            light([(look.neon, halo * lit), (look.hot, core * lit)]),
+        );
+    }
+}
+
+/// Where a title's neon reaches, in a `size` area with the title's middle
+/// `at` its height and size: its letters, and a near and a far glow around
+/// them.
+fn build_caption(
+    font: &Font,
+    title: &str,
+    size: (u32, u32),
+    at: (f32, f32),
+    width: u32,
+) -> CaptionGlow {
+    let (w, h) = size;
+    // The letters, as coverage: white on black, drawn as any label is.
+    let mut mask = Canvas::filled(w, h, Rgb::BLACK);
+    draw::label(
+        &mut mask,
+        font,
+        title,
+        w as i32 / 2,
+        at.0.round() as i32,
+        at.1,
+        Rgb::WHITE,
+        Align::Center,
+        width,
+    );
+    let letters: Vec<f32> = mask
+        .as_rgb()
+        .chunks(3)
+        .map(|p| f32::from(p[0]) / 255.0)
+        .collect();
+    let near = blur(
+        &letters,
+        w as usize,
+        h as usize,
+        (at.1 * 0.1).max(1.0) as usize,
+    );
+    let far = blur(
+        &letters,
+        w as usize,
+        h as usize,
+        (at.1 * 0.35).max(2.0) as usize,
+    );
+    let mut out = Vec::new();
+    for (i, ((&core, &near), &far)) in letters.iter().zip(&near).zip(&far).enumerate() {
+        let (core, halo) = (core * 0.9, 0.6 * near + 0.3 * far);
+        if core + halo > 0.004 {
+            out.push(((i % w as usize) as i32, (i / w as usize) as i32, core, halo));
+        }
+    }
+    out
+}
+
+/// `values`, a `w` by `h` grid, softened by a box `radius` either side, twice
+/// over, which is near enough a gaussian for a glow.
+fn blur(values: &[f32], w: usize, h: usize, radius: usize) -> Vec<f32> {
+    let mut out = values.to_vec();
+    for _ in 0..2 {
+        out = box_pass(&out, w, h, radius, true);
+        out = box_pass(&out, w, h, radius, false);
+    }
+    out
+}
+
+/// One pass of a box blur along the rows, or down the columns: a running
+/// sum, so its cost does not grow with the radius.
+fn box_pass(values: &[f32], w: usize, h: usize, radius: usize, across: bool) -> Vec<f32> {
+    let (lines, length) = if across { (h, w) } else { (w, h) };
+    let at = |line: usize, i: usize| if across { line * w + i } else { i * w + line };
+    let span = (2 * radius + 1) as f32;
+    let mut out = vec![0.0; values.len()];
+    for line in 0..lines {
+        let mut sum: f32 = (0..=radius.min(length.saturating_sub(1)))
+            .map(|i| values[at(line, i)])
+            .sum();
+        for i in 0..length {
+            out[at(line, i)] = sum / span;
+            if i + radius + 1 < length {
+                sum += values[at(line, i + radius + 1)];
+            }
+            if i >= radius {
+                sum -= values[at(line, i - radius)];
+            }
+        }
+    }
+    out
+}
+
+/// Something that tells fonts apart, for keeping a title's glow: a font has
+/// no name to go by, and a reload swaps it in place.
+fn font_print(font: &Font) -> u64 {
+    let width = font.measure("Hamburgefonstiv 0123", 64.0).to_bits();
+    let ascent = font.ascent(64.0).to_bits();
+    (u64::from(width) << 32) | u64::from(ascent)
+}
+
 #[derive(Clone, Copy)]
 struct Tube {
     x: i32,
     y: i32,
     w: u32,
     h: u32,
+    /// Whether it holds the symbols rather than the digits.
+    symbols: bool,
 }
 
 impl Tube {
@@ -654,7 +823,7 @@ impl Tube {
         let at = Cathodes::of(self.w, self.h);
         let (span, _) = at.span();
         let (ox, oy) = at.origin();
-        for (i, &wire) in cage(self.w, self.h).iter().enumerate() {
+        for (i, &wire) in cage(self.w, self.h, self.symbols).iter().enumerate() {
             if wire > 0.0 {
                 let (sx, sy) = ((i as u32 % span) as i32, (i as u32 / span) as i32);
                 s.blend(self.x + ox + sx, self.y + oy + sy, CAGE_METAL, 0.45 * wire);
@@ -958,14 +1127,26 @@ struct SceneKey {
     caption: bool,
 }
 
+/// What a lit title depends on.
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct CaptionKey {
+    title: String,
+    font: u64,
+    area: (u32, u32),
+    /// Its middle's height and its size, as bits: floats do not hash.
+    at: (u32, u32),
+    width: u32,
+}
+
 /// What is kept between frames. Everything here is costly to work out and
 /// depends only on sizes, which change when a layout is edited and not
 /// otherwise; each map starts over when it fills, which only a daemon whose
 /// layout is edited all day will see.
 #[derive(Default)]
 struct Kept {
-    /// Every digit's wire at once, per tube size: the cathodes nobody lit.
-    cages: HashMap<(u32, u32), Rc<Vec<f32>>>,
+    /// Every cathode's wire at once, per tube size and whether the tube
+    /// holds symbols: the cathodes nobody lit.
+    cages: HashMap<(u32, u32, bool), Rc<Vec<f32>>>,
     /// Per digit and tube size, how much of a lit wire's core and halo
     /// reaches each pixel past the mesh and the other cathodes.
     glows: HashMap<(u8, u32, u32), Rc<Glow>>,
@@ -978,6 +1159,8 @@ struct Kept {
     /// Per tile, those with the haze over them, and which step of the
     /// haze that is.
     hazy: HashMap<SceneKey, (u64, Rc<Vec<u8>>)>,
+    /// Per title, font and place, how much of its neon reaches each pixel.
+    captions: HashMap<CaptionKey, Rc<CaptionGlow>>,
 }
 
 /// Per pixel of a digit's sprite, how much of a lit wire's core and halo
@@ -986,6 +1169,9 @@ type Glow = Vec<[f32; 2]>;
 /// Where a tube's glass throws its own light back: points from the tube's
 /// top left, and how strongly.
 type Rim = Vec<(i32, i32, f32)>;
+/// Where a lit title's neon reaches: points in its area, and how much of the
+/// letters' core and glow reaches each.
+type CaptionGlow = Vec<(i32, i32, f32, f32)>;
 
 thread_local! {
     static KEPT: RefCell<Kept> = RefCell::new(Kept::default());
@@ -1014,8 +1200,13 @@ fn kept<K: Eq + Hash, V>(
     made
 }
 
-fn cage(w: u32, h: u32) -> Rc<Vec<f32>> {
-    kept(|kept| &mut kept.cages, (w, h), 16, || build_cage(w, h))
+fn cage(w: u32, h: u32, symbols: bool) -> Rc<Vec<f32>> {
+    kept(
+        |kept| &mut kept.cages,
+        (w, h, symbols),
+        16,
+        || build_cage(w, h, symbols),
+    )
 }
 
 fn glow(digit: u8, w: u32, h: u32) -> Rc<Glow> {
@@ -1023,7 +1214,7 @@ fn glow(digit: u8, w: u32, h: u32) -> Rc<Glow> {
         |kept| &mut kept.glows,
         (digit, w, h),
         64,
-        || build_glow(digit, w, h, &cage(w, h)),
+        || build_glow(digit, w, h, &cage(w, h, is_symbol(digit))),
     )
 }
 
@@ -1063,11 +1254,15 @@ fn hazy(key: SceneKey, epoch: f64, make: impl FnOnce() -> Vec<u8>) -> Rc<Vec<u8>
 }
 
 /// How much of every digit's wire covers each pixel of a digit's sprite.
-fn build_cage(w: u32, h: u32) -> Vec<f32> {
+fn build_cage(w: u32, h: u32, symbols: bool) -> Vec<f32> {
     let at = Cathodes::of(w, h);
     let (span, rows) = at.span();
     let mut out = vec![0.0f32; (span * rows) as usize];
-    let all: Vec<Vec<(f32, f32)>> = (0..10).flat_map(strokes).collect();
+    let all: Vec<Vec<(f32, f32)>> = if symbols {
+        SYMBOLS.flat_map(strokes).collect()
+    } else {
+        (0..10).flat_map(strokes).collect()
+    };
     // Each wire only reaches the pixels beside it, so each is drawn where
     // it is rather than every pixel measured against all three hundred.
     for (a, b) in wires(&all, at) {
@@ -1204,11 +1399,50 @@ fn strokes(digit: u8) -> Vec<Vec<(f32, f32)>> {
             arc((0.5, 0.72), (0.41, 0.28), 0.0, 360.0),
         ],
         // A six upside down, as on most real tubes.
-        _ => strokes(6)
+        9 => strokes(6)
             .into_iter()
             .map(|line| line.into_iter().map(|(x, y)| (1.0 - x, 1.0 - y)).collect())
             .collect(),
+        // The box is about half as wide as it is tall, so a circle is an
+        // ellipse twice as wide here as it is high.
+        PERCENT => vec![
+            arc((0.24, 0.17), (0.2, 0.11), 0.0, 360.0),
+            arc((0.76, 0.83), (0.2, 0.11), 0.0, 360.0),
+            vec![(0.9, 0.0), (0.1, 1.0)],
+        ],
+        DEGREE => vec![degree_ring()],
+        CELSIUS => vec![degree_ring(), arc((0.64, 0.6), (0.34, 0.4), 45.0, 315.0)],
+        FAHRENHEIT => vec![
+            degree_ring(),
+            vec![(0.94, 0.2), (0.42, 0.2), (0.42, 1.0)],
+            vec![(0.42, 0.58), (0.82, 0.58)],
+        ],
+        KILO => vec![
+            vec![(0.16, 0.0), (0.16, 1.0)],
+            vec![(0.88, 0.0), (0.16, 0.62)],
+            vec![(0.4, 0.42), (0.9, 1.0)],
+        ],
+        MEGA => vec![vec![
+            (0.06, 1.0),
+            (0.06, 0.0),
+            (0.5, 0.62),
+            (0.94, 0.0),
+            (0.94, 1.0),
+        ]],
+        GIGA => {
+            let mut line = arc((0.5, 0.5), (0.42, 0.5), 315.0, 0.0);
+            line.push((0.56, 0.5));
+            vec![line]
+        }
+        PLUS => vec![vec![(0.5, 0.2), (0.5, 0.8)], vec![(0.1, 0.5), (0.9, 0.5)]],
+        MINUS => vec![vec![(0.1, 0.5), (0.9, 0.5)]],
+        _ => Vec::new(),
     }
+}
+
+/// The small ring of a degree sign, up in the top corner.
+fn degree_ring() -> Vec<(f32, f32)> {
+    arc((0.2, 0.12), (0.16, 0.09), 0.0, 360.0)
 }
 
 /// Points around an ellipse, in degrees clockwise from three o'clock.
@@ -1531,5 +1765,111 @@ mod tests {
         let mut canvas = Canvas::filled(10, 10, Rgb::new(0, 0, 0));
         let area = Area::new(0, 0, 10, 10);
         draw(&mut canvas, area, &nixie(), "12:34:56", COLORS, None, 0.0);
+    }
+
+    #[test]
+    fn a_reading_s_unit_goes_on_a_symbol_tube() {
+        use Glyph::{Separator, Tube};
+        assert_eq!(
+            glyphs("42%"),
+            [Tube(Some(4)), Tube(Some(2)), Tube(Some(PERCENT))]
+        );
+        assert_eq!(
+            glyphs("63°C"),
+            [Tube(Some(6)), Tube(Some(3)), Tube(Some(CELSIUS))]
+        );
+        assert_eq!(
+            glyphs("-5°F"),
+            [Tube(Some(MINUS)), Tube(Some(5)), Tube(Some(FAHRENHEIT))]
+        );
+        // A network rate: the arrows are gaps, `K` is a tube, and bytes have
+        // no symbol.
+        assert_eq!(
+            glyphs("↓2.0K ↑850B"),
+            [
+                Tube(Some(2)),
+                Separator(1),
+                Tube(Some(0)),
+                Tube(Some(KILO)),
+                Separator(0),
+                Tube(Some(8)),
+                Tube(Some(5)),
+                Tube(Some(0)),
+            ]
+        );
+        assert_eq!(glyphs("12M")[2], Tube(Some(MEGA)));
+        assert_eq!(glyphs("1.5G")[3], Tube(Some(GIGA)));
+    }
+
+    #[test]
+    fn a_sign_leads_a_number_and_a_unit_follows_one() {
+        use Glyph::{Separator, Tube};
+        assert_eq!(glyphs("+3"), [Tube(Some(PLUS)), Tube(Some(3))]);
+        // The dashes of a date are gaps, not signs.
+        let date = glyphs("2026-09-26");
+        assert!(!date.contains(&Tube(Some(MINUS))));
+        assert_eq!(date[4], Separator(0));
+        // The `M` of a meridiem is a letter, not mega.
+        assert_eq!(glyphs("11:05 PM"), glyphs("11:05"));
+        assert_eq!(glyphs("Mon 11:05"), glyphs("11:05"));
+    }
+
+    #[test]
+    fn every_symbol_is_wire_inside_its_box() {
+        for symbol in SYMBOLS {
+            let lines = strokes(symbol);
+            assert!(!lines.is_empty(), "symbol {symbol} has no wire");
+            for &(x, y) in lines.iter().flatten() {
+                assert!(
+                    (-0.01..=1.01).contains(&x) && (-0.01..=1.01).contains(&y),
+                    "symbol {symbol} strays to ({x}, {y})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_symbol_tube_holds_symbols_behind_its_glass() {
+        let layout = |text: &str| Layout::new(360, 120, glyphs(text), false);
+        // Kept apart: a symbol tube's still picture is not a digit tube's.
+        assert_ne!(layout("44").signature(), layout("4%").signature());
+        let symbols: Vec<bool> = layout("4%").tubes().map(|(tube, _)| tube.symbols).collect();
+        assert_eq!(symbols, [false, true]);
+    }
+
+    #[test]
+    fn a_symbol_lights_its_tube() {
+        assert!(glow_sum(&frame("42%", 10.0)) > glow_sum(&frame("42", 10.0)));
+    }
+
+    #[test]
+    fn the_title_glows_as_neon_does() {
+        // A machine with no font draws no title at all.
+        let Some(font) = Font::system() else {
+            return;
+        };
+        let (w, h) = (360, 120);
+        let mut pixels = vec![0u8; (w * h * 3) as usize];
+        let mut s = Surface {
+            pixels: &mut pixels,
+            width: w,
+            height: h,
+            area: Area::new(0, 0, w, h),
+        };
+        let look = Look {
+            neon: NEON,
+            hot: HOT,
+            room: 1.0,
+        };
+        caption_light(&mut s, &font, "CPU", (100.0, 20.0), w, look, 0.0);
+        let canvas = Canvas::from_rgb(w, h, pixels).unwrap();
+        let hot = hottest(&canvas);
+        assert!(hot.r >= 200 && hot.r >= hot.g && hot.g >= hot.b, "{hot:?}");
+        // The glow stays about the letters: the top of the tile is dark.
+        let top: u64 = canvas.as_rgb()[..(w * 40 * 3) as usize]
+            .iter()
+            .map(|&c| u64::from(c))
+            .sum();
+        assert_eq!(top, 0);
     }
 }

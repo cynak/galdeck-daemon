@@ -63,6 +63,13 @@ pub enum Paint {
     /// A full-frame LCD update.
     Lcd {
         jpeg: Arc<[u8]>,
+        /// Where the frame goes. `None` is the firmware's 720x384 segment.
+        /// `Some` is a calibrated screen, drawn at its measured rectangle
+        /// through the panel path: the same `02 0c` command, without the
+        /// segment's bounds, so a screen that shows more or less than 384
+        /// rows is filled to its edges. The rectangle must be whole region
+        /// blocks, and the JPEG its size.
+        at: Option<galdeck::layout::Rect>,
     },
     /// Forget everything, so the next paint of each surface is unconditional.
     ///
@@ -79,7 +86,9 @@ pub struct DeckShadow {
     brightness: Option<u8>,
     keys: Vec<Option<KeyTarget>>,
     rings: Vec<[Option<Rgb>; Ring::SEGMENTS as usize]>,
-    lcd: Option<Arc<[u8]>>,
+    /// The last full frame and where it went. The place is part of the
+    /// identity, as it is for a key region.
+    lcd: Option<(Option<galdeck::layout::Rect>, Arc<[u8]>)>,
 }
 
 impl Default for DeckShadow {
@@ -166,20 +175,29 @@ impl DeckShadow {
                     })
                     .collect()
             }
-            Paint::Lcd { jpeg } => {
+            Paint::Lcd { jpeg, at } => {
                 if self
                     .lcd
                     .as_ref()
-                    .is_some_and(|shown| same_bytes(shown, jpeg))
+                    .is_some_and(|(place, shown)| place == at && same_bytes(shown, jpeg))
                 {
                     return Vec::new();
                 }
-                vec![DeckOp::LcdRegion {
-                    x: 0,
-                    y: 0,
-                    width: galdeck::Lcd::WIDTH,
-                    height: galdeck::Lcd::HEIGHT,
-                    jpeg: Arc::clone(jpeg),
+                vec![match at {
+                    None => DeckOp::LcdRegion {
+                        x: 0,
+                        y: 0,
+                        width: galdeck::Lcd::WIDTH,
+                        height: galdeck::Lcd::HEIGHT,
+                        jpeg: Arc::clone(jpeg),
+                    },
+                    Some(rect) => DeckOp::ScreenRegion {
+                        x: rect.x,
+                        y: rect.y,
+                        width: rect.width,
+                        height: rect.height,
+                        jpeg: Arc::clone(jpeg),
+                    },
                 }]
             }
         }
@@ -236,7 +254,17 @@ impl DeckShadow {
                     && *y == 0
                     && *width == galdeck::Lcd::WIDTH
                     && *height == galdeck::Lcd::HEIGHT;
-                self.lcd = full.then(|| Arc::clone(jpeg));
+                self.lcd = full.then(|| (None, Arc::clone(jpeg)));
+            }
+            DeckOp::ScreenRegion {
+                x,
+                y,
+                width,
+                height,
+                jpeg,
+            } => {
+                let rect = galdeck::layout::Rect::new(*x, *y, *width, *height);
+                self.lcd = Some((Some(rect), Arc::clone(jpeg)));
             }
             DeckOp::ClearAll => {
                 self.brightness = None;

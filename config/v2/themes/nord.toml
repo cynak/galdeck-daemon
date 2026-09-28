@@ -31,3 +31,23 @@ lcd_bg = "@polar"
 lcd_text_color = "@snow"
 lcd_text_size = 56.0
 ring = "@accent"
+
+# How widgets look under this theme. Left out here, so they draw the way
+# they always have; take the `#` off to try some. A widget's own settings
+# still win, and a profile or a page can have a [widgets] of its own.
+#
+# [widgets]
+# graph = "line"        # area (the usual), line or bars
+# bar = "segmented"     # rounded (the usual), flat or segmented
+# sweep = 240           # how far round a dial goes, 90 to 360 degrees
+#
+# [widgets.clock]       # every clock, over the settings above
+# view = "nixie"
+# color = "@aurora-yellow"
+
+# How things move under this theme. Also left out, so nothing does.
+#
+# [motion]
+# press = { kind = "flash", color = "@accent" }   # or "dim"; `ms` to fade
+# alarm = { kind = "pulse", period_ms = 900 }     # past a widget's threshold
+# rings = { kind = "breathe", period_ms = 4000 }  # every knob at rest

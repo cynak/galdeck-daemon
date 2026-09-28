@@ -13,6 +13,7 @@
 pub mod sse;
 
 use std::collections::BTreeMap;
+use std::net::{Ipv4Addr, SocketAddr};
 
 /// Longest request line accepted.
 ///
@@ -259,6 +260,10 @@ impl Response {
         out.extend_from_slice(
             format!("content-security-policy: {CONTENT_SECURITY_POLICY}\r\n").as_bytes(),
         );
+        // The page asks for this in a meta tag, which an error document or a
+        // preview opened on its own does not have. The token rides in the
+        // query of preview and event URLs, and a Referer would carry it on.
+        out.extend_from_slice(b"referrer-policy: no-referrer\r\n");
         out.extend_from_slice(b"connection: close\r\n\r\n");
         out.extend_from_slice(&self.body);
         out
@@ -274,7 +279,10 @@ fn reason(status: u16) -> &'static str {
         403 => "Forbidden",
         404 => "Not Found",
         405 => "Method Not Allowed",
+        410 => "Gone",
         413 => "Payload Too Large",
+        415 => "Unsupported Media Type",
+        429 => "Too Many Requests",
         500 => "Internal Server Error",
         _ => "Unknown",
     }
@@ -286,7 +294,17 @@ fn reason(status: u16) -> &'static str {
 /// and it is tested by name. The API can set shell commands the daemon runs,
 /// which makes an unauthenticated port on this machine a remote code execution
 /// hole reachable from any web page the user happens to visit.
+///
+/// It is the two halves below, in order: where the request came from, then
+/// what it carries. They are separate because the sign-in endpoint needs the
+/// first before there is a token to check.
 pub fn authorize(request: &Request, token: &str, port: u16) -> Result<(), Response> {
+    check_host_origin(request, port)?;
+    check_token(request, token)
+}
+
+/// Whether a request was addressed to us, by a page of ours or by no page.
+pub fn check_host_origin(request: &Request, port: u16) -> Result<(), Response> {
     // A browser will happily resolve any hostname to 127.0.0.1 and then send
     // the request with that hostname in Host. Only the literal loopback names
     // are accepted, so a DNS rebind lands on a rejection.
@@ -306,16 +324,32 @@ pub fn authorize(request: &Request, token: &str, port: u16) -> Result<(), Respon
     // must not do is one that acts. Same-origin requests send either no Origin
     // or exactly ours.
     if let Some(origin) = request.header("origin") {
-        let expected = [
-            format!("http://127.0.0.1:{port}"),
-            format!("http://[::1]:{port}"),
-            format!("http://localhost:{port}"),
-        ];
-        if !expected.iter().any(|allowed| allowed == origin) {
+        if !is_our_origin(origin, port) {
             return Err(Response::text(403, "cross-origin request refused"));
         }
     }
+    Ok(())
+}
 
+/// Whether `origin` is one of the names this server answers to.
+///
+/// `null`, which a sandboxed frame or a `file:` page sends, is never ours.
+pub fn is_our_origin(origin: &str, port: u16) -> bool {
+    [
+        format!("http://127.0.0.1:{port}"),
+        format!("http://[::1]:{port}"),
+        format!("http://localhost:{port}"),
+    ]
+    .iter()
+    .any(|allowed| allowed == origin)
+}
+
+/// Whether a request carries the token.
+///
+/// From the `Authorization` header, or from the query for the few things a
+/// browser fetches without letting a script add a header: images and the
+/// event stream.
+pub fn check_token(request: &Request, token: &str) -> Result<(), Response> {
     let presented = request
         .header("authorization")
         .and_then(|value| value.strip_prefix("Bearer "))
@@ -330,9 +364,9 @@ pub fn authorize(request: &Request, token: &str, port: u16) -> Result<(), Respon
 
 /// Compare without leaking where two strings first differ.
 ///
-/// The token is short-lived and local, so this is belt and braces -- but a
-/// comparison that returns early is a habit worth not having.
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+/// The token and the sign-in codes are local, so this is belt and braces --
+/// but a comparison that returns early is a habit worth not having.
+pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
     }
@@ -341,4 +375,57 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
         diff |= x ^ y;
     }
     diff == 0
+}
+
+/// The uid owning the client end of a loopback connection, from the text of
+/// `/proc/net/tcp`.
+///
+/// Every local account can connect to a port on 127.0.0.1, and a Host header
+/// is whatever the client says it is. The kernel's socket table is not: it
+/// lists both ends of every IPv4 TCP connection with the uid that opened
+/// each, and the file is readable by everyone. The row wanted is the
+/// client's own, whose local address is the client's and whose remote
+/// address is ours.
+///
+/// `None` for anything that cannot be matched -- no such row, a row that does
+/// not parse, an IPv6 address -- which the caller treats as a stranger.
+pub fn peer_uid(proc_net_tcp: &str, client: SocketAddr, server: SocketAddr) -> Option<u32> {
+    let (SocketAddr::V4(client), SocketAddr::V4(server)) = (client, server) else {
+        return None;
+    };
+    let client = (*client.ip(), client.port());
+    let server = (*server.ip(), server.port());
+    proc_net_tcp.lines().find_map(|row| {
+        // sl, local_address, rem_address, st, tx:rx, tr:when, retrnsmt, uid
+        let mut fields = row.split_whitespace();
+        let local = parse_tcp_address(fields.nth(1)?)?;
+        let remote = parse_tcp_address(fields.next()?)?;
+        if local != client || remote != server {
+            return None;
+        }
+        // What is left of an earlier connection on the same two ports,
+        // listed with uid 0 because it no longer has an owner.
+        if fields.next()? == TIME_WAIT {
+            return None;
+        }
+        fields.nth(3)?.parse().ok()
+    })
+}
+
+/// The state column's value for a closed connection waiting out its timer.
+const TIME_WAIT: &str = "06";
+
+/// One `ADDRESS:PORT` from `/proc/net/tcp`.
+///
+/// The kernel prints the address as the 32-bit word it holds, which is in
+/// network order in memory, so its bytes come back out in native order; the
+/// port it converts first, so that one reads as written.
+fn parse_tcp_address(field: &str) -> Option<(Ipv4Addr, u16)> {
+    let (address, port) = field.split_once(':')?;
+    if address.len() != 8 || port.len() != 4 {
+        return None;
+    }
+    let address = u32::from_str_radix(address, 16).ok()?;
+    let port = u16::from_str_radix(port, 16).ok()?;
+    Some((Ipv4Addr::from(address.to_ne_bytes()), port))
 }

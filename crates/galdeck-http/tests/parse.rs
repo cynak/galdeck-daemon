@@ -107,6 +107,7 @@ fn a_response_serializes_with_a_length_and_the_hardening_headers() {
     assert!(text.contains("x-content-type-options: nosniff\r\n"));
     assert!(text.contains("x-frame-options: DENY\r\n"));
     assert!(text.contains("cache-control: no-store\r\n"));
+    assert!(text.contains("referrer-policy: no-referrer\r\n"));
     assert!(text.ends_with("\r\n\r\n{}"));
 
     // Written out in full, so loosening the policy is a change to this test
@@ -134,5 +135,16 @@ fn a_response_serializes_with_a_length_and_the_hardening_headers() {
     ] {
         let text = String::from_utf8(response.to_bytes()).unwrap();
         assert!(text.contains(&header), "{text}");
+    }
+}
+
+#[test]
+fn a_gone_code_and_a_refused_retry_have_their_reasons() {
+    for (status, reason) in [(410, "Gone"), (429, "Too Many Requests")] {
+        let text = String::from_utf8(Response::empty(status).to_bytes()).unwrap();
+        assert!(
+            text.starts_with(&format!("HTTP/1.1 {status} {reason}\r\n")),
+            "{text}"
+        );
     }
 }

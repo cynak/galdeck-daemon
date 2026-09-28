@@ -25,11 +25,15 @@ use galdeck::{Buttons, Encoders, Error, Event, Lcd, Rgb, Ring};
 mod error;
 mod fake;
 mod hardware;
+mod keyboard;
+mod lights;
 mod shadow;
 
 pub use error::{DeckError, DeckResult};
 pub use fake::{DeckSurface, FakeDeck, FakeDeckHandle, KeySurface, LcdPatch, Violation};
 pub use hardware::HardwareDeck;
+pub use keyboard::HardwareLights;
+pub use lights::{led_level, to_light, FakeLights, FakeLightsHandle, Lights, LED_GAMMA};
 pub use shadow::{DeckShadow, KeyTarget, Paint};
 
 /// The forced pause after every feature report.
@@ -185,6 +189,15 @@ pub enum DeckOp {
         height: u16,
         jpeg: Arc<[u8]>,
     },
+    /// The info screen drawn as a panel region, at a calibrated rectangle
+    /// that is not the firmware's 720x384 segment.
+    ScreenRegion {
+        x: u16,
+        y: u16,
+        width: u16,
+        height: u16,
+        jpeg: Arc<[u8]>,
+    },
     ClearAll,
     ResetToLogo,
 }
@@ -203,9 +216,9 @@ impl DeckOp {
             | DeckOp::RingSegment { .. }
             | DeckOp::ResetToLogo => FEATURE_REPORT_COST,
             DeckOp::KeyJpeg { jpeg, .. } => image_cost(jpeg.len(), KEY_IMAGE_PAYLOAD),
-            DeckOp::LcdRegion { jpeg, .. } | DeckOp::KeyRegion { jpeg, .. } => {
-                image_cost(jpeg.len(), LCD_REGION_PAYLOAD)
-            }
+            DeckOp::LcdRegion { jpeg, .. }
+            | DeckOp::KeyRegion { jpeg, .. }
+            | DeckOp::ScreenRegion { jpeg, .. } => image_cost(jpeg.len(), LCD_REGION_PAYLOAD),
             // 12 key fills plus 8 ring LEDs, then a full black LCD frame.
             // 12 key fills plus 8 ring LEDs, and then -- easy to miss -- a
             // full black LCD frame, which the framework encodes on the spot
@@ -250,6 +263,13 @@ impl DeckOp {
                 height,
                 jpeg,
                 ..
+            }
+            | DeckOp::ScreenRegion {
+                x,
+                y,
+                width,
+                height,
+                jpeg,
             } => deck.draw_panel_jpeg(*x, *y, *width, *height, jpeg),
             DeckOp::ClearAll => deck.clear_all(),
             DeckOp::ResetToLogo => deck.reset_to_logo(),

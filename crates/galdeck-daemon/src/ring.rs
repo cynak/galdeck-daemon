@@ -14,6 +14,7 @@
 use std::time::Duration;
 
 use galdeck_core::Tick;
+use galdeck_model::{Animation, AnimationKind};
 
 use galdeck::{Rgb, Ring};
 
@@ -204,6 +205,103 @@ impl Default for RingFeedback {
     }
 }
 
+/// Most often an animated ring is redrawn.
+///
+/// Each redraw is up to four feature reports, 8 ms of the io thread, and the
+/// io thread is also what reads the keys. Both rings at this rate keep it
+/// about a third busy, which leaves room for key images and input.
+pub const ANIMATION_FRAME_MIN: Duration = Duration::from_millis(40);
+/// How often an animated ring is redrawn while a knob is being turned.
+///
+/// The turned knob's feedback writes LEDs of its own, up to two a detent,
+/// and with the animation at full rate as well the deck got about twice its
+/// resting load, under which its firmware dropped off the bus (3.05.005).
+/// Slowed to this, the animation keeps moving and the total stays near rest.
+pub const ANIMATION_FRAME_BUSY: Duration = Duration::from_millis(200);
+/// How many steps an animation's cycle is cut into, where the rate above
+/// allows it. At 120 a rainbow moves 3° of hue a step and a comet's head a
+/// thirtieth of a segment, which the eye takes as continuous.
+const ANIMATION_STEPS: u32 = 120;
+
+/// How often an animated ring is redrawn.
+///
+/// A key cycles through the few frames it pre-rendered; a ring computes each
+/// frame when it is due, so it is limited only by what the deck can take. A
+/// blink has two states and needs only two redraws a cycle.
+pub fn animation_interval(animation: &Animation) -> Duration {
+    let period = Duration::from_millis(u64::from(animation.period_ms()));
+    if animation.kind == AnimationKind::Blink {
+        return period / 2;
+    }
+    (period / ANIMATION_STEPS).max(ANIMATION_FRAME_MIN)
+}
+
+/// When the frame after `now` is due, for an animation begun at `start` and
+/// redrawn every `interval`: on its own grid of intervals, so a frame that
+/// runs late does not push every one after it later too.
+pub fn next_animation_frame(start: Tick, interval: Duration, now: Tick) -> Tick {
+    let interval = interval.as_micros().max(1);
+    let elapsed = now.duration_since(start).as_micros();
+    let due = (elapsed / interval + 1) * interval;
+    start.saturating_add(Duration::from_micros(due.min(u128::from(u64::MAX)) as u64))
+}
+
+/// How far through its cycle, 0 to 1, an animation begun at `start` is at
+/// `now`. Measured from the start rather than counted in frames, so a frame
+/// that runs late shows where the animation should be by then.
+pub fn animation_phase(animation: &Animation, start: Tick, now: Tick) -> f32 {
+    let period = u128::from(animation.period_ms()) * 1000;
+    let elapsed = now.duration_since(start).as_micros();
+    (elapsed % period) as f32 / period as f32
+}
+
+/// The colours of an animated ring at `phase` through its cycle, moving from
+/// `base` towards `to`.
+///
+/// Continuous in `phase`, so a frame a little later is a little further on
+/// and never a jump: a spin or a comet's head sits partly on each of the two
+/// segments it is between, and passes from one to the next as a crossfade.
+pub fn animation_frame(kind: AnimationKind, phase: f32, base: Rgb, to: Rgb) -> [Rgb; SEGMENTS] {
+    let round = SEGMENTS as f32;
+    // Where the head is, in segments clockwise from the top.
+    let head = phase.rem_euclid(1.0) * round;
+    // How far behind the head a segment is: from -1, the one it is about to
+    // reach, to one short of all the way round.
+    let behind = |segment: usize| {
+        let distance = (head - segment as f32).rem_euclid(round);
+        if distance > round - 1.0 {
+            distance - round
+        } else {
+            distance
+        }
+    };
+    match kind {
+        // One segment's worth of light going round, shared between the two
+        // segments it is between.
+        AnimationKind::Spin => {
+            std::array::from_fn(|segment| base.lerp(to, 1.0 - behind(segment).abs()))
+        }
+        // A head that brightens as it arrives, and a tail fading out over the
+        // rest of the ring behind it.
+        AnimationKind::Comet => std::array::from_fn(|segment| {
+            let behind = behind(segment);
+            let strength = if behind < 0.0 {
+                1.0 + behind
+            } else {
+                1.0 - behind / (round - 1.0)
+            };
+            base.lerp(to, strength)
+        }),
+        // Round the wheel, each segment a quarter turn on from the last, so
+        // the colours travel round the knob.
+        AnimationKind::Rainbow => std::array::from_fn(|segment| {
+            let offset = segment as f32 / round;
+            galdeck_model::animation::rainbow_or(kind, phase + offset, base, to)
+        }),
+        kind => [base.lerp(to, kind.mix_at(phase)); SEGMENTS],
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -367,6 +465,124 @@ mod tests {
         let updates = ring.updates(now);
         assert_eq!(updates.len(), SEGMENTS, "every segment must be rewritten");
         assert!(updates.iter().all(|(_, color)| *color == BASE));
+    }
+
+    fn animation(kind: AnimationKind, period_ms: u32) -> Animation {
+        Animation {
+            kind,
+            period_ms,
+            to: None,
+            frames: 8,
+        }
+    }
+
+    #[test]
+    fn ring_animations_never_jump_between_frames() {
+        // Stepped a thousandth of a cycle at a time, no channel of any
+        // segment may move by more than a few levels. The old comet and spin
+        // moved their head a whole segment at once, which is a jump of the
+        // whole distance from base to the lit colour.
+        let (base, to) = (Rgb::BLACK, Rgb::WHITE);
+        for kind in [
+            AnimationKind::Spin,
+            AnimationKind::Comet,
+            AnimationKind::Rainbow,
+            AnimationKind::Pulse,
+            AnimationKind::Breathe,
+        ] {
+            let steps = 1000;
+            let mut last = animation_frame(kind, 0.0, base, to);
+            // Once past the end, to check the wrap back to the start too.
+            for step in 1..=steps + 1 {
+                let phase = step as f32 / steps as f32;
+                let frame = animation_frame(kind, phase, base, to);
+                for (segment, (was, now)) in last.iter().zip(frame.iter()).enumerate() {
+                    let moved = was
+                        .to_array()
+                        .iter()
+                        .zip(now.to_array())
+                        .map(|(a, b)| a.abs_diff(b))
+                        .max()
+                        .unwrap_or(0);
+                    assert!(
+                        moved <= 3,
+                        "{kind:?} segment {segment} jumped {moved} at phase {phase}"
+                    );
+                }
+                last = frame;
+            }
+        }
+    }
+
+    #[test]
+    fn a_comet_between_segments_lights_both() {
+        let (base, to) = (Rgb::BLACK, Rgb::WHITE);
+        // Head exactly on segment 1: it is fully lit, the tail fades behind
+        // it, and the segment it is heading for is still dark.
+        let on = animation_frame(AnimationKind::Comet, 0.25, base, to);
+        assert_eq!(on[1], to);
+        assert_eq!(on[0], base.lerp(to, 2.0 / 3.0));
+        assert_eq!(on[3], base.lerp(to, 1.0 / 3.0));
+        assert_eq!(on[2], base);
+
+        // Half way to segment 2: segment 2 is half lit as the head arrives,
+        // and segment 1 has begun to fade.
+        let between = animation_frame(AnimationKind::Comet, 0.375, base, to);
+        assert_eq!(between[2], base.lerp(to, 0.5));
+        assert_eq!(between[1], base.lerp(to, 1.0 - 0.5 / 3.0));
+    }
+
+    #[test]
+    fn a_spin_between_segments_shares_its_light() {
+        let (base, to) = (Rgb::BLACK, Rgb::WHITE);
+        let on = animation_frame(AnimationKind::Spin, 0.5, base, to);
+        assert_eq!(on, [base, base, to, base]);
+
+        // A quarter of the way on to segment 3.
+        let between = animation_frame(AnimationKind::Spin, 0.5 + 0.125 / 2.0, base, to);
+        assert_eq!(between[2], base.lerp(to, 0.75));
+        assert_eq!(between[3], base.lerp(to, 0.25));
+        assert_eq!(between[0], base);
+        assert_eq!(between[1], base);
+    }
+
+    #[test]
+    fn a_blink_stays_two_colours() {
+        let (base, to) = (Rgb::BLACK, Rgb::new(255, 0, 0));
+        for step in 0..100 {
+            let frame = animation_frame(AnimationKind::Blink, step as f32 / 100.0, base, to);
+            assert!(frame.iter().all(|c| *c == base || *c == to));
+        }
+    }
+
+    #[test]
+    fn rings_redraw_often_but_within_what_the_deck_takes() {
+        // A two-second rainbow is capped at the frame rate the io thread can
+        // spare, which is still fifty steps a cycle.
+        let interval = animation_interval(&animation(AnimationKind::Rainbow, 2000));
+        assert_eq!(interval, ANIMATION_FRAME_MIN);
+        // A slow one is cut into fine steps rather than redrawn needlessly.
+        let slow = animation_interval(&animation(AnimationKind::Comet, 60_000));
+        assert_eq!(slow, Duration::from_millis(500));
+        // A blink has only its two states to show.
+        let blink = animation_interval(&animation(AnimationKind::Blink, 400));
+        assert_eq!(blink, Duration::from_millis(200));
+    }
+
+    #[test]
+    fn a_ring_animation_is_timed_from_its_start() {
+        let comet = animation(AnimationKind::Comet, 2000);
+        let start = tick(500);
+        assert_eq!(animation_phase(&comet, start, start), 0.0);
+        assert_eq!(animation_phase(&comet, start, tick(1000)), 0.25);
+        assert_eq!(animation_phase(&comet, start, tick(2500)), 0.0);
+
+        // A frame that ran late is followed by the next on the grid, not by
+        // a whole interval after it.
+        let interval = Duration::from_millis(40);
+        assert_eq!(next_animation_frame(start, interval, tick(540)), tick(580));
+        assert_eq!(next_animation_frame(start, interval, tick(553)), tick(580));
+        assert_eq!(next_animation_frame(start, interval, tick(579)), tick(580));
     }
 
     #[test]

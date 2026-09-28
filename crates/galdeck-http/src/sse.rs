@@ -14,6 +14,8 @@ pub fn open() -> Vec<u8> {
     out.extend_from_slice(b"HTTP/1.1 200 OK\r\n");
     out.extend_from_slice(b"content-type: text/event-stream; charset=utf-8\r\n");
     out.extend_from_slice(b"cache-control: no-store\r\n");
+    // As on every other response: the stream's URL carries the token.
+    out.extend_from_slice(b"referrer-policy: no-referrer\r\n");
     // Without this a proxy can hold the stream in a buffer forever.
     out.extend_from_slice(b"x-accel-buffering: no\r\n");
     out.extend_from_slice(b"connection: keep-alive\r\n\r\n");

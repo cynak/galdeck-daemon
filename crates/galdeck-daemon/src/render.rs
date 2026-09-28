@@ -51,9 +51,81 @@ pub fn key(
 ///
 /// The key is the canvas's size.
 pub fn key_over(
-    mut canvas: Canvas,
+    canvas: Canvas,
     style: &ResolvedStyle,
     icon: Option<&Path>,
+    label: Option<&str>,
+    font: Option<&Font>,
+) -> Canvas {
+    let (width, height) = icon_box((canvas.width(), canvas.height()), style, label.is_some());
+    let loaded = icon.and_then(|path| {
+        let loaded = load_icon(path, width, height);
+        if loaded.is_none() {
+            log::warn!("could not use icon {}", path.display());
+        }
+        loaded
+    });
+    // Laid out for an icon whenever one was named, drawn or not, as this
+    // always has been.
+    compose(canvas, style, loaded.as_ref(), icon.is_some(), label, font)
+}
+
+/// [`key`] with an icon already drawn, rather than a file to load.
+///
+/// For icons from [`crate::icons::IconCache`], drawn once to fit
+/// [`icon_box`] and reused for every repaint and animation frame.
+pub fn key_with_icon(
+    size: (u32, u32),
+    style: &ResolvedStyle,
+    icon: Option<&image::RgbaImage>,
+    label: Option<&str>,
+    font: Option<&Font>,
+) -> Canvas {
+    let (width, height) = size;
+    key_over_with_icon(
+        Canvas::filled(width, height, style.key_bg),
+        style,
+        icon,
+        label,
+        font,
+    )
+}
+
+/// [`key_over`] with an icon already drawn, rather than a file to load.
+///
+/// The icon is centred as it is, not scaled: it should have been drawn to
+/// fit [`icon_box`]. With no icon the label is centred on the key, which is
+/// also how a key whose icon could not be found or drawn looks.
+pub fn key_over_with_icon(
+    canvas: Canvas,
+    style: &ResolvedStyle,
+    icon: Option<&image::RgbaImage>,
+    label: Option<&str>,
+    font: Option<&Font>,
+) -> Canvas {
+    compose(canvas, style, icon, icon.is_some(), label, font)
+}
+
+/// The box a key's icon is drawn to fit: the key less a margin, and less the
+/// label strip when there is a label.
+pub fn icon_box(size: (u32, u32), style: &ResolvedStyle, labelled: bool) -> (u32, u32) {
+    let (width, height) = size;
+    let strip = if labelled { style.key_label_strip } else { 0 };
+    (
+        width.saturating_sub(8),
+        height.saturating_sub(strip.saturating_add(8)),
+    )
+}
+
+/// Draw an icon and a label over `canvas`.
+///
+/// `icon_named` places the label below where an icon goes, which the old
+/// path-taking entry points do even when the icon fails to load.
+fn compose(
+    mut canvas: Canvas,
+    style: &ResolvedStyle,
+    icon: Option<&image::RgbaImage>,
+    icon_named: bool,
     label: Option<&str>,
     font: Option<&Font>,
 ) -> Canvas {
@@ -65,15 +137,10 @@ pub fn key_over(
         0
     };
 
-    if let Some(path) = icon {
-        match load_icon(path, width - 8, height.saturating_sub(strip + 8)) {
-            Some(icon) => {
-                let x = (width as i32 - icon.width() as i32) / 2;
-                let y = (height as i32 - strip as i32 - icon.height() as i32) / 2;
-                blend_over(&mut canvas, &icon, x, y);
-            }
-            None => log::warn!("could not use icon {}", path.display()),
-        }
+    if let Some(icon) = icon {
+        let x = (width as i32 - icon.width() as i32) / 2;
+        let y = (height as i32 - strip as i32 - icon.height() as i32) / 2;
+        blend_over(&mut canvas, icon, x, y);
     }
 
     if let (Some(label), Some(font)) = (label, font) {
@@ -81,7 +148,7 @@ pub fn key_over(
         let (lines, size) = wrap(label, font, style.key_label_size, usable);
         // Centred on where a single line would have gone, so adding a second
         // line grows the block symmetrically rather than pushing it down.
-        let centre = if icon.is_some() {
+        let centre = if icon_named {
             height as i32 - strip as i32 / 2 - 4
         } else {
             height as i32 / 2
@@ -317,5 +384,41 @@ mod tests {
         let without = key(Button::size(), &s, None, None, None);
         let with = key(Button::size(), &s, None, Some("x"), None);
         assert_eq!(without.width(), with.width());
+    }
+
+    #[test]
+    fn the_icon_box_is_the_key_less_a_margin_and_the_label_strip() {
+        let mut s = ResolvedStyle::BUILTIN;
+        s.key_label_strip = 36;
+        assert_eq!(icon_box((160, 160), &s, true), (152, 116));
+        assert_eq!(icon_box((160, 160), &s, false), (152, 152));
+        // Too small for anything, rather than an underflow.
+        assert_eq!(icon_box((4, 30), &s, true), (0, 0));
+    }
+
+    #[test]
+    fn a_drawn_icon_is_centred_in_the_space_above_the_label() {
+        let red = Rgb::new(255, 0, 0);
+        let icon = image::RgbaImage::from_pixel(20, 20, image::Rgba([255, 0, 0, 255]));
+        let mut s = style(Rgb::new(1, 2, 3));
+        s.key_label_strip = 36;
+
+        let alone = key_with_icon((160, 160), &s, Some(&icon), None, None);
+        assert_eq!(alone.pixel(80, 80), Some(red));
+        assert_eq!(alone.pixel(80, 60), Some(Rgb::new(1, 2, 3)));
+
+        // With a label, centred in the 124 pixels above the strip: rows 52
+        // to 71. No font here, so the label itself is not drawn.
+        let labelled = key_with_icon((160, 160), &s, Some(&icon), Some("Wi-Fi"), None);
+        assert_eq!(labelled.pixel(80, 52), Some(red));
+        assert_eq!(labelled.pixel(80, 71), Some(red));
+        assert_eq!(labelled.pixel(80, 72), Some(Rgb::new(1, 2, 3)));
+    }
+
+    #[test]
+    fn a_drawn_icon_keeps_its_transparency() {
+        let icon = image::RgbaImage::from_pixel(10, 10, image::Rgba([255, 255, 255, 0]));
+        let canvas = key_with_icon((40, 40), &style(Rgb::new(9, 9, 9)), Some(&icon), None, None);
+        assert_eq!(canvas.pixel(20, 20), Some(Rgb::new(9, 9, 9)));
     }
 }

@@ -59,12 +59,14 @@ fn an_identical_frame_from_a_different_allocation_still_matches() {
         &mut shadow,
         &Paint::Lcd {
             jpeg: Arc::from(vec![7u8; 512]),
+            at: None,
         },
     );
     let ops = apply(
         &mut shadow,
         &Paint::Lcd {
             jpeg: Arc::from(vec![7u8; 512]),
+            at: None,
         },
     );
     assert!(ops.is_empty());
@@ -84,7 +86,10 @@ fn a_page_switch_pushes_only_what_changed() {
             encoder,
             colors: ring(Rgb::new(0, 200, 150)),
         }))
-        .chain([Paint::Lcd { jpeg: jpeg(99) }])
+        .chain([Paint::Lcd {
+            jpeg: jpeg(99),
+            at: None,
+        }])
         .collect();
 
     let cold: usize = first.iter().map(|p| apply(&mut shadow, p).len()).sum();
@@ -167,6 +172,7 @@ fn a_partial_lcd_write_does_not_claim_the_whole_panel() {
         &mut shadow,
         &Paint::Lcd {
             jpeg: frame.clone(),
+            at: None,
         },
     );
 
@@ -178,7 +184,13 @@ fn a_partial_lcd_write_does_not_claim_the_whole_panel() {
         jpeg: jpeg(6),
     });
 
-    let ops = apply(&mut shadow, &Paint::Lcd { jpeg: frame });
+    let ops = apply(
+        &mut shadow,
+        &Paint::Lcd {
+            jpeg: frame,
+            at: None,
+        },
+    );
     assert_eq!(ops.len(), 1, "the full frame must be rewritten");
 }
 
@@ -202,7 +214,15 @@ fn clear_all_is_reflected_so_the_next_paint_is_not_skipped() {
         .is_empty());
     // But brightness and the LCD are unknown again.
     assert_eq!(shadow.plan(&Paint::Brightness(60)).len(), 1);
-    assert_eq!(shadow.plan(&Paint::Lcd { jpeg: jpeg(1) }).len(), 1);
+    assert_eq!(
+        shadow
+            .plan(&Paint::Lcd {
+                jpeg: jpeg(1),
+                at: None,
+            })
+            .len(),
+        1
+    );
 }
 
 #[test]
@@ -216,7 +236,12 @@ fn a_full_frame_write_is_recorded_as_the_whole_panel() {
         height: Lcd::HEIGHT,
         jpeg: frame.clone(),
     });
-    assert!(shadow.plan(&Paint::Lcd { jpeg: frame }).is_empty());
+    assert!(shadow
+        .plan(&Paint::Lcd {
+            jpeg: frame,
+            at: None,
+        })
+        .is_empty());
 }
 
 #[test]
@@ -297,4 +322,50 @@ fn switching_a_key_between_the_two_paths_repaints_it() {
         "the same bytes through the other path is a write"
     );
     assert!(matches!(ops[0], DeckOp::KeyRegion { .. }));
+}
+
+#[test]
+fn a_calibrated_screen_goes_through_the_panel_path_and_is_diffed_on_its_place() {
+    // A screen calibrated to 396 rows is drawn 400 tall at its measured
+    // place. Moving it, or going back to the firmware's segment, has to be
+    // written even when the pixels are the same.
+    let mut shadow = DeckShadow::new();
+    let frame = jpeg(4);
+    let tall = galdeck::layout::Rect::new(0, 0, 720, 400);
+
+    let ops = apply(
+        &mut shadow,
+        &Paint::Lcd {
+            jpeg: frame.clone(),
+            at: Some(tall),
+        },
+    );
+    assert!(matches!(
+        ops.as_slice(),
+        [DeckOp::ScreenRegion {
+            x: 0,
+            y: 0,
+            width: 720,
+            height: 400,
+            ..
+        }]
+    ));
+    assert!(
+        shadow
+            .plan(&Paint::Lcd {
+                jpeg: frame.clone(),
+                at: Some(tall),
+            })
+            .is_empty(),
+        "the same frame in the same place is not worth writing twice"
+    );
+
+    let ops = shadow.plan(&Paint::Lcd {
+        jpeg: frame,
+        at: None,
+    });
+    assert!(
+        matches!(ops.as_slice(), [DeckOp::LcdRegion { .. }]),
+        "the same bytes through the segment is a write"
+    );
 }

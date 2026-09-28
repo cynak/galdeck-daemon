@@ -813,7 +813,7 @@ fn pw_dump() -> Option<&'static Path> {
 }
 
 /// `PATH`, or where the C library looks when it is unset.
-fn search_path() -> OsString {
+pub(crate) fn search_path() -> OsString {
     std::env::var_os("PATH").unwrap_or_else(|| "/bin:/usr/bin".into())
 }
 
@@ -833,7 +833,7 @@ fn choose(find: impl Fn(&str) -> Option<PathBuf>) -> Option<Installed> {
 /// Relative entries are skipped: an empty entry means the current directory,
 /// and a daemon should not run whatever happens to be in the one it was
 /// started from. What this returns is absolute, so it is also what runs.
-fn find(program: &str, path: &OsStr) -> Option<PathBuf> {
+pub(crate) fn find(program: &str, path: &OsStr) -> Option<PathBuf> {
     std::env::split_paths(path)
         .filter(|dir| dir.is_absolute())
         .map(|dir| dir.join(program))

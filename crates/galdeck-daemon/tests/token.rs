@@ -1,4 +1,4 @@
-//! The UI token outlives the daemon that minted it.
+//! The UI token outlives the daemon that minted it, until it is replaced.
 
 use std::os::unix::fs::PermissionsExt;
 use std::sync::atomic::AtomicBool;
@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use galdeck_core::wake_channel;
 use galdeck_daemon::engine::ControlSender;
-use galdeck_daemon::http::HttpServer;
+use galdeck_daemon::http::{remove_legacy_token, token_path_for, HttpServer};
 use galdeck_daemon::preview::Preview;
 
 fn scratch(name: &str) -> std::path::PathBuf {
@@ -35,11 +35,9 @@ fn a_restart_keeps_the_same_token() {
     // moment the daemon restarts, and the token is stripped from the address
     // bar on load, so a refresh cannot recover it either.
     let file = scratch("reuse");
-    let first = server(&file).url();
-    let second = server(&file).url();
-
-    let token_of = |url: &str| url.split("token=").nth(1).unwrap().to_string();
-    assert_eq!(token_of(&first), token_of(&second));
+    let first = server(&file).logins().token();
+    let second = server(&file).logins().token();
+    assert_eq!(first, second);
 
     let _ = std::fs::remove_file(&file);
 }
@@ -59,10 +57,10 @@ fn a_token_file_anyone_can_read_is_replaced_rather_than_trusted() {
     std::fs::write(&file, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap();
     std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
 
-    let url = server(&file).url();
+    let token = server(&file).logins().token();
     assert!(
-        !url.contains("aaaaaaaaaaaa"),
-        "a world-readable token must not be reused: {url}"
+        !token.contains("aaaaaaaaaaaa"),
+        "a world-readable token must not be reused: {token}"
     );
     assert_eq!(
         std::fs::metadata(&file).unwrap().permissions().mode() & 0o777,
@@ -77,9 +75,54 @@ fn a_file_that_is_not_a_token_is_replaced() {
     std::fs::write(&file, "not a token at all").unwrap();
     std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
 
-    let url = server(&file).url();
-    let token = url.split("token=").nth(1).unwrap();
+    let token = server(&file).logins().token();
     assert_eq!(token.len(), 48);
     assert!(token.chars().all(|c| c.is_ascii_hexdigit()));
     let _ = std::fs::remove_file(&file);
+}
+
+#[test]
+fn rotating_replaces_the_token_in_the_file_and_in_the_server() {
+    // For `galdeck ui --new-token`: the old one must stop working now and
+    // must not come back at the next start.
+    let file = scratch("rotate");
+    let running = server(&file);
+    let logins = running.logins();
+    let before = logins.token();
+    logins.rotate_token().unwrap();
+    let after = logins.token();
+    assert_ne!(before, after);
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), after);
+    let mode = std::fs::metadata(&file).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o600, "token file mode was {mode:o}");
+    drop(running);
+    assert_eq!(server(&file).logins().token(), after);
+    let _ = std::fs::remove_file(&file);
+}
+
+#[test]
+fn the_token_lives_under_its_new_name_beside_the_socket() {
+    // A new name, so the first start after the upgrade mints a new token:
+    // the old one was printed to the journal at every start.
+    let socket = std::path::Path::new("/run/user/1000/galdeck.sock");
+    assert_eq!(
+        token_path_for(socket),
+        std::path::Path::new("/run/user/1000/galdeck-ui.token")
+    );
+}
+
+#[test]
+fn the_old_token_file_is_removed_at_start() {
+    let dir = std::env::temp_dir().join(format!("galdeck-token-{}-legacy", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let old = dir.join("galdeck-ui-token");
+    std::fs::write(&old, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap();
+    let socket = dir.join("galdeck.sock");
+
+    remove_legacy_token(&socket);
+    assert!(!old.exists());
+    // And quietly nothing when there is nothing to remove.
+    remove_legacy_token(&socket);
+
+    let _ = std::fs::remove_dir_all(&dir);
 }

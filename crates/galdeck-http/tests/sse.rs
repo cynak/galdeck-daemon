@@ -9,6 +9,13 @@ fn the_stream_head_says_what_it_is_and_asks_not_to_be_buffered() {
 }
 
 #[test]
+fn the_stream_head_asks_for_no_referrer() {
+    // The stream's address carries the token in its query.
+    let head = String::from_utf8(sse::open()).unwrap();
+    assert!(head.contains("referrer-policy: no-referrer\r\n"));
+}
+
+#[test]
 fn an_event_is_a_name_and_a_data_line() {
     let bytes = String::from_utf8(sse::event("status", "{\"ok\":true}")).unwrap();
     assert_eq!(bytes, "event: status\ndata: {\"ok\":true}\n\n");

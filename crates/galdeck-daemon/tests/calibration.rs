@@ -393,6 +393,93 @@ fn a_calibrated_deck_draws_keys_at_their_measured_size() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// A screen that shows more than the firmware's 384 rows is filled to its
+/// measured edge, and a saved change to it shows at once.
+///
+/// Found on a unit whose glass shows 396 rows: the tiles were laid out on
+/// 384, the twelve rows below them kept whatever the firmware had drawn
+/// there, and editing the screen in the UI changed nothing on the deck.
+#[test]
+fn a_calibrated_screen_is_drawn_at_its_measured_size() {
+    let root = std::env::temp_dir().join(format!("galdeck-screen-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).expect("temp dir");
+    let path = root.join("layout.conf");
+    let mut layout = measured_layout();
+    layout.screen = Rect::new(0, 0, 720, 396);
+    layout.save(&path).expect("saving the layout");
+
+    let harness = Harness::start(&path);
+    let wait_for = |what: &str, found: &dyn Fn(&DeckOp) -> bool| {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !harness.deck.ops().iter().any(found) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{what} never arrived: {:#?}",
+                harness.deck.ops()
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    };
+
+    // The fake records every panel write the same way, not knowing whose it
+    // is; no key sits at the origin.
+    wait_for("the screen at 720x400", &|op| {
+        matches!(
+            op,
+            DeckOp::KeyRegion {
+                x: 0,
+                y: 0,
+                width: 720,
+                height: 400,
+                ..
+            }
+        )
+    });
+    assert!(
+        !harness
+            .deck
+            .ops()
+            .iter()
+            .any(|op| matches!(op, DeckOp::LcdRegion { .. })),
+        "the firmware's segment stops at 384 rows"
+    );
+
+    // Back to the segment from the UI, without a page switch to repaint.
+    harness.deck.clear_ops();
+    let cal = harness.calibration();
+    assert!(matches!(
+        harness.request(Request::SetCalibration {
+            screen: rect(0, 0, 720, 384),
+            bounds: cal.bounds,
+            rows: cal.rows,
+            columns: cal.columns,
+            bleed_x: cal.bleed_x,
+            bleed_y: cal.bleed_y,
+        }),
+        Response::Ok
+    ));
+    wait_for("the screen through the segment", &|op| {
+        matches!(
+            op,
+            DeckOp::LcdRegion {
+                x: 0,
+                y: 0,
+                width: 720,
+                height: 384,
+                ..
+            }
+        )
+    });
+    assert!(
+        harness.deck.violations().is_empty(),
+        "the firmware would not forgive: {:?}",
+        harness.deck.violations()
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// A deck with no calibration keeps the cheap path.
 ///
 /// The template's numbers are arithmetic, not measured, and drawing at

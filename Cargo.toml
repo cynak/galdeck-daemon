@@ -23,7 +23,7 @@ authors = ["galdeck contributors"]
 # an unpublished framework change, add to .cargo/config.toml (not committed):
 #   [patch.crates-io]
 #   galdeck = { path = "../galdeck" }
-galdeck = "0.2.0"
+galdeck = "0.3.1"
 
 # The control protocol and the configuration model, which belong to the CLI:
 # https://github.com/cynak/galdeck-cli. The dependency runs one way only --

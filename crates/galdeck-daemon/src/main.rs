@@ -48,8 +48,8 @@ struct Args {
     /// Serve the configuration UI on loopback at this port.
     ///
     /// Off unless given, because this surface can set the shell commands the
-    /// daemon runs. Pass 0 to let the system choose a free port; the address,
-    /// with its token, is printed at startup.
+    /// daemon runs. Pass 0 to let the system choose a free port; the address
+    /// is printed at startup, and `galdeck ui` opens it signed in.
     #[arg(long, value_name = "PORT")]
     http: Option<u16>,
 }
@@ -105,16 +105,18 @@ fn main() -> Result<()> {
 
     let (control_tx, control_rx) = channel();
     let control = engine::ControlSender::new(control_tx, waker.clone());
-    {
-        let control = control.clone();
-        std::thread::spawn(move || ipc_server::serve(listener, control));
-    }
 
     let preview = galdeck_daemon::preview::Preview::new();
+    // With or without the UI: the old file's token went to the journal, and
+    // nothing reads that file any more.
+    galdeck_daemon::http::remove_legacy_token(&socket_path);
+    // Bound before the control socket starts answering, because that is
+    // where `galdeck ui` asks for the port and a sign-in code.
+    let mut logins = None;
     if let Some(port) = args.http {
         // Derived from the socket actually in use rather than from the
-        // environment, or `--socket` would move the socket and leave the
-        // token behind somewhere `galdeck ui` cannot find it.
+        // environment, so a daemon started with `--socket` keeps its token
+        // beside its own socket.
         let token_file = galdeck_daemon::http::token_path_for(&socket_path);
         let server = galdeck_daemon::http::HttpServer::bind_with_token(
             port,
@@ -123,10 +125,20 @@ fn main() -> Result<()> {
             Arc::clone(&shutdown),
             token_file,
         )?;
-        println!("configuration UI: {}", server.url());
+        // The address and nothing else: under systemd, stdout is the
+        // journal, which more than this user can read.
+        println!(
+            "configuration UI on http://127.0.0.1:{}/ — run `galdeck ui` to open it",
+            server.port()
+        );
+        logins = Some(server.logins());
         std::thread::Builder::new()
             .name("galdeck-ui".into())
             .spawn(move || server.run())?;
+    }
+    {
+        let control = control.clone();
+        std::thread::spawn(move || ipc_server::serve(listener, control, logins));
     }
 
     // A whole page is sixteen paints. Sixty-four leaves room for a page
@@ -158,6 +170,16 @@ fn main() -> Result<()> {
         .name("galdeck-io".into())
         .spawn(move || io.run())?;
 
+    // The keyboard's own lighting has a thread of its own: a frame blocks for
+    // milliseconds, and opening the keyboard for half a second. It touches the
+    // keyboard only once a theme or profile asks for lighting.
+    let (lighting, lighting_thread) = galdeck_daemon::lighting::spawn(
+        lighting_opener(args.device),
+        Arc::clone(&shutdown),
+        galdeck_daemon::lighting::Timing::default(),
+        preview.clone(),
+    )?;
+
     let mut engine = engine::Engine::new(
         config_dir,
         workspace,
@@ -179,11 +201,15 @@ fn main() -> Result<()> {
             calibration_path: None,
         },
     )?;
+    engine.attach_lighting(lighting);
     engine.run();
 
     // The io thread owns the device and blanks it on the way out; wait for
     // that rather than leaving the panel mid-page.
     let _ = io_thread.join();
+    // The lighting thread hands the keyboard's lighting back on its way out,
+    // and the keyboard never takes it back by itself: wait for that too.
+    let _ = lighting_thread.join();
     let _ = std::fs::remove_file(&socket_path);
     Ok(())
 }
@@ -202,5 +228,18 @@ impl From<DeviceArg> for DeviceMode {
             DeviceArg::Auto => DeviceMode::Auto,
             DeviceArg::Virtual => DeviceMode::Virtual,
         }
+    }
+}
+
+/// Opens the keyboard's lighting as `--device` says: the real keyboard, or
+/// lights that exist only in memory.
+fn lighting_opener(device: DeviceArg) -> galdeck_daemon::lighting::Opener {
+    use galdeck_device::{FakeLights, HardwareLights, Lights};
+    match device {
+        DeviceArg::Auto => Box::new(|| {
+            let api = galdeck::hidapi::HidApi::new()?;
+            Ok(Box::new(HardwareLights::open(&api)?) as Box<dyn Lights>)
+        }),
+        DeviceArg::Virtual => Box::new(|| Ok(Box::new(FakeLights::new().0) as Box<dyn Lights>)),
     }
 }

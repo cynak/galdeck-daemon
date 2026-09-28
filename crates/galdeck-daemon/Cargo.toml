@@ -40,3 +40,7 @@ env_logger = { workspace = true }
 ctrlc = { workspace = true }
 zbus = { workspace = true }
 ureq = { workspace = true }
+# Icons. The desktop's symbolic icons exist only as SVG. Without default
+# features: no gzip (an .svgz is refused), no text or system fonts, and no
+# decoders for pictures embedded in an SVG.
+resvg = { version = "0.48", default-features = false }

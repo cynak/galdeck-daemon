@@ -378,6 +378,112 @@ fn an_animation_survives_the_round_trip_with_its_colour_resolved() {
 }
 
 #[test]
+fn a_key_s_own_label_colour_is_told_apart_from_the_theme_s() {
+    // The key form's label colour writes only a change, and offers to go
+    // back to the theme's only when the key has one of its own.
+    let harness = Harness::start();
+    let label_colour = |harness: &Harness| {
+        let Response::Layout(layout) = harness.request(Request::GetLayout) else {
+            panic!("expected a layout");
+        };
+        let key = layout.keys.iter().find(|k| k.key == 0).unwrap();
+        (key.label_color.clone(), key.label_color_is_own)
+    };
+    let (theme, own) = label_colour(&harness);
+    assert!(theme.starts_with('#') && theme.len() == 7, "{theme:?}");
+    assert!(!own);
+
+    let response = harness.request(Request::ApplyConfig {
+        file: "profiles/work.toml".into(),
+        patches: vec![Patch::Set {
+            path: "pages[0].keys[0].style.key_label_color".into(),
+            value: Value::String("#112233".into()),
+        }],
+        generation: None,
+    });
+    assert!(matches!(response, Response::Ok), "got {response:?}");
+    assert_eq!(label_colour(&harness), ("#112233".to_string(), true));
+}
+
+#[test]
+fn states_patched_in_as_the_ui_patches_them_keep_their_own_looks() {
+    // How the UI puts a toggle on a key: an appended table per state with
+    // its name, then each field set on its own, colours making a sub-table.
+    // Its editor then adds a state and moves it to the front before setting
+    // anything in it, when the new table has no place in the file yet. Each
+    // state must still end up with its own colours, and the key with none.
+    let harness = Harness::start();
+    let key = "pages[0].keys[0]";
+    let set = |path: &str, value: &str| Patch::Set {
+        path: format!("{key}.{path}"),
+        value: Value::String(value.into()),
+    };
+    let append = |name: &str| Patch::Append {
+        path: format!("{key}.states"),
+        fields: [("name".to_string(), Value::String(name.into()))].into(),
+    };
+    let mut patches = vec![
+        Patch::Remove {
+            path: format!("{key}.exec"),
+        },
+        set("status", "echo off"),
+    ];
+    for (index, (name, background)) in [("off", "#3b4252"), ("on", "#5e81ac")]
+        .into_iter()
+        .enumerate()
+    {
+        patches.push(append(name));
+        patches.push(set(&format!("states[{index}].exec"), "true"));
+        patches.push(set(&format!("states[{index}].style.key_bg"), background));
+    }
+    let apply = |patches: Vec<Patch>| {
+        let response = harness.request(Request::ApplyConfig {
+            file: "profiles/work.toml".into(),
+            patches,
+            generation: None,
+        });
+        assert!(matches!(response, Response::Ok), "got {response:?}");
+    };
+    apply(patches);
+    apply(vec![
+        append("mid"),
+        Patch::Move {
+            path: format!("{key}.states"),
+            from: 2,
+            to: 0,
+        },
+        set("states[0].style.key_bg", "#ebcb8b"),
+        set("states[2].style.key_label_color", "#2e3440"),
+    ]);
+
+    let Response::Layout(layout) = harness.request(Request::GetLayout) else {
+        panic!("expected a layout");
+    };
+    let info = layout.keys.iter().find(|k| k.key == 0).unwrap();
+    let looks: Vec<_> = info
+        .states
+        .iter()
+        .map(|s| {
+            (
+                s.name.as_str(),
+                s.background.as_deref(),
+                s.label_color.as_deref(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        looks,
+        [
+            ("mid", Some("#ebcb8b"), None),
+            ("off", Some("#3b4252"), None),
+            ("on", Some("#5e81ac"), Some("#2e3440")),
+        ]
+    );
+    assert!(!info.background_is_own && !info.label_color_is_own);
+    assert!(info.exec.is_none() && info.status.as_deref() == Some("echo off"));
+}
+
+#[test]
 fn an_animation_kind_a_key_cannot_have_is_refused_before_it_is_written() {
     let harness = Harness::start();
     let before = std::fs::read_to_string(harness.dir.join("profiles/work.toml")).unwrap();
@@ -398,4 +504,57 @@ fn an_animation_kind_a_key_cannot_have_is_refused_before_it_is_written() {
         std::fs::read_to_string(harness.dir.join("profiles/work.toml")).unwrap(),
         before
     );
+}
+
+#[test]
+fn a_picture_from_a_link_is_kept_beside_the_uploads_and_named_by_absolute_path() {
+    use std::io::{Read, Write};
+    let harness = Harness::start();
+    let picture = b"\x89PNG\r\n\x1a\nfrom a link".to_vec();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let body = picture.clone();
+    std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let _ = stream.read(&mut [0u8; 4096]);
+        let head = format!("HTTP/1.1 200 OK\r\ncontent-length: {}\r\n\r\n", body.len());
+        let _ = stream.write_all(head.as_bytes());
+        let _ = stream.write_all(&body);
+    });
+
+    let response = harness.request(Request::FetchAsset {
+        url: format!("http://127.0.0.1:{port}/icons/play.png"),
+    });
+    let Response::Asset { path } = response else {
+        panic!("expected an asset, got {response:?}");
+    };
+    let path = std::path::PathBuf::from(path);
+    // A key's icon without a `/` would be read as a theme icon's name.
+    assert!(path.is_absolute(), "{}", path.display());
+    assert!(path.ends_with("assets/play.png"), "{}", path.display());
+    assert_eq!(std::fs::read(&path).unwrap(), picture);
+
+    // Uploading the same picture finds the file the link brought.
+    let response = harness.request(Request::SaveAsset {
+        name: "play.png".into(),
+        data: galdeck_daemon::base64::encode(&picture),
+    });
+    let Response::Asset { path: uploaded } = response else {
+        panic!("expected an asset, got {response:?}");
+    };
+    assert_eq!(std::path::PathBuf::from(uploaded), path);
+}
+
+#[test]
+fn the_engine_hands_out_no_ui_sign_in() {
+    // The control socket answers these itself. One that reaches the engine
+    // came some other way -- the UI's /api/call, which refuses them too -- and
+    // must not be able to mint a code or sign the other tabs out.
+    let harness = Harness::start();
+    for request in [Request::UiLogin { ttl_s: None }, Request::UiRotateToken] {
+        let Response::Error { message } = harness.request(request) else {
+            panic!("expected a refusal");
+        };
+        assert!(message.contains("control socket"), "{message}");
+    }
 }

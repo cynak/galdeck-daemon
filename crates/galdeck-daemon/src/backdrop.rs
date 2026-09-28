@@ -289,6 +289,67 @@ impl Scene {
     }
 }
 
+/// The colours an animated background is drawn in: the configured ones,
+/// else a set taken from the theme so it matches without being asked.
+///
+/// `palette` is the theme's, and `lcd_bg` the screen's background under it,
+/// which is the darkest of the defaults.
+pub fn colors_for(
+    backdrop: &Backdrop,
+    palette: &galdeck_model::ResolvedPalette,
+    lcd_bg: Rgb,
+) -> Vec<Rgb> {
+    let resolve = |color: &galdeck_model::ColorRef| {
+        palette.resolve(
+            color,
+            "background.colors",
+            &mut galdeck_model::Diagnostics::new(),
+        )
+    };
+    let mut colors: Vec<Rgb> = backdrop.colors.iter().take(4).filter_map(resolve).collect();
+    // Some animations are their colours: fire in a theme's blues does not
+    // read as fire. Those default to their own; the rest to the theme's.
+    if colors.len() < 2 {
+        let own = match backdrop.animation {
+            Some(Motion::Fire) => Some(vec![
+                Rgb::new(255, 236, 150),
+                Rgb::new(255, 150, 40),
+                Rgb::new(200, 50, 20),
+                Rgb::new(70, 12, 8),
+                Rgb::new(10, 4, 4),
+            ]),
+            Some(Motion::Rain) => Some(vec![
+                Rgb::new(70, 255, 120),
+                Rgb::new(30, 180, 80),
+                Rgb::new(2, 10, 5),
+            ]),
+            Some(Motion::Starfield) => Some(vec![
+                Rgb::new(220, 230, 255),
+                Rgb::new(180, 200, 255),
+                Rgb::new(255, 220, 190),
+                Rgb::new(4, 6, 14),
+            ]),
+            _ => None,
+        };
+        if let Some(own) = own {
+            return own;
+        }
+    }
+    if colors.len() < 2 {
+        let accent = galdeck_model::ColorRef::parse("@accent")
+            .ok()
+            .and_then(|token| resolve(&token))
+            .unwrap_or(Rgb::new(136, 192, 208));
+        colors = vec![
+            accent,
+            Rgb::new(180, 142, 173),
+            Rgb::new(94, 129, 172),
+            lcd_bg,
+        ];
+    }
+    colors
+}
+
 fn keys_extent(keys: &[Rect]) -> Rect {
     keys.iter()
         .copied()

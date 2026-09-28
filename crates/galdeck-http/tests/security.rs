@@ -5,7 +5,10 @@
 //! any web page the user happens to visit, so each defence gets a test that
 //! says what it is for.
 
-use galdeck_http::{authorize, parse_request, Request};
+use galdeck_http::{
+    authorize, check_host_origin, check_token, constant_time_eq, is_our_origin, parse_request,
+    Request,
+};
 
 const TOKEN: &str = "s3cret-token-value";
 const PORT: u16 = 8787;
@@ -104,4 +107,50 @@ fn a_request_on_the_wrong_port_is_refused() {
         "Host: 127.0.0.1:9999\r\nAuthorization: Bearer {TOKEN}\r\n"
     ));
     assert_eq!(authorize(&r, TOKEN, PORT).unwrap_err().status, 403);
+}
+
+#[test]
+fn the_host_and_origin_half_passes_our_own_page_without_a_token() {
+    // What the sign-in endpoint runs, before there is a token to check.
+    let r = request(&format!(
+        "Host: 127.0.0.1:{PORT}\r\nOrigin: http://127.0.0.1:{PORT}\r\n"
+    ));
+    assert!(check_host_origin(&r, PORT).is_ok());
+    assert_eq!(check_token(&r, TOKEN).unwrap_err().status, 401);
+}
+
+#[test]
+fn the_host_and_origin_half_refuses_what_authorize_refuses() {
+    for headers in [
+        format!("Host: evil.example:{PORT}\r\n"),
+        "Host: 127.0.0.1:9999\r\n".to_string(),
+        String::new(),
+        format!("Host: 127.0.0.1:{PORT}\r\nOrigin: https://example.com\r\n"),
+        format!("Host: 127.0.0.1:{PORT}\r\nOrigin: http://127.0.0.1:9999\r\n"),
+    ] {
+        let r = request(&headers);
+        assert_eq!(
+            check_host_origin(&r, PORT).unwrap_err().status,
+            403,
+            "{headers:?}"
+        );
+    }
+}
+
+#[test]
+fn a_null_origin_is_never_ours() {
+    // A sandboxed frame or a page opened from a file sends `null`.
+    assert!(!is_our_origin("null", PORT));
+    let r = request(&format!(
+        "Host: 127.0.0.1:{PORT}\r\nOrigin: null\r\nAuthorization: Bearer {TOKEN}\r\n"
+    ));
+    assert_eq!(authorize(&r, TOKEN, PORT).unwrap_err().status, 403);
+}
+
+#[test]
+fn the_comparison_needs_equal_lengths_and_equal_bytes() {
+    assert!(constant_time_eq(b"abc", b"abc"));
+    assert!(!constant_time_eq(b"abc", b"abd"));
+    assert!(!constant_time_eq(b"abc", b"abcd"));
+    assert!(constant_time_eq(b"", b""));
 }
