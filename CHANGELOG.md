@@ -3,6 +3,13 @@
 Notable changes to galdeck-daemon. Versions follow [semver](https://semver.org);
 until 1.0 the configuration format may change between minor versions.
 
+## 0.1.1
+
+- **A Debian package.** Each tagged release now has a `.deb` with the daemon,
+  the `galdeck` command, the systemd user unit and the udev rule for the deck,
+  built and published by a release workflow. `scripts/build-deb.sh` builds
+  the same package locally.
+
 ## 0.1.0
 
 The first release. It turns the Stream Deck module in a Corsair Galleon 100

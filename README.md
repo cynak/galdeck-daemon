@@ -1,4 +1,12 @@
-# galdeck-daemon
+<p align="center">
+  <img src="docs/hero.svg" width="100%"
+       alt="galdeck-daemon: turn the Stream Deck built into a Corsair Galleon 100 SD keyboard into a launcher, set up from your browser">
+</p>
+
+<p align="center">
+  <a href="https://cash.app/$cynak"><img alt="Fuel the adventure: Cash App $cynak"
+     src="https://img.shields.io/badge/fuel_the_adventure-%24cynak-00C244?logo=cashapp&logoColor=white"></a>
+</p>
 
 A configurable daemon that turns the Stream Deck module in a **Corsair
 Galleon 100 SD** keyboard into a launcher: label your keys, give them
@@ -18,6 +26,33 @@ configuration UI are what require it. Check the two out side by side —
 `../galdeck-cli` is where the build looks.
 
 ## Quick start
+
+### From a release (Debian, Ubuntu)
+
+Each release on the [releases page](https://github.com/cynak/galdeck-daemon/releases)
+has a `.deb` holding the daemon, the `galdeck` command, the systemd user unit
+and the udev rule that gives the deck to whoever is at the seat.
+
+```sh
+sudo apt install ./galdeck-daemon_*_amd64.deb
+# replug the keyboard
+
+mkdir -p ~/.config/galdeck && cp -r /usr/share/galdeck-daemon/config/. ~/.config/galdeck/
+systemctl --user daemon-reload && systemctl --user enable --now galdeck
+
+galdeck status
+```
+
+Keystroke and scroll actions also need `/dev/uinput`, which the package does
+not open up by itself: any program at the seat could then inject input. Read
+the top of the rule for what it grants, and if you want those actions:
+
+```sh
+sudo cp /usr/share/galdeck-daemon/udev/71-galdeck-uinput.rules /etc/udev/rules.d/
+sudo udevadm control --reload && sudo udevadm trigger
+```
+
+### From source
 
 ```sh
 # both repositories, side by side: this one builds against ../galdeck-cli
@@ -704,6 +739,11 @@ The ones this page refers to:
   `DISPLAY`). GNOME and KDE do this for you.
 - Logs: `journalctl --user -u galdeck -f`. Set `RUST_LOG=debug` in the unit
   for per-event tracing.
+- Installed from the `.deb`, the unit is `/usr/lib/systemd/user/galdeck.service`
+  and starts `/usr/bin/galdeck-daemon`. A copy in `~/.config/systemd/user/`
+  from an install from source takes precedence over it; delete that copy to
+  use the package's. After upgrading the package,
+  `systemctl --user daemon-reload && systemctl --user restart galdeck`.
 - After pulling or editing either checkout, `scripts/rebuild.sh` builds the
   CLI and the daemon, installs both in `~/.cargo/bin` and restarts the
   service, waiting until it answers. It also stops a daemon started by hand
@@ -767,6 +807,40 @@ would rather not rely on the sibling checkout:
 galdeck-ipc = { path = "../galdeck-cli/crates/galdeck-ipc" }
 galdeck-model = { path = "../galdeck-cli/crates/galdeck-model" }
 ```
+
+### Releasing
+
+Bump `version` in the workspace `Cargo.toml`, give it a `## <version>` section
+in `CHANGELOG.md`, commit, and push a tag named after it:
+
+```sh
+git tag v0.2.0 && git push origin v0.2.0
+```
+
+The [release workflow](.github/workflows/release.yml) then runs everything CI
+runs, builds the `.deb`, installs it on a fresh runner to see that it works,
+and publishes it with a `SHA256SUMS` file and that changelog section as the
+notes. It refuses a tag that does not match `Cargo.toml`, and a tag with a
+hyphen in it (`v0.2.0-rc.1`) becomes a pre-release. The `galdeck` command in
+the package is built from galdeck-cli's `main` as it stands at that moment;
+the notes name the commit. Run the workflow by hand from the Actions tab to
+build a package from any branch without releasing it.
+
+`scripts/build-deb.sh` builds the same package on your own machine (it needs
+`dpkg-dev` and `python3`), into `target/debian/`.
+
+`scripts/hero.py` draws the card at the top of this page, `docs/hero.svg`, and
+`docs/social-preview.png`, the same card for GitHub to show wherever the
+repository is linked. Change the script rather than the SVG, and upload the
+PNG under Settings, General, Social preview after running it.
+
+## Fuel the adventure ☕
+
+galdeck runs on late nights and an alarming amount of coffee. If it has made
+your keyboard more fun and you want to help keep the adventure going (and feed
+my caffeine addiction), send a few coffeebucks my way on Cash App:
+[`$cynak`](https://cash.app/$cynak). Every cup turns into more features.
+Probably. Eventually.
 
 ## License
 

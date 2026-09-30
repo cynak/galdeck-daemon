@@ -1,0 +1,124 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  # Build the package from any branch without releasing it, to try the
+  # packaging out before tagging. The .deb is kept as the run's artifact.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+# A tag runs everything CI runs, builds a .deb with scripts/build-deb.sh,
+# installs it to see that it does, and publishes it with the tag's section of
+# CHANGELOG.md as the notes.
+#
+# The `galdeck` command in the package comes from cynak/galdeck-cli's default
+# branch as it stands when the tag is built, as in CI; the release notes name
+# the commit.
+
+jobs:
+  ci:
+    name: CI
+    uses: ./.github/workflows/ci.yml
+
+  deb:
+    name: build the .deb
+    needs: ci
+    # Pinned rather than -latest: the release it builds on decides the oldest
+    # libc6 the package accepts, and that should not move on its own.
+    runs-on: ubuntu-24.04
+    outputs:
+      cli-commit: ${{ steps.cli.outputs.commit }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: galdeck-daemon
+      - uses: actions/checkout@v4
+        with:
+          repository: cynak/galdeck-cli
+          path: galdeck-cli
+      - id: cli
+        name: Note the CLI commit
+        run: echo "commit=$(git -C galdeck-cli rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+      # hidapi builds a C shim against libudev; dpkg-shlibdeps is in dpkg-dev.
+      - name: Install build dependencies
+        run: sudo apt-get update && sudo apt-get install -y libudev-dev dpkg-dev
+      # No cache here: a release is built from a clean slate.
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Check the tag matches the version
+        if: startsWith(github.ref, 'refs/tags/')
+        working-directory: galdeck-daemon
+        run: |
+          version="$(cargo metadata --no-deps --format-version 1 --locked \
+            | jq -r '.packages[] | select(.name == "galdeck-daemon") | .version')"
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::tag $GITHUB_REF_NAME, but Cargo.toml says $version"
+            exit 1
+          fi
+      - name: Build
+        working-directory: galdeck-daemon
+        run: scripts/build-deb.sh
+      - name: Install it
+        run: |
+          sudo apt-get install -y ./galdeck-daemon/target/debian/*.deb
+          galdeck-daemon --version
+          galdeck --help >/dev/null
+          # Not --user: that needs a login session, which a runner lacks. The
+          # system manager still catches a bad key or a missing binary.
+          systemd-analyze verify /usr/lib/systemd/user/galdeck.service
+      - uses: actions/upload-artifact@v4
+        with:
+          name: deb
+          path: galdeck-daemon/target/debian/*.deb
+          if-no-files-found: error
+
+  release:
+    name: publish the release
+    needs: deb
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: deb
+          path: dist
+      - name: Write the notes
+        env:
+          CLI_COMMIT: ${{ needs.deb.outputs.cli-commit }}
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          # The tag's section of the changelog: from its heading to the next.
+          awk -v v="$version" '$0 == "## " v { on = 1; next } /^## / { on = 0 } on' \
+            CHANGELOG.md > notes.md
+          if ! grep -q '[^[:space:]]' notes.md; then
+            echo "See [CHANGELOG.md](CHANGELOG.md)." > notes.md
+          fi
+          cat >> notes.md <<EOF
+
+          ### Install (Debian, Ubuntu)
+
+          \`\`\`sh
+          sudo apt install ./$(cd dist && ls -- *.deb)
+          \`\`\`
+
+          Then follow the README's quick start for the package. The \`galdeck\`
+          command in it is built from cynak/galdeck-cli@${CLI_COMMIT::12}.
+          EOF
+          (cd dist && sha256sum -- *.deb > SHA256SUMS)
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # A tag like v0.2.0-rc.1 is published as a pre-release.
+          prerelease=()
+          case "$GITHUB_REF_NAME" in *-*) prerelease=(--prerelease) ;; esac
+          gh release create "$GITHUB_REF_NAME" dist/*.deb dist/SHA256SUMS \
+            --verify-tag --title "$GITHUB_REF_NAME" --notes-file notes.md "${prerelease[@]}"

@@ -657,14 +657,14 @@ dependencies = [
 
 [[package]]
 name = "galdeck-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "log",
 ]
 
 [[package]]
 name = "galdeck-daemon"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -691,7 +691,7 @@ dependencies = [
 
 [[package]]
 name = "galdeck-device"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "galdeck",
  "galdeck-core",
@@ -701,7 +701,7 @@ dependencies = [
 
 [[package]]
 name = "galdeck-http"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "libc",
  "log",
@@ -730,7 +730,7 @@ dependencies = [
 
 [[package]]
 name = "galdeck-plugin"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "serde",
  "serde_json",
